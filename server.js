@@ -10,23 +10,72 @@ process.env.PATH = `${process.env.HOME}/.local/bin:${process.env.PATH}`;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-// FIX: Render uses 10000 by default; changed from 3000 to prevent 502 Bad Gateway
 const PORT = process.env.PORT || 10000;
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
+// URL cache: avoids re-running yt-dlp for the same video within a session.
+// YouTube CDN URLs are signed and stay valid for ~6 hours.
+const urlCache = new Map();
+const CACHE_TTL = 4 * 60 * 60 * 1000;
+
+async function getStreamUrls(videoId, quality, audioOnly) {
+  const key = `${videoId}:${quality}:${audioOnly}`;
+  const cached = urlCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
+
+  // Prefer H.264 (avc1) so ffmpeg can copy-mux without re-encoding when possible.
+  // Fall through progressively so every video gets something.
+  // ios client is the most reliable — it returns HLS manifest URLs for both
+  // video and audio without requiring nsig extraction (which fails for the web client).
+  // Do NOT include [ext=m4a] — ios audio uses mp4 container over m3u8 protocol.
+  const ytFormat = audioOnly
+    ? 'bestaudio'
+    : [
+        `bestvideo[vcodec^=avc1][height<=${quality}]+bestaudio`,
+        `bestvideo[height<=${quality}]+bestaudio`,
+        `best[height<=${quality}]`,
+        'best'
+      ].join('/');
+
+  const args = [
+    '--no-check-certificate',
+    '--extractor-args', 'youtube:player_client=ios',
+    '-g', '-f', ytFormat,
+    '--no-playlist',
+    '--socket-timeout', '30',
+    `https://www.youtube.com/watch?v=${videoId}`
+  ];
+
+  const proc = spawn('yt-dlp', args);
+  let out = '', err = '';
+  proc.stdout.on('data', d => { out += d; });
+  proc.stderr.on('data', d => { err += d; });
+
+  await new Promise((resolve, reject) => {
+    proc.on('close', code =>
+      code === 0 ? resolve() : reject(new Error(err.slice(-800) || 'yt-dlp failed'))
+    );
+  });
+
+  const urls = out.trim().split('\n').filter(Boolean);
+  if (!urls.length) throw new Error('No stream URLs returned');
+
+  urlCache.set(key, { urls, ts: Date.now() });
+  return urls;
+}
+
 let youtube;
 
 // Background Initialization
 async function initYouTube() {
   try {
-    // FIX: retrieve_player is CRITICAL for the "Signature Decipher" error
     youtube = await Innertube.create({
       cache: new UniversalCache(false),
       generate_session_locally: true,
-      retrieve_player: true 
+      retrieve_player: true
     });
     console.log(">>> [SUCCESS] YouTube API Initialised");
   } catch (e) {
@@ -65,9 +114,11 @@ app.get('/api/info/:videoId', async (req, res) => {
   try {
     const ytArgs = [
       '--no-check-certificate',
-      '--extractor-args', 'youtube:player_client=ios,android;player_skip=webpage',
+      '--extractor-args', 'youtube:player_client=ios',
       '--print', 'duration',
       '--print', 'title',
+      '--no-playlist',
+      '--socket-timeout', '30',
       `https://www.youtube.com/watch?v=${videoId}`
     ];
     const proc = spawn('yt-dlp', ytArgs);
@@ -87,81 +138,67 @@ app.get('/api/info/:videoId', async (req, res) => {
   }
 });
 
-// Stream endpoint - uses yt-dlp to get URLs, ffmpeg to mux into streamable fragmented MP4
+// Stream endpoint - uses yt-dlp to get CDN URLs, ffmpeg to transcode + mux
+// into a fragmented MP4 the browser can play progressively without Content-Length.
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', audioOnly = 'false', start = '0' } = req.query;
   const startSec = parseFloat(start) || 0;
 
-  // Force H.264 + AAC for universal browser compatibility
-  // Prefer mp4/m4a containers; fall back progressively if not available
-  const ytFormat = audioOnly === 'true'
-    ? 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio'
-    : [
-        `bestvideo[height<=${quality}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]`,
-        `bestvideo[height<=${quality}][vcodec^=avc1]+bestaudio[ext=m4a]`,
-        `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]`,
-        `bestvideo[height<=${quality}]+bestaudio`,
-        `best[height<=${quality}]`,
-        'best'
-      ].join('/');
-
-  const getUrlArgs = [
-    '--no-check-certificate',
-    '--extractor-args', 'youtube:player_client=ios,android;player_skip=webpage',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    '-g',
-    '-f', ytFormat,
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
-
   try {
-    const urlProcess = spawn('yt-dlp', getUrlArgs);
-    let urlOutput = '';
-    let errOutput = '';
-    urlProcess.stdout.on('data', (d) => { urlOutput += d.toString(); });
-    urlProcess.stderr.on('data', (d) => { errOutput += d.toString(); });
-
-    await new Promise((resolve, reject) => {
-      urlProcess.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(errOutput.trim() || 'yt-dlp URL extraction failed'));
-      });
-    });
-
-    const urls = urlOutput.trim().split('\n').filter(Boolean);
-    if (!urls.length) throw new Error('No stream URLs found');
-
+    const urls = await getStreamUrls(videoId, quality, audioOnly === 'true');
     const videoUrl = urls[0];
     const audioUrl = urls[1] || null;
 
-    const reconnectArgs = ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'];
+    // Always transcode to H.264/AAC fragmented MP4 — guarantees browser compatibility
+    // regardless of whether YouTube returned VP9, AV1, or H.264 via HLS or direct URL.
+    // ultrafast preset runs at 200+ fps, fast enough for real-time streaming.
+    // protocol_whitelist is required for ffmpeg to follow HLS (m3u8) manifests.
     const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
-    const outputArgs = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
+    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto,m3u8'];
+    const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
 
     let ffmpegArgs;
     if (audioOnly === 'true') {
-      ffmpegArgs = [...seekArgs, ...reconnectArgs, '-i', videoUrl, '-vn', '-c:a', 'aac', '-b:a', '192k', ...outputArgs, 'pipe:1'];
+      ffmpegArgs = [
+        ...hlsArgs, ...seekArgs, '-i', videoUrl,
+        '-vn', '-c:a', 'aac', '-b:a', '192k',
+        ...outFlags, 'pipe:1'
+      ];
       res.setHeader('Content-Type', 'audio/mp4');
     } else if (audioUrl) {
-      ffmpegArgs = [...seekArgs, ...reconnectArgs,
-        '-i', videoUrl, ...seekArgs, '-i', audioUrl,
+      ffmpegArgs = [
+        ...hlsArgs,
+        ...seekArgs, '-i', videoUrl,
+        ...seekArgs, '-i', audioUrl,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
-        ...outputArgs, 'pipe:1'
+        '-shortest',
+        ...outFlags, 'pipe:1'
       ];
       res.setHeader('Content-Type', 'video/mp4');
     } else {
-      ffmpegArgs = [...seekArgs, ...reconnectArgs, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', ...outputArgs, 'pipe:1'];
+      ffmpegArgs = [
+        ...hlsArgs, ...seekArgs, '-i', videoUrl,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
+        ...outFlags, 'pipe:1'
+      ];
       res.setHeader('Content-Type', 'video/mp4');
     }
 
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     ffmpeg.stdout.pipe(res);
-    ffmpeg.stderr.on('data', () => {}); // suppress ffmpeg logs
+    let ffErr = '';
+    ffmpeg.stderr.on('data', d => { ffErr += d; });
 
-    ffmpeg.on('error', (err) => {
-      console.error('ffmpeg error:', err.message);
+    ffmpeg.on('close', code => {
+      if (code !== 0 && code !== null) {
+        console.error(`[ffmpeg stream] exited ${code}:`, ffErr.slice(-400));
+      }
+    });
+    ffmpeg.on('error', err => {
+      console.error('[ffmpeg stream] spawn error:', err.message);
       if (!res.headersSent) res.status(500).send('Streaming error');
     });
 
@@ -177,61 +214,40 @@ app.get('/api/stream/:videoId', async (req, res) => {
 app.get('/api/download/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { format = 'mp4', quality = '720' } = req.query;
-  const formatMap = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
-  const ext = formatMap[format] || 'mp4';
+  const ext = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' }[format] || 'mp4';
   const isAudio = format !== 'mp4';
 
-  const ytFormat = isAudio
-    ? 'bestaudio[ext=m4a]/bestaudio'
-    : `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]`;
-
-  const getUrlArgs = [
-    '--no-check-certificate',
-    '--extractor-args', 'youtube:player_client=ios,android;player_skip=webpage',
-    '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    '-g', '-f', ytFormat,
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
-
   try {
-    const urlProcess = spawn('yt-dlp', getUrlArgs);
-    let urlOutput = '';
-    let errOutput = '';
-    urlProcess.stdout.on('data', (d) => { urlOutput += d.toString(); });
-    urlProcess.stderr.on('data', (d) => { errOutput += d.toString(); });
-
-    await new Promise((resolve, reject) => {
-      urlProcess.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(errOutput.trim() || 'yt-dlp failed'));
-      });
-    });
-
-    const urls = urlOutput.trim().split('\n').filter(Boolean);
-    if (!urls.length) throw new Error('No URLs found');
-
+    const urls = await getStreamUrls(videoId, quality, isAudio);
     const videoUrl = urls[0];
     const audioUrl = urls[1] || null;
 
     res.setHeader('Content-Disposition', `attachment; filename="download_${videoId}.${ext}"`);
 
-    let ffmpegArgs = ['-i', videoUrl];
+    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto,m3u8'];
+    let ffmpegArgs;
     if (isAudio) {
       const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
-      const ffFormat = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
-      ffmpegArgs.push('-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0', '-f', ffFormat[format] || 'mp3', 'pipe:1');
+      const fmtMap  = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
+      ffmpegArgs = [
+        ...hlsArgs, '-i', videoUrl,
+        '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0',
+        '-f', fmtMap[format] || 'mp3', 'pipe:1'
+      ];
       res.setHeader('Content-Type', `audio/${format}`);
     } else {
-      if (audioUrl) ffmpegArgs.push('-i', audioUrl);
-      ffmpegArgs.push('-c:v', 'copy', '-c:a', 'aac', '-f', 'mp4', 'pipe:1');
+      // Use libx264 transcoding (not copy) to ensure VP9/AV1 HLS sources work
+      ffmpegArgs = audioUrl
+        ? [...hlsArgs, '-i', videoUrl, '-i', audioUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-shortest', '-f', 'mp4', 'pipe:1']
+        : [...hlsArgs, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-f', 'mp4', 'pipe:1'];
       res.setHeader('Content-Type', 'video/mp4');
     }
 
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     ffmpeg.stdout.pipe(res);
     ffmpeg.stderr.on('data', () => {});
-    ffmpeg.on('error', (err) => {
-      console.error('ffmpeg download error:', err.message);
+    ffmpeg.on('error', err => {
+      console.error('[ffmpeg download] error:', err.message);
       if (!res.headersSent) res.status(500).send('Download error');
     });
     req.on('close', () => { try { ffmpeg.kill(); } catch (_) {} });
