@@ -43,7 +43,7 @@ app.get('/api/search', async (req, res) => {
     const { q } = req.query;
     // type: 'video' avoids the ThumbnailView parser crash
     const results = await youtube.search(q, { type: 'video' });
-    
+
     const videos = (results.videos || []).map(v => ({
       id: v.id,
       title: v.title?.text || "Video",
