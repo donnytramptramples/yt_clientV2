@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { Menu, Sun, Moon } from 'lucide-react';
 import Sidebar from './components/Sidebar';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
@@ -19,38 +20,41 @@ function App() {
   }, [darkMode]);
 
   return (
-    <div className="min-h-screen flex">
-      <Sidebar 
+    <div className="min-h-screen flex bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      <Sidebar
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
       />
-      
-      <div className="flex-1 flex flex-col">
-        <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-6 py-4">
+
+      <div className="flex-1 flex flex-col min-w-0">
+        <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-6 py-3 flex-shrink-0">
           <div className="flex items-center gap-4">
-            <button onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
-              <div className="icon-menu text-xl"></div>
-            </button>
-            
-            <SearchBar onSearch={setSearchQuery} />
-            
-            <button 
-              onClick={() => setDarkMode(!darkMode)}
-              className="ml-auto p-2 hover:bg-[var(--bg-primary)] rounded"
+            <button
+              onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
             >
-              <div className={`icon-${darkMode ? 'sun' : 'moon'} text-xl`}></div>
+              <Menu size={20} />
+            </button>
+
+            <SearchBar onSearch={setSearchQuery} />
+
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className="ml-auto p-2 hover:bg-[var(--bg-primary)] rounded transition-colors flex-shrink-0"
+            >
+              {darkMode ? <Sun size={20} /> : <Moon size={20} />}
             </button>
           </div>
         </header>
-        
+
         <main className="flex-1 overflow-y-auto p-6">
           {selectedVideo ? (
-            <VideoPlayer 
+            <VideoPlayer
               video={selectedVideo}
               onBack={() => setSelectedVideo(null)}
             />
           ) : (
-            <VideoGrid 
+            <VideoGrid
               searchQuery={searchQuery}
               onVideoSelect={setSelectedVideo}
             />

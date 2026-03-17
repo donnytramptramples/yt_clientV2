@@ -2,25 +2,61 @@
 @tailwind components;
 @tailwind utilities;
 
+/* KDE Breeze Light Theme */
+:root {
+  --bg-primary: #eff0f1;
+  --bg-secondary: #fcfcfc;
+  --border: #bdc3c7;
+  --accent: #3daee9;
+  --accent-hover: #2980b9;
+  --text-primary: #1a1c22;
+  --text-secondary: #7f8c8d;
+}
+
+/* KDE Breeze Dark Theme */
+.dark {
+  --bg-primary: #1b1e20;
+  --bg-secondary: #232629;
+  --border: #3d4248;
+  --accent: #3daee9;
+  --accent-hover: #2980b9;
+  --text-primary: #eff0f1;
+  --text-secondary: #7f8c8d;
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
 @layer components {
   .breeze-card {
     @apply bg-[var(--bg-secondary)] border border-[var(--border)] shadow-sm;
-    border-radius: 2px;
+    border-radius: 4px;
   }
-  
+
   .breeze-btn {
-    @apply px-4 py-2 bg-[var(--accent)] text-white font-medium;
-    border-radius: 2px;
-    transition: opacity 0.2s;
+    @apply px-4 py-2 bg-[var(--accent)] text-white font-medium cursor-pointer;
+    border-radius: 4px;
+    transition: background-color 0.2s;
   }
-  
+
   .breeze-btn:hover {
-    @apply opacity-80;
+    background-color: var(--accent-hover);
   }
-  
+
+  .breeze-btn:disabled {
+    @apply opacity-50 cursor-not-allowed;
+  }
+
   .breeze-input {
-    @apply bg-[var(--bg-secondary)] border border-[var(--border)] px-3 py-2;
-    border-radius: 2px;
+    @apply bg-[var(--bg-secondary)] border border-[var(--border)] px-3 py-2 text-[var(--text-primary)];
+    border-radius: 4px;
+    outline: none;
+  }
+
+  .breeze-input:focus {
+    border-color: var(--accent);
   }
 }
 
@@ -34,5 +70,5 @@
 
 ::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 2px;
+  border-radius: 4px;
 }

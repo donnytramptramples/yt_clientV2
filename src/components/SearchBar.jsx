@@ -1,29 +1,27 @@
 import React, { useState } from 'react';
+import { Search } from 'lucide-react';
 
 function SearchBar({ onSearch }) {
   const [query, setQuery] = useState('');
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (query.trim()) {
-      onSearch(query);
-    }
+    if (query.trim()) onSearch(query.trim());
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex-1 max-w-2xl">
-      <div className="flex items-center gap-2">
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search videos..."
-          className="flex-1 breeze-input focus:outline-none focus:border-[var(--accent)]"
-        />
-        <button type="submit" className="breeze-btn">
-          <div className="icon-search text-lg"></div>
-        </button>
-      </div>
+    <form onSubmit={handleSubmit} className="flex-1 max-w-2xl flex gap-2">
+      <input
+        type="text"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search videos..."
+        className="breeze-input flex-1"
+      />
+      <button type="submit" className="breeze-btn flex items-center gap-2">
+        <Search size={16} />
+        <span>Search</span>
+      </button>
     </form>
   );
 }
