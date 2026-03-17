@@ -4,15 +4,12 @@
   "description": "High-performance YouTube Client & Downloader with KDE Breeze theme",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"node server.js\" \"vite\"",
-    "dev:server": "node server.js",
-    "dev:client": "vite",
+    "dev": "vite",
     "build": "vite build",
     "start": "node server.js",
     "preview": "vite preview"
   },
   "dependencies": {
-    "concurrently": "^8.2.2",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "fluent-ffmpeg": "^2.1.2",
