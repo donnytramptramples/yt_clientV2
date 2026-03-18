@@ -25,6 +25,21 @@ Platform.shim.eval = (code, env) => {
   return new Function(...Object.keys(env), code)(...Object.values(env));
 };
 
+// --- Fix #3: Safe fetch shim ---
+// youtubei.js with po_token injects Symbol-keyed entries into init.headers for
+// internal tracking. The native fetch Request constructor rejects Symbol keys.
+// We patch Platform.shim.fetch (used by ALL youtubei.js requests) to strip them.
+const _nativeFetch = Platform.shim.fetch ?? fetch;
+Platform.shim.fetch = (input, init = {}) => {
+  if (init?.headers && typeof init.headers === 'object') {
+    const clean = {};
+    // Object.entries only yields string-keyed props — Symbols are silently dropped
+    for (const [k, v] of Object.entries(init.headers)) clean[k] = v;
+    init = { ...init, headers: clean };
+  }
+  return _nativeFetch(input, init);
+};
+
 let youtube;
 let refreshTimer = null;
 
@@ -58,10 +73,6 @@ async function initYouTube() {
       generate_session_locally: true,
       enable_session_cache: true,
       retrieve_player: true,
-      fetch: (url, options = {}) => fetch(url, {
-        ...options,
-        headers: { ...options.headers, 'User-Agent': YT_UA },
-      }),
     });
 
     console.log('>>> [SUCCESS] YouTube API Initialised');
