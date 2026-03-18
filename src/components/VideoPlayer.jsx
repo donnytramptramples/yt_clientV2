@@ -47,9 +47,15 @@ export default function VideoPlayer({ video, onBack }) {
   const [showDownload, setShowDownload] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [draggingProgress, setDraggingProgress] = useState(false);
+  const [embedFallback, setEmbedFallback] = useState(false);
 
   // Use proxy endpoint: supports HTTP range requests so browser can seek and cache natively
   const proxyUrl = `/api/proxy/${video.id}?quality=${quality}`;
+
+  // Reset fallback when video changes
+  useEffect(() => {
+    setEmbedFallback(false);
+  }, [video.id]);
 
   // Fetch video duration from info endpoint
   useEffect(() => {

@@ -118,9 +118,18 @@ async function getVideoFormats(videoId) {
       throw new Error('No streaming data available');
     }
 
+    const muxed = info.streaming_data.formats || [];
+    const adaptive = info.streaming_data.adaptive_formats || [];
+
+    console.log(`[formats] ${videoId}: ${muxed.length} muxed, ${adaptive.length} adaptive`);
+
+    if (muxed.length === 0 && adaptive.length === 0) {
+      throw new Error('No formats returned — video may be age-restricted or unavailable');
+    }
+
     const formats = {
-      videoFormats: info.streaming_data.formats || [],
-      adaptiveFormats: info.streaming_data.adaptive_formats || [],
+      videoFormats: muxed,
+      adaptiveFormats: adaptive,
       duration: info.basic_info?.duration || 0,
       title: info.basic_info?.title || 'Video'
     };
