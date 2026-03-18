@@ -131,16 +131,51 @@ async function getVideoFormats(videoId) {
       throw new Error(error);
     }
 
-    if (!info.streaming_data) {
-      console.error(`[formats] ERROR: No streaming_data in response for ${videoId}`);
-      console.error(`[formats] Available keys in info:`, Object.keys(info));
+    // Check if streaming_data exists and has content
+    const hasStreamingData = info.streaming_data && 
+      (info.streaming_data.formats?.length > 0 || info.streaming_data.adaptive_formats?.length > 0);
+
+    if (!hasStreamingData) {
+      console.error(`[formats] ERROR: No valid streaming_data for ${videoId}`);
+      console.error(`[formats] streaming_data exists:`, !!info.streaming_data);
+      if (info.streaming_data) {
+        console.error(`[formats] formats count:`, info.streaming_data.formats?.length || 0);
+        console.error(`[formats] adaptive_formats count:`, info.streaming_data.adaptive_formats?.length || 0);
+      }
+      console.error(`[formats] Playability status:`, info.playability_status?.status);
       throw new Error('No streaming data available - video may be restricted');
     }
 
-    const muxed = info.streaming_data.formats || [];
-    const adaptive = info.streaming_data.adaptive_formats || [];
+    let muxed = info.streaming_data.formats || [];
+    let adaptive = info.streaming_data.adaptive_formats || [];
 
-    console.log(`[formats] ${videoId} - Found ${muxed.length} muxed formats, ${adaptive.length} adaptive formats`);
+    // Decipher formats if needed
+    console.log(`[formats] Deciphering ${muxed.length + adaptive.length} formats...`);
+    muxed = await Promise.all(muxed.map(async (f) => {
+      try {
+        await f.decipher(youtube.session.player);
+        return f;
+      } catch (e) {
+        console.warn(`[formats] Failed to decipher muxed format itag=${f.itag}:`, e.message);
+        return null;
+      }
+    }));
+    
+    adaptive = await Promise.all(adaptive.map(async (f) => {
+      try {
+        await f.decipher(youtube.session.player);
+        return f;
+      } catch (e) {
+        console.warn(`[formats] Failed to decipher adaptive format itag=${f.itag}:`, e.message);
+        return null;
+      }
+    }));
+
+    // Filter out null values (failed decipher attempts)
+    muxed = muxed.filter(f => f !== null);
+    adaptive = adaptive.filter(f => f !== null);
+
+    console.log(`[formats] ${videoId} - After decipher: ${muxed.length} muxed, ${adaptive.length} adaptive`);
 
     if (muxed.length > 0) {
       console.log(`[formats] Muxed formats available:`, muxed.map(f => ({
@@ -149,7 +184,7 @@ async function getVideoFormats(videoId) {
         height: f.height,
         hasAudio: f.has_audio,
         hasVideo: f.has_video,
-        mime: f.mime_type
+        hasUrl: !!f.url
       })));
     }
 
@@ -160,12 +195,12 @@ async function getVideoFormats(videoId) {
         height: f.height,
         hasAudio: f.has_audio,
         hasVideo: f.has_video,
-        mime: f.mime_type
+        hasUrl: !!f.url
       })));
     }
 
     if (muxed.length === 0 && adaptive.length === 0) {
-      const error = 'No formats returned - video may be age-restricted, region-locked, or unavailable';
+      const error = 'No formats available after deciphering';
       console.error(`[formats] ERROR: ${error} for ${videoId}`);
       throw new Error(error);
     }
