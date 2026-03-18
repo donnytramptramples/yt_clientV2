@@ -37,91 +37,44 @@ setInterval(() => {
 async function getStreamUrls(videoId, quality, audioOnly) {
   const key = `${videoId}:${quality}:${audioOnly}`;
   const cached = urlCache.get(key);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached;
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
 
-  // Use web client - most reliable for direct URLs
-  // Request H.264 (avc1) which browsers can play natively
+  // Prefer H.264 (avc1) so ffmpeg can copy-mux without re-encoding when possible.
+  // ios client is reliable - returns HLS manifest URLs for both video and audio.
   const ytFormat = audioOnly
-    ? 'bestaudio[ext=m4a]/bestaudio'
+    ? 'bestaudio'
     : [
-        `bestvideo[vcodec^=avc1][height<=${quality}]+bestaudio[ext=m4a]`,
         `bestvideo[vcodec^=avc1][height<=${quality}]+bestaudio`,
         `bestvideo[height<=${quality}]+bestaudio`,
+        `best[height<=${quality}]`,
         'best'
       ].join('/');
 
-  // First get format info with -j (lowercase, single video info)
-  const infoArgs = [
+  const args = [
     '--no-check-certificate',
-    '-j', '-f', ytFormat,
-    '--no-playlist',
-    '--socket-timeout', '15',
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
-
-  const infoProc = spawn('yt-dlp', infoArgs);
-  let infoOut = '', infoErr = '';
-  infoProc.stdout.on('data', d => { infoOut += d; });
-  infoProc.stderr.on('data', d => { infoErr += d; });
-
-  const infoCode = await new Promise((resolve) => {
-    const timeout = setTimeout(() => { infoProc.kill('SIGKILL'); resolve(-1); }, 20000);
-    infoProc.on('close', code => { clearTimeout(timeout); resolve(code); });
-    infoProc.on('error', () => { clearTimeout(timeout); resolve(-1); });
-  });
-
-  let vcodec = '', acodec = '';
-  if (infoCode === 0) {
-    try {
-      const info = JSON.parse(infoOut.trim());
-      vcodec = info.vcodec || (info.requested_formats?.[0]?.vcodec) || '';
-      acodec = info.acodec || (info.requested_formats?.[1]?.acodec) || (info.requested_formats?.[0]?.acodec) || '';
-    } catch (_) {}
-  }
-
-  // Now get the actual URLs with -g
-  const urlArgs = [
-    '--no-check-certificate',
+    '--extractor-args', 'youtube:player_client=ios',
     '-g', '-f', ytFormat,
     '--no-playlist',
-    '--socket-timeout', '15',
+    '--socket-timeout', '30',
     `https://www.youtube.com/watch?v=${videoId}`
   ];
 
-  const urlProc = spawn('yt-dlp', urlArgs);
-  let urlOut = '', urlErr = '';
-  urlProc.stdout.on('data', d => { urlOut += d; });
-  urlProc.stderr.on('data', d => { urlErr += d; });
+  const proc = spawn('yt-dlp', args);
+  let out = '', err = '';
+  proc.stdout.on('data', d => { out += d; });
+  proc.stderr.on('data', d => { err += d; });
 
-  const urlCode = await new Promise((resolve) => {
-    const timeout = setTimeout(() => { urlProc.kill('SIGKILL'); resolve(-1); }, 20000);
-    urlProc.on('close', code => { clearTimeout(timeout); resolve(code); });
-    urlProc.on('error', () => { clearTimeout(timeout); resolve(-1); });
+  await new Promise((resolve, reject) => {
+    proc.on('close', code =>
+      code === 0 ? resolve() : reject(new Error(err.slice(-800) || 'yt-dlp failed'))
+    );
   });
 
-  if (urlCode !== 0) {
-    throw new Error(urlErr.slice(-300) || 'yt-dlp failed to get URLs');
-  }
-
-  const urls = urlOut.trim().split('\n').filter(Boolean);
+  const urls = out.trim().split('\n').filter(Boolean);
   if (!urls.length) throw new Error('No stream URLs returned');
 
-  // Determine if we can use copy codec (H.264 + AAC) - avoids transcoding
-  const canCopyVideo = vcodec.startsWith('avc1') || vcodec.includes('h264');
-  const canCopyAudio = acodec.startsWith('mp4a') || acodec.includes('aac');
-
-  const result = { 
-    urls, 
-    ts: Date.now(), 
-    canCopyVideo, 
-    canCopyAudio,
-    vcodec,
-    acodec
-  };
-  
-  urlCache.set(key, result);
-  console.log(`[yt-dlp] Got ${urls.length} URL(s), vcodec=${vcodec}, acodec=${acodec}, canCopy=${canCopyVideo}/${canCopyAudio}`);
-  return result;
+  urlCache.set(key, { urls, ts: Date.now() });
+  return urls;
 }
 
 let youtube;
@@ -195,15 +148,14 @@ app.get('/api/info/:videoId', async (req, res) => {
   }
 });
 
-// Stream endpoint - uses yt-dlp to get CDN URLs, ffmpeg to mux/transcode
-// Always transcodes to ensure browser compatibility and fix format errors
+// Stream endpoint - uses yt-dlp to get CDN URLs, ffmpeg to transcode + mux
+// into a fragmented MP4 the browser can play progressively without Content-Length.
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', audioOnly = 'false', start = '0' } = req.query;
   const startSec = parseFloat(start) || 0;
-  const isAudioOnly = audioOnly === 'true';
 
-  // Rate limit concurrent streams to prevent OOM
+  // Rate limit concurrent streams to prevent OOM (512MB RAM)
   if (activeStreams >= MAX_CONCURRENT_STREAMS) {
     return res.status(503).json({ error: 'Server busy, please try again' });
   }
@@ -219,80 +171,58 @@ app.get('/api/stream/:videoId', async (req, res) => {
   };
 
   try {
-    const streamInfo = await getStreamUrls(videoId, quality, isAudioOnly);
-    const { urls, canCopyVideo, canCopyAudio } = streamInfo;
+    const urls = await getStreamUrls(videoId, quality, audioOnly === 'true');
     const videoUrl = urls[0];
     const audioUrl = urls[1] || null;
 
-    console.log(`[stream] ${videoId} - URLs: ${urls.length}, canCopy: v=${canCopyVideo} a=${canCopyAudio}`);
-
-    // Build ffmpeg args - always use fragmented MP4 for streaming
+    // Always transcode to H.264/AAC fragmented MP4 - guarantees browser compatibility
+    // regardless of whether YouTube returned VP9, AV1, or H.264 via HLS or direct URL.
+    // ultrafast preset runs at 200+ fps, fast enough for real-time streaming.
+    // protocol_whitelist is required for ffmpeg to follow HLS (m3u8) manifests.
     const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
-    
-    // Memory-saving options
-    const memOpts = ['-threads', '2', '-analyzeduration', '1M', '-probesize', '1M'];
-    
-    // Fragmented MP4 flags - essential for streaming without Content-Length
+    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto'];
     const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
 
     let ffmpegArgs;
-    
-    if (isAudioOnly) {
+    if (audioOnly === 'true') {
       ffmpegArgs = [
-        ...memOpts, ...seekArgs, '-i', videoUrl,
+        ...hlsArgs, ...seekArgs, '-i', videoUrl,
         '-vn', '-c:a', 'aac', '-b:a', '128k',
         ...outFlags, 'pipe:1'
       ];
       res.setHeader('Content-Type', 'audio/mp4');
     } else if (audioUrl) {
-      // Two separate streams - mux them together
-      // Always transcode video to H.264 to ensure compatibility
       ffmpegArgs = [
-        ...memOpts,
+        ...hlsArgs,
         ...seekArgs, '-i', videoUrl,
         ...seekArgs, '-i', audioUrl,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         '-shortest',
         ...outFlags, 'pipe:1'
       ];
       res.setHeader('Content-Type', 'video/mp4');
     } else {
-      // Single URL - transcode to ensure compatibility
       ffmpegArgs = [
-        ...memOpts, ...seekArgs, '-i', videoUrl,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p',
+        ...hlsArgs, ...seekArgs, '-i', videoUrl,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         ...outFlags, 'pipe:1'
       ];
       res.setHeader('Content-Type', 'video/mp4');
     }
 
-    // Set headers for streaming
-    res.setHeader('Accept-Ranges', 'none');
-    res.setHeader('Cache-Control', 'no-cache');
-    
-    console.log(`[ffmpeg] Starting with args:`, ffmpegArgs.slice(0, 8).join(' '), '...');
-    
-    ffmpeg = spawn('ffmpeg', ffmpegArgs, {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    
+    ffmpeg = spawn('ffmpeg', ffmpegArgs);
     ffmpeg.stdout.pipe(res);
-    
     let ffErr = '';
-    ffmpeg.stderr.on('data', d => { 
-      ffErr += d.toString();
-      if (ffErr.length > 4000) ffErr = ffErr.slice(-2000);
-    });
+    ffmpeg.stderr.on('data', d => { ffErr += d; });
 
     ffmpeg.on('close', code => {
       cleanup();
-      if (code !== 0 && code !== null && !res.writableEnded) {
-        console.error(`[ffmpeg stream] exited ${code}:`, ffErr.slice(-500));
+      if (code !== 0 && code !== null) {
+        console.error(`[ffmpeg stream] exited ${code}:`, ffErr.slice(-400));
       }
     });
-    
     ffmpeg.on('error', err => {
       cleanup();
       console.error('[ffmpeg stream] spawn error:', err.message);
@@ -300,7 +230,6 @@ app.get('/api/stream/:videoId', async (req, res) => {
     });
 
     req.on('close', cleanup);
-    req.on('error', cleanup);
 
   } catch (error) {
     cleanup();
@@ -332,57 +261,41 @@ app.get('/api/download/:videoId', async (req, res) => {
   };
 
   try {
-    const streamInfo = await getStreamUrls(videoId, quality, isAudio);
-    const { urls } = streamInfo;
+    const urls = await getStreamUrls(videoId, quality, isAudio);
     const videoUrl = urls[0];
     const audioUrl = urls[1] || null;
 
     res.setHeader('Content-Disposition', `attachment; filename="download_${videoId}.${ext}"`);
 
-    const memOpts = ['-threads', '2', '-analyzeduration', '1M', '-probesize', '1M'];
+    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto'];
     let ffmpegArgs;
-    
     if (isAudio) {
       const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
       const fmtMap  = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
       ffmpegArgs = [
-        ...memOpts, '-i', videoUrl,
-        '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '2',
+        ...hlsArgs, '-i', videoUrl,
+        '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0',
         '-f', fmtMap[format] || 'mp3', 'pipe:1'
       ];
       res.setHeader('Content-Type', `audio/${format}`);
     } else {
-      // Always transcode to H.264/AAC for compatibility
+      // Use libx264 transcoding to ensure VP9/AV1 HLS sources work
       ffmpegArgs = audioUrl
-        ? [...memOpts, '-i', videoUrl, '-i', audioUrl, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-f', 'mp4', 'pipe:1']
-        : [...memOpts, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k', '-f', 'mp4', 'pipe:1'];
+        ? [...hlsArgs, '-i', videoUrl, '-i', audioUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-shortest', '-f', 'mp4', 'pipe:1']
+        : [...hlsArgs, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-f', 'mp4', 'pipe:1'];
       res.setHeader('Content-Type', 'video/mp4');
     }
 
-    ffmpeg = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+    ffmpeg = spawn('ffmpeg', ffmpegArgs);
     ffmpeg.stdout.pipe(res);
-    
-    let ffErr = '';
-    ffmpeg.stderr.on('data', d => {
-      ffErr += d.toString();
-      if (ffErr.length > 4000) ffErr = ffErr.slice(-2000);
-    });
-    
-    ffmpeg.on('close', code => {
-      cleanup();
-      if (code !== 0 && code !== null) {
-        console.error('[ffmpeg download] exited:', code, ffErr.slice(-400));
-      }
-    });
-    
+    ffmpeg.stderr.on('data', () => {});
     ffmpeg.on('error', err => {
       cleanup();
       console.error('[ffmpeg download] error:', err.message);
       if (!res.headersSent) res.status(500).send('Download error');
     });
-    
+    ffmpeg.on('close', () => cleanup());
     req.on('close', cleanup);
-    req.on('error', cleanup);
 
   } catch (error) {
     cleanup();
