@@ -175,26 +175,32 @@ app.get('/api/stream/:videoId', async (req, res) => {
     const videoUrl = urls[0];
     const audioUrl = urls[1] || null;
 
+    console.log(`[stream] ${videoId} q=${quality} audioOnly=${audioOnly} urls=${urls.length}`);
+
     // Always transcode to H.264/AAC fragmented MP4 - guarantees browser compatibility
-    // regardless of whether YouTube returned VP9, AV1, or H.264 via HLS or direct URL.
-    // ultrafast preset runs at 200+ fps, fast enough for real-time streaming.
-    // protocol_whitelist is required for ffmpeg to follow HLS (m3u8) manifests.
+    // protocol_whitelist + reconnect options for reliable HLS streaming
     const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
-    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto'];
+    const inputOpts = [
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1', 
+      '-reconnect_delay_max', '5'
+    ];
     const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
 
     let ffmpegArgs;
     if (audioOnly === 'true') {
       ffmpegArgs = [
-        ...hlsArgs, ...seekArgs, '-i', videoUrl,
+        ...inputOpts, ...seekArgs, '-i', videoUrl,
         '-vn', '-c:a', 'aac', '-b:a', '128k',
         ...outFlags, 'pipe:1'
       ];
       res.setHeader('Content-Type', 'audio/mp4');
     } else if (audioUrl) {
       ffmpegArgs = [
-        ...hlsArgs,
+        ...inputOpts,
         ...seekArgs, '-i', videoUrl,
+        ...inputOpts,
         ...seekArgs, '-i', audioUrl,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
@@ -204,7 +210,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
       res.setHeader('Content-Type', 'video/mp4');
     } else {
       ffmpegArgs = [
-        ...hlsArgs, ...seekArgs, '-i', videoUrl,
+        ...inputOpts, ...seekArgs, '-i', videoUrl,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         ...outFlags, 'pipe:1'
@@ -267,22 +273,26 @@ app.get('/api/download/:videoId', async (req, res) => {
 
     res.setHeader('Content-Disposition', `attachment; filename="download_${videoId}.${ext}"`);
 
-    const hlsArgs = ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto'];
+    const inputOpts = [
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5'
+    ];
     let ffmpegArgs;
     if (isAudio) {
       const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
       const fmtMap  = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
       ffmpegArgs = [
-        ...hlsArgs, '-i', videoUrl,
+        ...inputOpts, '-i', videoUrl,
         '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0',
         '-f', fmtMap[format] || 'mp3', 'pipe:1'
       ];
       res.setHeader('Content-Type', `audio/${format}`);
     } else {
-      // Use libx264 transcoding to ensure VP9/AV1 HLS sources work
       ffmpegArgs = audioUrl
-        ? [...hlsArgs, '-i', videoUrl, '-i', audioUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-shortest', '-f', 'mp4', 'pipe:1']
-        : [...hlsArgs, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-f', 'mp4', 'pipe:1'];
+        ? [...inputOpts, '-i', videoUrl, ...inputOpts, '-i', audioUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-shortest', '-f', 'mp4', 'pipe:1']
+        : [...inputOpts, '-i', videoUrl, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-c:a', 'aac', '-f', 'mp4', 'pipe:1'];
       res.setHeader('Content-Type', 'video/mp4');
     }
 
