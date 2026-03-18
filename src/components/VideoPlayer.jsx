@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Minimize,
-  Loader2, Settings, Download, Video, Music, Disc3, Headphones, FileAudio, ChevronDown
+  Loader2, Settings, Download, Video, Music, Disc3, Headphones, FileAudio
 } from 'lucide-react';
 
 function formatTime(secs) {
@@ -31,9 +31,7 @@ export default function VideoPlayer({ video, onBack }) {
 
   const [quality, setQuality] = useState('720');
   const [speed, setSpeed] = useState(1);
-  const [audioOnly, setAudioOnly] = useState(false);
   const [streamKey, setStreamKey] = useState(0);
-  const [streamOffset, setStreamOffset] = useState(0); // seconds we seeked-to when restarting
 
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -50,7 +48,8 @@ export default function VideoPlayer({ video, onBack }) {
   const [downloading, setDownloading] = useState(false);
   const [draggingProgress, setDraggingProgress] = useState(false);
 
-  const streamUrl = `/api/stream/${video.id}?quality=${quality}&audioOnly=${audioOnly}`;
+  // Use proxy endpoint: supports HTTP range requests so browser can seek and cache natively
+  const proxyUrl = `/api/proxy/${video.id}?quality=${quality}`;
 
   // Fetch video duration from info endpoint
   useEffect(() => {
@@ -66,15 +65,13 @@ export default function VideoPlayer({ video, onBack }) {
     const v = videoRef.current;
     if (!v) return;
     const onTimeUpdate = () => {
-      setCurrentTime(streamOffset + v.currentTime);
+      setCurrentTime(v.currentTime);
       if (v.buffered.length > 0) {
-        setBufferedEnd(streamOffset + v.buffered.end(v.buffered.length - 1));
+        setBufferedEnd(v.buffered.end(v.buffered.length - 1));
       }
     };
     const onDurationChange = () => {
-      if (v.duration && isFinite(v.duration) && v.duration > duration) {
-        setDuration(streamOffset + v.duration);
-      }
+      if (v.duration && isFinite(v.duration)) setDuration(v.duration);
     };
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
@@ -97,7 +94,7 @@ export default function VideoPlayer({ video, onBack }) {
       v.removeEventListener('canplay', onCanPlay);
       v.removeEventListener('loadstart', onLoadStart);
     };
-  }, [streamOffset, duration]);
+  }, [streamKey]);
 
   // Apply playback speed
   useEffect(() => {
@@ -128,22 +125,12 @@ export default function VideoPlayer({ video, onBack }) {
     return () => clearTimeout(hideControlsTimer.current);
   }, [playing]);
 
-  // Seek: try native first, restart stream if seeking far ahead
+  // Native seek — the proxy endpoint handles range requests so the browser can seek freely
   const seekTo = useCallback((targetTime) => {
     const v = videoRef.current;
     if (!v) return;
-    const withinBuffer = targetTime >= streamOffset &&
-      targetTime <= streamOffset + (v.buffered.length > 0 ? v.buffered.end(v.buffered.length - 1) : 0);
-    if (withinBuffer) {
-      v.currentTime = targetTime - streamOffset;
-    } else {
-      // Restart stream from seek position
-      setStreamOffset(targetTime);
-      setCurrentTime(targetTime);
-      setIsLoading(true);
-      setStreamKey(k => k + 1);
-    }
-  }, [streamOffset]);
+    v.currentTime = targetTime;
+  }, []);
 
   // Progress bar interaction
   const getProgressRatio = useCallback((e) => {
@@ -204,38 +191,41 @@ export default function VideoPlayer({ video, onBack }) {
   };
 
   const changeQuality = (q) => {
+    const savedTime = videoRef.current?.currentTime || 0;
     setQuality(q);
     setIsLoading(true);
-    setStreamOffset(currentTime);
     setStreamKey(k => k + 1);
     setShowSettings(false);
+    // Restore position after quality change
+    setTimeout(() => {
+      if (videoRef.current) videoRef.current.currentTime = savedTime;
+    }, 500);
   };
 
-  const changeAudioOnly = (v) => {
-    setAudioOnly(v);
-    setIsLoading(true);
-    setStreamOffset(currentTime);
-    setStreamKey(k => k + 1);
-    setShowSettings(false);
-  };
-
-  const handleDownload = (format) => {
+  // Download via fetch+blob so it works reliably across all browsers/proxies
+  const handleDownload = async (format) => {
     setDownloading(true);
     setShowDownload(false);
-    const url = `/api/download/${video.id}?format=${format}&quality=${quality}`;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${video.title || 'video'}.${format}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => setDownloading(false), 2000);
+    try {
+      const url = `/api/download/${video.id}?format=${format}&quality=${quality}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Server error: ${res.status}`);
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = `${video.title || 'video'}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+    } catch (err) {
+      console.error('Download failed:', err);
+      alert(`Download failed: ${err.message}`);
+    } finally {
+      setDownloading(false);
+    }
   };
-
-  // New stream URL includes start offset
-  const fullStreamUrl = streamOffset > 0
-    ? `${streamUrl}&start=${Math.floor(streamOffset)}`
-    : streamUrl;
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
@@ -259,14 +249,15 @@ export default function VideoPlayer({ video, onBack }) {
         onClick={() => { togglePlay(); showControls(); }}
         onDoubleClick={toggleFullscreen}
       >
-        {/* Video */}
+        {/* Video — key on streamKey+quality so it reloads when quality changes */}
         <video
-          key={`${streamKey}-${streamOffset}`}
+          key={`${streamKey}-${quality}`}
           ref={videoRef}
-          src={fullStreamUrl}
+          src={proxyUrl}
           className="w-full aspect-video block"
           autoPlay
           playsInline
+          preload="auto"
           onError={(e) => { console.error('Video error:', e.target.error); setIsLoading(false); }}
         />
 
@@ -339,7 +330,7 @@ export default function VideoPlayer({ video, onBack }) {
 
             <div className="flex-1" />
 
-            {/* Speed indicator (click to open settings) */}
+            {/* Speed indicator */}
             <button
               className="text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20 hover:text-[var(--accent)] transition-colors"
               onClick={(e) => { e.stopPropagation(); setShowSettings(s => !s); setShowDownload(false); }}
@@ -347,7 +338,7 @@ export default function VideoPlayer({ video, onBack }) {
               {speed}x
             </button>
 
-            {/* Settings (quality + speed + audio-only) */}
+            {/* Settings (quality + speed) */}
             <div className="relative">
               <button
                 className="flex items-center gap-1 hover:text-[var(--accent)] transition-colors"
@@ -375,7 +366,7 @@ export default function VideoPlayer({ video, onBack }) {
                       ))}
                     </div>
                   </div>
-                  <div className="mb-3">
+                  <div>
                     <label className="block text-xs font-semibold mb-1.5 text-[var(--text-secondary)] uppercase tracking-wide">Speed</label>
                     <div className="grid grid-cols-4 gap-1">
                       {SPEEDS.map(s => (
@@ -389,15 +380,6 @@ export default function VideoPlayer({ video, onBack }) {
                       ))}
                     </div>
                   </div>
-                  <label className="flex items-center gap-2 cursor-pointer text-sm">
-                    <input
-                      type="checkbox"
-                      checked={audioOnly}
-                      onChange={e => changeAudioOnly(e.target.checked)}
-                      className="w-4 h-4 accent-[var(--accent)]"
-                    />
-                    Audio Only
-                  </label>
                 </div>
               )}
             </div>
