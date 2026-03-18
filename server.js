@@ -1,3 +1,33 @@
+/**
+ * YouTube Privacy Frontend - Piped Architecture
+ *
+ * DESIGN PHILOSOPHY (based on Piped):
+ *
+ * 1. METADATA ONLY: Server extracts and returns metadata (URLs, titles, formats)
+ *    - NO server-side media streaming for playback
+ *    - NO ffmpeg transcoding in the playback path
+ *    - NO long-lived media connections
+ *
+ * 2. BROWSER-SIDE PLAYBACK: Browser fetches video segments directly
+ *    - Adaptive bitrate streaming (DASH/HLS style)
+ *    - Many short segment requests (not one long stream)
+ *    - Native browser seeking and caching
+ *
+ * 3. PRIVACY PROXY: Lightweight stateless URL rewriting
+ *    - Shields user IP from Google
+ *    - No transcoding or muxing
+ *    - Just passes bytes through
+ *
+ * 4. WHY THIS WORKS:
+ *    - From YouTube's perspective: normal playback behavior
+ *    - From user's perspective: privacy preserved
+ *    - From server's perspective: minimal resource usage
+ *
+ * KEY DIFFERENCE FROM TRADITIONAL APPROACH:
+ *    ❌ Server acting as downloader/CDN (triggers blocking)
+ *    ✅ Server acting as metadata provider (looks like normal use)
+ */
+
 import express from 'express';
 import { Innertube, UniversalCache } from 'youtubei.js';
 import { spawn } from 'child_process';
@@ -13,9 +43,6 @@ process.env.PATH = `${process.env.HOME}/.local/bin:${process.env.HOME}/workspace
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 8080;
-
-const MAX_CONCURRENT_STREAMS = 3;
-let activeStreams = 0;
 
 const MAX_CONCURRENT_YTDLP = 2;
 let activeYtDlp = 0;
@@ -94,8 +121,9 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 /**
- * Get DASH URLs (video+audio) for ffmpeg audio transcoding.
- * ios/tv_embedded clients bypass sign-in requirements for most public content.
+ * Get DASH stream URLs (metadata extraction only)
+ * Returns direct YouTube CDN URLs for browser playback
+ * ios/tv_embedded clients bypass sign-in requirements for most public content
  */
 async function getDashStreamUrls(videoId, quality, audioOnly) {
   const key = `${videoId}:dash:${quality}:${audioOnly}`;
@@ -283,23 +311,89 @@ app.get('/api/info/:videoId', async (req, res) => {
 });
 
 /**
- * PROXY: stream progressive MP4 with range request support.
- * Enables native browser seeking and HTTP-level caching.
+ * STREAMS: Piped-style metadata endpoint
+ * Returns available stream URLs - browser fetches directly (Piped architecture)
+ * No server-side media processing, no ffmpeg, no transcoding
  */
-app.get('/api/proxy/:videoId', async (req, res) => {
+app.get('/api/streams/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { quality = '720' } = req.query;
+
+  try {
+    const formats = [];
+
+    for (const quality of ['360', '480', '720', '1080']) {
+      try {
+        const url = await getProgressiveMp4Url(videoId, quality);
+        formats.push({
+          quality: `${quality}p`,
+          format: 'MPEG_4',
+          mimeType: 'video/mp4',
+          codec: 'avc1',
+          videoOnly: false,
+          url: url,
+          width: parseInt(quality) * 16 / 9,
+          height: parseInt(quality)
+        });
+      } catch (e) {
+        console.log(`[streams] ${quality}p unavailable: ${e.message.slice(0, 100)}`);
+      }
+    }
+
+    try {
+      const audioUrl = (await getDashStreamUrls(videoId, '720', true))[0];
+      formats.push({
+        quality: 'audio',
+        format: 'M4A',
+        mimeType: 'audio/mp4',
+        codec: 'mp4a',
+        audioOnly: true,
+        url: audioUrl,
+        bitrate: 128000
+      });
+    } catch (e) {
+      console.log(`[streams] audio unavailable: ${e.message.slice(0, 100)}`);
+    }
+
+    if (formats.length === 0) {
+      throw new Error('No streams available');
+    }
+
+    res.json({
+      videoStreams: formats.filter(f => !f.audioOnly),
+      audioStreams: formats.filter(f => f.audioOnly),
+      videoId,
+      fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+    });
+
+  } catch (error) {
+    console.error('[streams] error:', error.message);
+    res.status(502).json({
+      error: error.message,
+      fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+    });
+  }
+});
+
+/**
+ * PROXY: Lightweight stateless privacy proxy (Piped architecture)
+ * No transcoding, no ffmpeg, no muxing - just URL rewriting for privacy
+ * Handles segment/range requests from browser with minimal server involvement
+ */
+app.get('/api/proxy', async (req, res) => {
+  const { url } = req.query;
+
+  if (!url || !url.includes('googlevideo.com')) {
+    return res.status(400).json({ error: 'Invalid or missing URL parameter' });
+  }
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
   try {
-    const upstreamUrl = await getProgressiveMp4Url(videoId, quality);
-
     const headers = { 'User-Agent': YT_UA, 'Referer': 'https://www.youtube.com/' };
     if (req.headers.range) headers['Range'] = req.headers.range;
 
-    const upstream = await fetch(upstreamUrl, { headers, signal: controller.signal });
+    const upstream = await fetch(url, { headers, signal: controller.signal });
 
     res.status(upstream.status);
 
@@ -309,7 +403,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       if (v) res.setHeader(h, v);
     }
 
-    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Vary', 'Range');
 
     if (!upstream.body) {
@@ -322,131 +416,19 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     if (controller.signal.aborted) return;
     console.error('[proxy] error:', e.message);
     if (!res.headersSent) {
-      res.status(502).json({
-        error: e.message,
-        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
-      });
+      res.status(502).json({ error: e.message });
     }
   }
 });
 
 /**
- * STREAM (legacy): yt-dlp + ffmpeg fragmented MP4 pipe
- */
-app.get('/api/stream/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  const { quality = '720', audioOnly = 'false', start = '0' } = req.query;
-  const startSec = parseFloat(start) || 0;
-
-  if (activeStreams >= MAX_CONCURRENT_STREAMS) {
-    return res.status(503).json({ error: 'Server busy, please try again' });
-  }
-
-  activeStreams++;
-  let ffmpeg = null;
-
-  const cleanup = () => {
-    activeStreams = Math.max(0, activeStreams - 1);
-    if (ffmpeg) { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }
-  };
-
-  try {
-    const urls = await getDashStreamUrls(videoId, quality, audioOnly === 'true');
-    const videoUrl = urls[0];
-    const audioUrl = urls[1] || null;
-
-    console.log(`[stream] ${videoId} q=${quality} audioOnly=${audioOnly} urls=${urls.length}`);
-
-    const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
-    const inputOpts = [
-      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-      '-user_agent', YT_UA,
-      '-headers', 'Referer: https://www.youtube.com/\r\n'
-    ];
-
-    const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
-
-    let ffmpegArgs;
-    if (audioOnly === 'true') {
-      ffmpegArgs = [
-        ...inputOpts, ...seekArgs, '-i', videoUrl,
-        '-vn', '-c:a', 'aac', '-b:a', '128k',
-        ...outFlags, 'pipe:1'
-      ];
-      res.setHeader('Content-Type', 'audio/mp4');
-    } else if (audioUrl) {
-      ffmpegArgs = [
-        ...inputOpts, ...seekArgs, '-i', videoUrl,
-        ...inputOpts, ...seekArgs, '-i', audioUrl,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-shortest',
-        ...outFlags, 'pipe:1'
-      ];
-      res.setHeader('Content-Type', 'video/mp4');
-    } else {
-      ffmpegArgs = [
-        ...inputOpts, ...seekArgs, '-i', videoUrl,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-c:a', 'aac', '-b:a', '128k',
-        ...outFlags, 'pipe:1'
-      ];
-      res.setHeader('Content-Type', 'video/mp4');
-    }
-
-    ffmpeg = spawn('ffmpeg', ffmpegArgs);
-
-    let ffErr = '';
-    let bytesWritten = 0;
-
-    ffmpeg.stdout.on('data', chunk => {
-      bytesWritten += chunk.length;
-      if (!res.writableEnded) res.write(chunk);
-    });
-
-    ffmpeg.stdout.on('end', () => {
-      if (!res.writableEnded) res.end();
-    });
-
-    ffmpeg.stderr.on('data', d => {
-      ffErr += d.toString();
-      if (ffErr.length > 8000) ffErr = ffErr.slice(-4000);
-    });
-
-    ffmpeg.on('close', code => {
-      cleanup();
-      if (code !== 0 && code !== null) {
-        console.error(`[ffmpeg stream] ${videoId} exited ${code}, bytes written: ${bytesWritten}`);
-        console.error(`[ffmpeg stderr]:`, ffErr.slice(-800));
-      }
-    });
-
-    ffmpeg.on('error', err => {
-      cleanup();
-      console.error('[ffmpeg stream] spawn error:', err.message);
-      if (!res.headersSent) res.status(500).send('Streaming error');
-    });
-
-    req.on('close', cleanup);
-
-  } catch (error) {
-    cleanup();
-    console.error('Stream error:', error.message);
-    if (!res.headersSent) {
-      res.status(502).json({
-        error: error.message,
-        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
-      });
-    }
-  }
-});
-
-/**
- * DOWNLOAD
- * - MP4: proxy the progressive URL directly — no ffmpeg, no 403 from Google CDN
- * - Audio (mp3/flac/opus/ogg): get bestaudio URL, transcode with ffmpeg using
- *   proper User-Agent so Google CDN accepts the request
+ * DOWNLOAD (separate from playback)
+ * - MP4: proxy progressive URL directly (no re-encoding)
+ * - Audio formats (mp3/flac/opus/ogg): ffmpeg transcoding is acceptable here
+ *   because downloads are one-time operations, not continuous playback streams
+ *
+ * Note: This differs from Piped's playback model. Piped avoids downloads entirely
+ * and focuses only on streaming playback. We keep this for user convenience.
  */
 app.get('/api/download/:videoId', async (req, res) => {
   const { videoId } = req.params;
@@ -455,7 +437,6 @@ app.get('/api/download/:videoId', async (req, res) => {
   const isAudio = format !== 'mp4';
   const safeTitle = `video_${videoId}`;
 
-  // ── MP4: stream the progressive file directly, no re-encode ──────────────
   if (!isAudio) {
     try {
       const upstreamUrl = await getProgressiveMp4Url(videoId, quality);
@@ -482,16 +463,9 @@ app.get('/api/download/:videoId', async (req, res) => {
     return;
   }
 
-  // ── Audio: get bestaudio URL then transcode with ffmpeg ──────────────────
-  if (activeStreams >= MAX_CONCURRENT_STREAMS) {
-    return res.status(503).json({ error: 'Server busy, please try again' });
-  }
-
-  activeStreams++;
   let ffmpeg = null;
 
   const cleanup = () => {
-    activeStreams = Math.max(0, activeStreams - 1);
     if (ffmpeg) { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }
   };
 
