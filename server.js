@@ -40,11 +40,12 @@ async function getStreamUrls(videoId, quality, audioOnly) {
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
 
   // Prefer H.264 (avc1) for browser compatibility
+  // Include 'best' as final fallback which returns combined video+audio
   const ytFormat = audioOnly
-    ? 'bestaudio'
+    ? 'bestaudio/best'
     : [
-        `bestvideo[vcodec^=avc1][height<=${quality}]+bestaudio`,
-        `bestvideo[height<=${quality}]+bestaudio`,
+        `bestvideo[vcodec^=avc1][height<=${quality}]+bestaudio/bestaudio`,
+        `bestvideo[height<=${quality}]+bestaudio/bestaudio`,
         `best[height<=${quality}]`,
         'best'
       ].join('/');
@@ -242,17 +243,38 @@ app.get('/api/stream/:videoId', async (req, res) => {
       res.setHeader('Content-Type', 'video/mp4');
     }
 
+    console.log(`[ffmpeg] Starting stream for ${videoId}, args count: ${ffmpegArgs.length}`);
+    
     ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    ffmpeg.stdout.pipe(res);
+    
     let ffErr = '';
-    ffmpeg.stderr.on('data', d => { ffErr += d; });
+    let bytesWritten = 0;
+    
+    ffmpeg.stdout.on('data', chunk => {
+      bytesWritten += chunk.length;
+      if (!res.writableEnded) {
+        res.write(chunk);
+      }
+    });
+    
+    ffmpeg.stdout.on('end', () => {
+      console.log(`[ffmpeg] Stream ${videoId} finished, bytes: ${bytesWritten}`);
+      if (!res.writableEnded) res.end();
+    });
+    
+    ffmpeg.stderr.on('data', d => { 
+      ffErr += d.toString();
+      if (ffErr.length > 8000) ffErr = ffErr.slice(-4000);
+    });
 
     ffmpeg.on('close', code => {
       cleanup();
       if (code !== 0 && code !== null) {
-        console.error(`[ffmpeg stream] exited ${code}:`, ffErr.slice(-400));
+        console.error(`[ffmpeg stream] ${videoId} exited ${code}, bytes written: ${bytesWritten}`);
+        console.error(`[ffmpeg stderr]:`, ffErr.slice(-800));
       }
     });
+    
     ffmpeg.on('error', err => {
       cleanup();
       console.error('[ffmpeg stream] spawn error:', err.message);
