@@ -1,15 +1,11 @@
 import express from 'express';
-import { Innertube, UniversalCache, Platform, Log } from 'youtubei.js';
-import { BG } from 'bgutils-js';
+import { Innertube, UniversalCache } from 'youtubei.js';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-
-// Set log level to ERROR to see critical issues but suppress verbose warnings
-Log.setLevel(Log.Level.ERROR);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -19,71 +15,33 @@ const MAX_CONCURRENT_STREAMS = 5;
 let activeStreams = 0;
 
 const YT_UA = 'Mozilla/5.0 (Linux; Android 13; SM-A135F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
-const YT_REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 
-// --- Fix #1: N-parameter shim ---
-// Enables YouTube.js to run the player's JS decipher/throttle challenge inside Node,
-// preventing the ~50 KB/s speed cap YouTube enforces on unsigned requests.
-Platform.shim.eval = (code, env) => {
-  return new Function(...Object.keys(env), code)(...Object.values(env));
-};
-
-// --- Fix #3: Safe fetch shim ---
-// youtubei.js with po_token injects Symbol-keyed entries into init.headers for
-// internal tracking. The native fetch Request constructor rejects Symbol keys.
-// We patch Platform.shim.fetch (used by ALL youtubei.js requests) to strip them.
-const _nativeFetch = Platform.shim.fetch ?? fetch;
-Platform.shim.fetch = (input, init = {}) => {
-  if (init?.headers && typeof init.headers === 'object') {
-    const clean = {};
-    // Object.entries only yields string-keyed props — Symbols are silently dropped
-    for (const [k, v] of Object.entries(init.headers)) clean[k] = v;
-    init = { ...init, headers: clean };
-  }
-  return _nativeFetch(input, init);
-};
-
-let youtube;
-let refreshTimer = null;
-
-// --- Fix #2: PoToken generation via bgutils-js ---
-// generateColdStartToken is a pure-JS implementation — no browser APIs needed.
-// It works for most videos (StreamProtectionStatus ≤ 2) and runs fine in Node.js.
-function generatePoToken(visitorData) {
-  return BG.PoToken.generateColdStartToken(visitorData);
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
+let youtube;
+
 async function initYouTube() {
-  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
-
   try {
-    // First create a bare instance to obtain a stable visitorData
-    const bare = await Innertube.create({ generate_session_locally: true });
-    const visitorData = bare.session.context.client.visitorData;
-
-    let po_token;
-    try {
-      po_token = await generatePoToken(visitorData);
-      console.log('>>> [SUCCESS] PoToken generated');
-    } catch (e) {
-      console.warn('>>> [WARN] PoToken generation failed:', e.message, '— proceeding without it');
-    }
-
     youtube = await Innertube.create({
-      visitor_data: visitorData,
-      po_token,
       cache: new UniversalCache(false),
       generate_session_locally: true,
       enable_session_cache: true,
       retrieve_player: true,
+      fetch: (url, options = {}) => {
+        return fetch(url, {
+          ...options,
+          headers: {
+            ...options.headers,
+            'User-Agent': YT_UA,
+          }
+        });
+      }
     });
-
-    console.log('>>> [SUCCESS] YouTube API Initialised');
-
-    // Refresh every 25 minutes — PoTokens expire after ~30 minutes
-    refreshTimer = setTimeout(initYouTube, 25 * 60 * 1000);
+    console.log(">>> [SUCCESS] YouTube API Initialised");
   } catch (e) {
-    console.error('>>> [ERROR] Init Failed:', e.message);
+    console.error(">>> [ERROR] Init Failed:", e.message);
     setTimeout(initYouTube, 10000);
   }
 }
@@ -95,7 +53,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
 const formatCache = new Map();
-const CACHE_TTL = 60 * 60 * 1000; // 1 hour — YouTube stream URLs expire, keep cache short
+const CACHE_TTL = 4 * 60 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -108,242 +66,48 @@ async function getVideoFormats(videoId) {
   const cacheKey = `formats:${videoId}`;
   const cached = formatCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL) {
-    console.log(`[formats] Using cached formats for ${videoId}`);
     return cached.formats;
   }
 
   if (!youtube) {
-    const error = 'YouTube API not initialized';
-    console.error(`[formats] ERROR: ${error}`);
-    throw new Error(error);
+    throw new Error('YouTube API not initialized');
   }
-
-  console.log(`[formats] Fetching formats for video: ${videoId}`);
 
   try {
     const info = await youtube.getInfo(videoId);
-    
-    console.log(`[formats] getInfo() completed for ${videoId}`);
-    
-    if (!info) {
-      const error = 'getInfo() returned null/undefined';
-      console.error(`[formats] ERROR: ${error} for ${videoId}`);
-      throw new Error(error);
-    }
-
-    // Check if streaming_data exists and has content
-    const hasStreamingData = info.streaming_data && 
-      (info.streaming_data.formats?.length > 0 || info.streaming_data.adaptive_formats?.length > 0);
-
-    if (!hasStreamingData) {
-      console.error(`[formats] ERROR: No valid streaming_data for ${videoId}`);
-      console.error(`[formats] streaming_data exists:`, !!info.streaming_data);
-      if (info.streaming_data) {
-        console.error(`[formats] formats count:`, info.streaming_data.formats?.length || 0);
-        console.error(`[formats] adaptive_formats count:`, info.streaming_data.adaptive_formats?.length || 0);
-      }
-      console.error(`[formats] Playability status:`, info.playability_status?.status);
-      throw new Error('No streaming data available - video may be restricted');
-    }
-
-    let muxed = info.streaming_data.formats || [];
-    let adaptive = info.streaming_data.adaptive_formats || [];
-
-    // Decipher formats if needed - this resolves signature_cipher into actual URLs
-    console.log(`[formats] Deciphering ${muxed.length + adaptive.length} formats...`);
-    
-    // Process muxed formats
-    const muxedDeciphered = [];
-    for (const f of muxed) {
-      try {
-        // Check if format needs deciphering (has signature_cipher but no url)
-        if (f.signature_cipher && !f.url) {
-          console.log(`[formats] Deciphering muxed format itag=${f.itag}...`);
-          await f.decipher(youtube.session.player);
-          console.log(`[formats] ✓ Muxed itag=${f.itag} deciphered, hasUrl=${!!f.url}`);
-        }
-        if (f.url) {
-          muxedDeciphered.push(f);
-        } else {
-          console.warn(`[formats] ✗ Muxed itag=${f.itag} still has no URL after decipher`);
-        }
-      } catch (e) {
-        console.warn(`[formats] Failed to decipher muxed format itag=${f.itag}:`, e.message);
-      }
-    }
-    
-    // Process adaptive formats
-    const adaptiveDeciphered = [];
-    for (const f of adaptive) {
-      try {
-        // Check if format needs deciphering (has signature_cipher but no url)
-        if (f.signature_cipher && !f.url) {
-          await f.decipher(youtube.session.player);
-        }
-        if (f.url) {
-          adaptiveDeciphered.push(f);
-        }
-      } catch (e) {
-        console.warn(`[formats] Failed to decipher adaptive format itag=${f.itag}:`, e.message);
-      }
-    }
-
-    muxed = muxedDeciphered;
-    adaptive = adaptiveDeciphered;
-
-    console.log(`[formats] ${videoId} - After decipher: ${muxed.length} muxed, ${adaptive.length} adaptive`);
-
-    if (muxed.length > 0) {
-      console.log(`[formats] Muxed formats available:`, muxed.map(f => ({
-        itag: f.itag,
-        quality: f.quality_label || f.quality,
-        height: f.height,
-        hasAudio: f.has_audio,
-        hasVideo: f.has_video,
-        hasUrl: !!f.url
-      })));
-    }
-
-    if (adaptive.length > 0) {
-      console.log(`[formats] Adaptive formats available:`, adaptive.slice(0, 5).map(f => ({
-        itag: f.itag,
-        quality: f.quality_label || f.quality,
-        height: f.height,
-        hasAudio: f.has_audio,
-        hasVideo: f.has_video,
-        hasUrl: !!f.url
-      })));
-    }
-
-    if (muxed.length === 0 && adaptive.length === 0) {
-      const error = 'No formats available after deciphering';
-      console.error(`[formats] ERROR: ${error} for ${videoId}`);
-      throw new Error(error);
+    if (!info || !info.streaming_data) {
+      throw new Error('No streaming data available');
     }
 
     const formats = {
-      videoFormats: muxed,
-      adaptiveFormats: adaptive,
+      videoFormats: info.streaming_data.formats || [],
+      adaptiveFormats: info.streaming_data.adaptive_formats || [],
       duration: info.basic_info?.duration || 0,
       title: info.basic_info?.title || 'Video'
     };
 
     formatCache.set(cacheKey, { formats, ts: Date.now() });
-    console.log(`[formats] Successfully cached formats for ${videoId}`);
-    
     return formats;
   } catch (err) {
-    console.error(`[formats] EXCEPTION caught for ${videoId}:`);
-    console.error(`[formats] Error type: ${err.constructor.name}`);
-    console.error(`[formats] Error message: ${err.message}`);
-    console.error(`[formats] Stack trace:`, err.stack);
+    console.error(`[innertube] getVideoFormats failed for ${videoId}:`, err.message);
     throw err;
   }
 }
 
 function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
-  console.log(`[selectFormat] Starting format selection - qualityLimit: ${qualityLimit}, isAudio: ${isAudio}`);
-  console.log(`[selectFormat] Available: ${formats.videoFormats.length} muxed, ${formats.adaptiveFormats.length} adaptive`);
+  const allFormats = [...formats.videoFormats, ...formats.adaptiveFormats];
 
   if (isAudio) {
-    console.log(`[selectFormat] Audio-only mode requested`);
-    // Best audio-only adaptive format
-    const audioOnly = formats.adaptiveFormats
-      .filter(f => f.has_audio && !f.has_video)
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    
-    if (audioOnly.length > 0) {
-      console.log(`[selectFormat] ✓ Selected audio-only format: itag=${audioOnly[0].itag}, bitrate=${audioOnly[0].bitrate}`);
-      return audioOnly[0];
-    }
-    
-    // Fallback: any format with audio
-    const anyAudio = [...formats.videoFormats, ...formats.adaptiveFormats]
-      .filter(f => f.has_audio)
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    
-    if (anyAudio.length > 0) {
-      console.log(`[selectFormat] ✓ Fallback audio format: itag=${anyAudio[0].itag}`);
-      return anyAudio[0];
-    }
-    
-    console.error(`[selectFormat] ✗ No audio formats found!`);
-    throw new Error('No audio format available');
+    return allFormats
+      .filter(f => f.audio_channels && !f.video_channels)
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
   }
 
-  // 1. Prefer muxed formats (streaming_data.formats) — they have both audio + video combined
-  console.log(`[selectFormat] Step 1: Looking for muxed formats <= ${qualityLimit}p`);
-  const muxedAtLimit = formats.videoFormats
-    .filter(f => f.has_video && f.height && f.height <= qualityLimit)
+  const videoFormats = allFormats
+    .filter(f => f.video_channels && f.height && f.height <= qualityLimit)
     .sort((a, b) => (b.height || 0) - (a.height || 0));
-  
-  if (muxedAtLimit.length > 0) {
-    const selected = muxedAtLimit[0];
-    console.log(`[selectFormat] ✓ Step 1 SUCCESS: muxed format ${selected.height}p, itag=${selected.itag}, hasAudio=${selected.has_audio}, mime=${selected.mime_type}`);
-    return selected;
-  }
-  console.log(`[selectFormat] ✗ Step 1 failed: No muxed formats at or below ${qualityLimit}p`);
 
-  // 2. Any muxed format (ignore quality limit — best available)
-  console.log(`[selectFormat] Step 2: Looking for any muxed formats with height`);
-  const anyMuxed = formats.videoFormats
-    .filter(f => f.has_video && f.height)
-    .sort((a, b) => (b.height || 0) - (a.height || 0));
-  
-  if (anyMuxed.length > 0) {
-    const selected = anyMuxed[0];
-    console.log(`[selectFormat] ✓ Step 2 SUCCESS: muxed format ${selected.height}p (any quality), itag=${selected.itag}, hasAudio=${selected.has_audio}`);
-    return selected;
-  }
-  console.log(`[selectFormat] ✗ Step 2 failed: No muxed formats with height property`);
-
-  // 3. Try any muxed format without quality filter
-  console.log(`[selectFormat] Step 3: Looking for any muxed formats (no filters)`);
-  const anyMuxedNoFilter = formats.videoFormats
-    .filter(f => f.has_video)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  
-  if (anyMuxedNoFilter.length > 0) {
-    const selected = anyMuxedNoFilter[0];
-    console.log(`[selectFormat] ✓ Step 3 SUCCESS: muxed format (unfiltered), itag=${selected.itag}, bitrate=${selected.bitrate}, hasAudio=${selected.has_audio}`);
-    return selected;
-  }
-  console.log(`[selectFormat] ✗ Step 3 failed: No muxed formats with video`);
-
-  // 4. Last resort: adaptive video stream (no audio, but at least something plays)
-  console.log(`[selectFormat] Step 4: Looking for adaptive video formats <= ${qualityLimit}p`);
-  const adaptiveVideo = formats.adaptiveFormats
-    .filter(f => f.has_video && f.height && f.height <= qualityLimit)
-    .sort((a, b) => (b.height || 0) - (a.height || 0));
-  
-  if (adaptiveVideo.length > 0) {
-    const selected = adaptiveVideo[0];
-    console.warn(`[selectFormat] ⚠ Step 4 WARNING: Using video-only adaptive stream (NO AUDIO) - ${selected.height}p, itag=${selected.itag}`);
-    return selected;
-  }
-  console.log(`[selectFormat] ✗ Step 4 failed: No adaptive video formats at or below ${qualityLimit}p`);
-
-  // 5. Ultimate fallback: any format with video
-  console.log(`[selectFormat] Step 5: Looking for ANY format with video (ultimate fallback)`);
-  const anyVideo = [...formats.videoFormats, ...formats.adaptiveFormats]
-    .filter(f => f.has_video)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-  
-  if (anyVideo.length > 0) {
-    const selected = anyVideo[0];
-    console.warn(`[selectFormat] ⚠ Step 5 FALLBACK: Using any available video format - itag=${selected.itag}, hasAudio=${selected.has_audio}, bitrate=${selected.bitrate}`);
-    return selected;
-  }
-
-  console.error(`[selectFormat] ✗✗✗ ALL STEPS FAILED - No playable format found`);
-  console.error(`[selectFormat] Debug info:`, {
-    totalMuxed: formats.videoFormats.length,
-    totalAdaptive: formats.adaptiveFormats.length,
-    muxedWithVideo: formats.videoFormats.filter(f => f.has_video).length,
-    adaptiveWithVideo: formats.adaptiveFormats.filter(f => f.has_video).length
-  });
-  
-  throw new Error('No playable format found after exhaustive search');
+  return videoFormats[0] || allFormats.filter(f => f.height)[0];
 }
 
 app.get('/api/search', async (req, res) => {
@@ -388,97 +152,40 @@ app.get('/api/info/:videoId', async (req, res) => {
   }
 });
 
-// Debug endpoint — lists available formats for a video
-app.get('/api/formats/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  try {
-    const formats = await getVideoFormats(videoId);
-    res.json({
-      muxed: formats.videoFormats.map(f => ({
-        itag: f.itag, height: f.height, has_audio: f.has_audio, has_video: f.has_video,
-        mime: f.mime_type, bitrate: f.bitrate
-      })),
-      adaptive: formats.adaptiveFormats.map(f => ({
-        itag: f.itag, height: f.height, has_audio: f.has_audio, has_video: f.has_video,
-        mime: f.mime_type, bitrate: f.bitrate
-      })),
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720' } = req.query;
 
-  console.log(`[proxy] ▶ Request received for ${videoId}, quality=${quality}`);
-
   const controller = new AbortController();
-  req.on('close', () => {
-    console.log(`[proxy] Client disconnected for ${videoId}`);
-    controller.abort();
-  });
+  req.on('close', () => controller.abort());
 
   try {
-    console.log(`[proxy] Step 1: Fetching formats for ${videoId}`);
     const formats = await getVideoFormats(videoId);
-    
     const qualityNum = parseInt(quality, 10);
-    console.log(`[proxy] Step 2: Selecting best format for quality ${qualityNum}p`);
     const format = selectBestFormat(formats, qualityNum, false);
 
-    if (!format) {
-      const error = 'selectBestFormat returned null/undefined';
-      console.error(`[proxy] ERROR: ${error}`);
-      throw new Error(error);
-    }
-
-    if (!format.url) {
-      const error = 'Selected format has no URL';
-      console.error(`[proxy] ERROR: ${error}, format:`, format);
-      throw new Error(error);
+    if (!format || !format.url) {
+      throw new Error('No suitable format found');
     }
 
     const headers = {
       'User-Agent': YT_UA,
       'Referer': 'https://www.youtube.com/',
     };
-    if (req.headers.range) {
-      headers['Range'] = req.headers.range;
-      console.log(`[proxy] Range request: ${req.headers.range}`);
-    }
+    if (req.headers.range) headers['Range'] = req.headers.range;
 
-    console.log(`[proxy] Step 3: Selected format details:`, {
-      itag: format.itag,
-      height: format.height,
-      hasAudio: format.has_audio,
-      hasVideo: format.has_video,
-      mime: format.mime_type,
-      bitrate: format.bitrate
-    });
+    console.log(`[proxy] ${videoId} quality=${quality} using format height=${format.height} itag=${format.itag}`);
 
-    console.log(`[proxy] Step 4: Fetching from YouTube upstream...`);
     const upstream = await fetch(format.url, {
       headers,
       signal: controller.signal,
       timeout: 30000
     });
 
-    console.log(`[proxy] Upstream response status: ${upstream.status}`);
-
     if (!upstream.ok) {
-      console.error(`[proxy] Upstream returned non-OK status: ${upstream.status} ${upstream.statusText}`);
-      
-      // If URL has expired (403/410), evict cache and retry once
-      if (upstream.status === 403 || upstream.status === 410) {
-        console.log(`[proxy] URL expired (${upstream.status}), evicting cache and retrying...`);
-        formatCache.delete(`formats:${videoId}`);
-      }
-      throw new Error(`Upstream error: ${upstream.status} ${upstream.statusText}`);
+      throw new Error(`Upstream error: ${upstream.status}`);
     }
 
-    console.log(`[proxy] Step 5: Streaming response to client...`);
     res.status(upstream.status);
 
     const passthrough = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
@@ -486,38 +193,22 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-    
-    if (!upstream.headers.get('accept-ranges')) {
-      res.setHeader('Accept-Ranges', 'bytes');
-    }
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
     res.setHeader('Vary', 'Range');
 
     if (!upstream.body) {
-      const error = 'Upstream returned no body';
-      console.error(`[proxy] ERROR: ${error}`);
-      throw new Error(error);
+      throw new Error('Upstream returned no body');
     }
 
     await pipeline(Readable.fromWeb(upstream.body), res);
-    console.log(`[proxy] ✓ Successfully streamed ${videoId} to client`);
 
   } catch (e) {
-    if (controller.signal.aborted) {
-      console.log(`[proxy] Request aborted for ${videoId}`);
-      return;
-    }
-    
-    console.error(`[proxy] ✗✗✗ FATAL ERROR for ${videoId}:`);
-    console.error(`[proxy] Error type: ${e.constructor.name}`);
-    console.error(`[proxy] Error message: ${e.message}`);
-    console.error(`[proxy] Stack:`, e.stack);
-    
+    if (controller.signal.aborted) return;
+    console.error('[proxy] error:', e.message);
     if (!res.headersSent) {
       res.status(502).json({
         error: e.message,
-        videoId: videoId,
         fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
       });
     }
