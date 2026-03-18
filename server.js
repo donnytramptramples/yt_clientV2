@@ -149,31 +149,47 @@ async function getVideoFormats(videoId) {
     let muxed = info.streaming_data.formats || [];
     let adaptive = info.streaming_data.adaptive_formats || [];
 
-    // Decipher formats if needed
+    // Decipher formats if needed - this resolves signature_cipher into actual URLs
     console.log(`[formats] Deciphering ${muxed.length + adaptive.length} formats...`);
-    muxed = await Promise.all(muxed.map(async (f) => {
+    
+    // Process muxed formats
+    const muxedDeciphered = [];
+    for (const f of muxed) {
       try {
-        await f.decipher(youtube.session.player);
-        return f;
+        // Check if format needs deciphering (has signature_cipher but no url)
+        if (f.signature_cipher && !f.url) {
+          console.log(`[formats] Deciphering muxed format itag=${f.itag}...`);
+          await f.decipher(youtube.session.player);
+          console.log(`[formats] ✓ Muxed itag=${f.itag} deciphered, hasUrl=${!!f.url}`);
+        }
+        if (f.url) {
+          muxedDeciphered.push(f);
+        } else {
+          console.warn(`[formats] ✗ Muxed itag=${f.itag} still has no URL after decipher`);
+        }
       } catch (e) {
         console.warn(`[formats] Failed to decipher muxed format itag=${f.itag}:`, e.message);
-        return null;
       }
-    }));
+    }
     
-    adaptive = await Promise.all(adaptive.map(async (f) => {
+    // Process adaptive formats
+    const adaptiveDeciphered = [];
+    for (const f of adaptive) {
       try {
-        await f.decipher(youtube.session.player);
-        return f;
+        // Check if format needs deciphering (has signature_cipher but no url)
+        if (f.signature_cipher && !f.url) {
+          await f.decipher(youtube.session.player);
+        }
+        if (f.url) {
+          adaptiveDeciphered.push(f);
+        }
       } catch (e) {
         console.warn(`[formats] Failed to decipher adaptive format itag=${f.itag}:`, e.message);
-        return null;
       }
-    }));
+    }
 
-    // Filter out null values (failed decipher attempts)
-    muxed = muxed.filter(f => f !== null);
-    adaptive = adaptive.filter(f => f !== null);
+    muxed = muxedDeciphered;
+    adaptive = adaptiveDeciphered;
 
     console.log(`[formats] ${videoId} - After decipher: ${muxed.length} muxed, ${adaptive.length} adaptive`);
 
