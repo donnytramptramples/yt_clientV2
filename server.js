@@ -13,16 +13,75 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // Limit concurrent ffmpeg processes to prevent OOM (512MB total RAM)
-// ultrafast preset uses ~100MB per stream, so 3 is safe
 const MAX_CONCURRENT_STREAMS = 3;
 let activeStreams = 0;
+
+/**
+ * NEW: Limit concurrent yt-dlp extractions too.
+ * This reduces bursty traffic that tends to trigger blocks and also reduces CPU spikes.
+ */
+const MAX_CONCURRENT_YTDLP = 2;
+let activeYtDlp = 0;
+const ytdlpWaiters = [];
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+async function acquireYtDlp() {
+  if (activeYtDlp < MAX_CONCURRENT_YTDLP) {
+    activeYtDlp++;
+    return;
+  }
+  await new Promise(resolve => ytdlpWaiters.push(resolve));
+  activeYtDlp++;
+}
+function releaseYtDlp() {
+  activeYtDlp = Math.max(0, activeYtDlp - 1);
+  const next = ytdlpWaiters.shift();
+  if (next) next();
+}
+
+/**
+ * NEW: Run yt-dlp with timeout and safe string handling.
+ */
+async function runYtDlp(args, timeoutMs = 25000) {
+  await acquireYtDlp();
+  try {
+    return await new Promise((resolve) => {
+      const proc = spawn('yt-dlp', args);
+      let out = '', err = '';
+
+      const timer = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch (_) {}
+      }, timeoutMs);
+
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.stderr.on('data', d => { err += d.toString(); });
+
+      proc.on('close', code => {
+        clearTimeout(timer);
+        resolve({ code, out, err });
+      });
+      proc.on('error', () => {
+        clearTimeout(timer);
+        resolve({ code: -1, out, err: err || 'spawn error' });
+      });
+    });
+  } finally {
+    releaseYtDlp();
+  }
+}
+
+// Optional: log yt-dlp version on boot (helps confirm deploy version)
+runYtDlp(['--version'], 8000).then(r => {
+  console.log('[yt-dlp] version:', (r.out || r.err || '').trim());
+});
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
 // URL cache: avoids re-running yt-dlp for the same video within a session.
-// YouTube CDN URLs are signed and stay valid for ~6 hours.
 const urlCache = new Map();
 const CACHE_TTL = 4 * 60 * 60 * 1000;
 
@@ -32,15 +91,13 @@ setInterval(() => {
   for (const [key, val] of urlCache) {
     if (now - val.ts > CACHE_TTL) urlCache.delete(key);
   }
-}, 30 * 60 * 1000); // Every 30 minutes
+}, 30 * 60 * 1000);
 
 async function getStreamUrls(videoId, quality, audioOnly) {
   const key = `${videoId}:${quality}:${audioOnly}`;
   const cached = urlCache.get(key);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
 
-  // Prefer H.264 (avc1) for browser compatibility
-  // Include 'best' as final fallback which returns combined video+audio
   const ytFormat = audioOnly
     ? 'bestaudio/best'
     : [
@@ -50,9 +107,8 @@ async function getStreamUrls(videoId, quality, audioOnly) {
         'best'
       ].join('/');
 
-  // Try multiple player clients - some get blocked by YouTube bot detection
   const clients = ['mweb', 'android', 'web'];
-  
+
   for (const client of clients) {
     const args = [
       '--no-check-certificate',
@@ -64,15 +120,7 @@ async function getStreamUrls(videoId, quality, audioOnly) {
       `https://www.youtube.com/watch?v=${videoId}`
     ];
 
-    const proc = spawn('yt-dlp', args);
-    let out = '', err = '';
-    proc.stdout.on('data', d => { out += d; });
-    proc.stderr.on('data', d => { err += d; });
-
-    const code = await new Promise((resolve) => {
-      proc.on('close', resolve);
-      proc.on('error', () => resolve(-1));
-    });
+    const { code, out, err } = await runYtDlp(args, 25000);
 
     if (code === 0) {
       const urls = out.trim().split('\n').filter(Boolean);
@@ -82,7 +130,10 @@ async function getStreamUrls(videoId, quality, audioOnly) {
         return urls;
       }
     }
+
     console.log(`[yt-dlp] ${videoId} failed with ${client} client: ${err.slice(-200)}`);
+    // NEW: small backoff between attempts (reduces burst retry)
+    await sleep(600);
   }
 
   throw new Error('All player clients failed - YouTube may be blocking requests');
@@ -95,7 +146,14 @@ async function initYouTube() {
   try {
     youtube = await Innertube.create({
       cache: new UniversalCache(false),
-      generate_session_locally: true,
+
+      /**
+       * CHANGED: generate_session_locally -> false
+       * Upstream reports YouTube may reject locally-generated visitor data now. [1](https://github.com/LuanRT/YouTube.js/issues/922)
+       */
+      generate_session_locally: false,
+      enable_session_cache: true,
+
       retrieve_player: true
     });
     console.log(">>> [SUCCESS] YouTube API Initialised");
@@ -111,7 +169,6 @@ app.get('/api/search', async (req, res) => {
   try {
     if (!youtube) return res.status(503).json({ error: "API Initialising..." });
     const { q } = req.query;
-    // type: 'video' avoids the ThumbnailView parser crash
     const results = await youtube.search(q, { type: 'video' });
 
     const videos = (results.videos || []).map(v => ({
@@ -129,13 +186,11 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// Info endpoint - returns duration and basic info for a video
+// Info endpoint
 app.get('/api/info/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  
-  // Try multiple player clients
   const clients = ['mweb', 'android', 'web'];
-  
+
   for (const client of clients) {
     try {
       const ytArgs = [
@@ -148,16 +203,9 @@ app.get('/api/info/:videoId', async (req, res) => {
         '--socket-timeout', '15',
         `https://www.youtube.com/watch?v=${videoId}`
       ];
-      const proc = spawn('yt-dlp', ytArgs);
-      let out = '', err = '';
-      proc.stdout.on('data', d => { out += d.toString(); });
-      proc.stderr.on('data', d => { err += d.toString(); });
-      
-      const code = await new Promise((resolve) => {
-        proc.on('close', resolve);
-        proc.on('error', () => resolve(-1));
-      });
-      
+
+      const { code, out } = await runYtDlp(ytArgs, 20000);
+
       if (code === 0) {
         const lines = out.trim().split('\n');
         const duration = parseFloat(lines[0]) || 0;
@@ -168,19 +216,22 @@ app.get('/api/info/:videoId', async (req, res) => {
       }
     } catch (_) {}
   }
-  
+
   console.error('Info error: All clients failed for', videoId);
-  res.status(500).json({ error: 'Could not fetch video info' });
+
+  // NEW: graceful fallback
+  res.status(502).json({
+    error: 'Could not fetch video info from server extractor',
+    fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+  });
 });
 
-// Stream endpoint - uses yt-dlp to get CDN URLs, ffmpeg to transcode + mux
-// into a fragmented MP4 the browser can play progressively without Content-Length.
+// Stream endpoint
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', audioOnly = 'false', start = '0' } = req.query;
   const startSec = parseFloat(start) || 0;
 
-  // Rate limit concurrent streams to prevent OOM (512MB RAM)
   if (activeStreams >= MAX_CONCURRENT_STREAMS) {
     return res.status(503).json({ error: 'Server busy, please try again' });
   }
@@ -202,13 +253,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
     console.log(`[stream] ${videoId} q=${quality} audioOnly=${audioOnly} urls=${urls.length}`);
 
-    // Always transcode to H.264/AAC fragmented MP4 - guarantees browser compatibility
-    // protocol_whitelist + reconnect options for reliable HLS streaming
     const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
     const inputOpts = [
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
       '-reconnect', '1',
-      '-reconnect_streamed', '1', 
+      '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5'
     ];
     const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
@@ -223,10 +272,8 @@ app.get('/api/stream/:videoId', async (req, res) => {
       res.setHeader('Content-Type', 'audio/mp4');
     } else if (audioUrl) {
       ffmpegArgs = [
-        ...inputOpts,
-        ...seekArgs, '-i', videoUrl,
-        ...inputOpts,
-        ...seekArgs, '-i', audioUrl,
+        ...inputOpts, ...seekArgs, '-i', videoUrl,
+        ...inputOpts, ...seekArgs, '-i', audioUrl,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
         '-shortest',
@@ -243,26 +290,21 @@ app.get('/api/stream/:videoId', async (req, res) => {
       res.setHeader('Content-Type', 'video/mp4');
     }
 
-    console.log(`[ffmpeg] Starting stream for ${videoId}, args count: ${ffmpegArgs.length}`);
-    
     ffmpeg = spawn('ffmpeg', ffmpegArgs);
-    
+
     let ffErr = '';
     let bytesWritten = 0;
-    
+
     ffmpeg.stdout.on('data', chunk => {
       bytesWritten += chunk.length;
-      if (!res.writableEnded) {
-        res.write(chunk);
-      }
+      if (!res.writableEnded) res.write(chunk);
     });
-    
+
     ffmpeg.stdout.on('end', () => {
-      console.log(`[ffmpeg] Stream ${videoId} finished, bytes: ${bytesWritten}`);
       if (!res.writableEnded) res.end();
     });
-    
-    ffmpeg.stderr.on('data', d => { 
+
+    ffmpeg.stderr.on('data', d => {
       ffErr += d.toString();
       if (ffErr.length > 8000) ffErr = ffErr.slice(-4000);
     });
@@ -274,7 +316,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
         console.error(`[ffmpeg stderr]:`, ffErr.slice(-800));
       }
     });
-    
+
     ffmpeg.on('error', err => {
       cleanup();
       console.error('[ffmpeg stream] spawn error:', err.message);
@@ -282,22 +324,26 @@ app.get('/api/stream/:videoId', async (req, res) => {
     });
 
     req.on('close', cleanup);
-
   } catch (error) {
     cleanup();
     console.error('Stream error:', error.message);
-    if (!res.headersSent) res.status(500).json({ error: error.message });
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: error.message,
+        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+      });
+    }
   }
 });
 
-// Download endpoint - uses yt-dlp for URL extraction, ffmpeg for muxing/conversion
+// Download endpoint (same extraction improvements + fallback)
 app.get('/api/download/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { format = 'mp4', quality = '720' } = req.query;
   const ext = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' }[format] || 'mp4';
   const isAudio = format !== 'mp4';
 
-  // Rate limit concurrent downloads
   if (activeStreams >= MAX_CONCURRENT_STREAMS) {
     return res.status(503).json({ error: 'Server busy, please try again' });
   }
@@ -325,6 +371,7 @@ app.get('/api/download/:videoId', async (req, res) => {
       '-reconnect_streamed', '1',
       '-reconnect_delay_max', '5'
     ];
+
     let ffmpegArgs;
     if (isAudio) {
       const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
@@ -352,11 +399,16 @@ app.get('/api/download/:videoId', async (req, res) => {
     });
     ffmpeg.on('close', () => cleanup());
     req.on('close', cleanup);
-
   } catch (error) {
     cleanup();
     console.error('Download error:', error.message);
-    if (!res.headersSent) res.status(500).json({ error: error.message });
+
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: error.message,
+        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+      });
+    }
   }
 });
 
@@ -371,8 +423,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
-  ws.on('message', (message) => {
-    // Restored your manual progress message logic
+  ws.on('message', () => {
     ws.send(JSON.stringify({ progress: 100 }));
     console.log('Progress signaled to client');
   });
