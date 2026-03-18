@@ -14,14 +14,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Limit concurrent ffmpeg processes to prevent OOM (Render free tier style RAM)
 const MAX_CONCURRENT_STREAMS = 3;
 let activeStreams = 0;
 
-// Limit concurrent yt-dlp calls (reduces bursty extraction)
 const MAX_CONCURRENT_YTDLP = 2;
 let activeYtDlp = 0;
 const ytdlpWaiters = [];
+
+// User-Agent that matches what the android yt-dlp client sends
+const YT_UA = 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Mobile Safari/537.36';
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -46,7 +47,6 @@ const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
 
 async function runYtDlp(args, timeoutMs = 25000) {
   await acquireYtDlp();
-  // Prepend cookies file to every yt-dlp call (helps with bot-detection)
   const fullArgs = ['--cookies', COOKIES_PATH, ...args];
   try {
     return await new Promise((resolve) => {
@@ -75,7 +75,6 @@ async function runYtDlp(args, timeoutMs = 25000) {
   }
 }
 
-// log yt-dlp version
 runYtDlp(['--version'], 8000).then(r => {
   console.log('[yt-dlp] version:', (r.out || r.err || '').trim());
 });
@@ -84,7 +83,6 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
-// In-memory URL cache (signed googlevideo URLs expire; keep short-ish TTL)
 const urlCache = new Map();
 const CACHE_TTL = 4 * 60 * 60 * 1000; // 4h
 
@@ -96,14 +94,14 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 /**
- * Try to get DASH URLs (video+audio) suitable for ffmpeg mux/transcode (your old flow).
+ * Get DASH URLs (video+audio) for ffmpeg audio transcoding.
+ * ios/tv_embedded clients bypass sign-in requirements for most public content.
  */
 async function getDashStreamUrls(videoId, quality, audioOnly) {
   const key = `${videoId}:dash:${quality}:${audioOnly}`;
   const cached = urlCache.get(key);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
 
-  // Prefer H.264 for compatibility
   const ytFormat = audioOnly
     ? 'bestaudio/best'
     : [
@@ -113,8 +111,7 @@ async function getDashStreamUrls(videoId, quality, audioOnly) {
         'best'
       ].join('/');
 
-  // Try multiple clients
-  const clients = ['mweb', 'android', 'web'];
+  const clients = ['ios', 'tv_embedded', 'android', 'mweb', 'web'];
 
   for (const client of clients) {
     const args = [
@@ -147,22 +144,21 @@ async function getDashStreamUrls(videoId, quality, audioOnly) {
 }
 
 /**
- * NEW: Get a single progressive MP4 URL for best browser UX (duration, seek, cache).
+ * Get a single progressive MP4 URL (best for browser playback and direct download).
+ * ios/tv_embedded clients bypass sign-in requirements for most public content.
  */
 async function getProgressiveMp4Url(videoId, quality) {
   const key = `${videoId}:mp4:${quality}`;
   const cached = urlCache.get(key);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls[0];
 
-  // Prefer a single-file MP4 (progressive) so browsers can seek + show duration properly
   const fmt = [
     `best[ext=mp4][height<=${quality}]`,
     `best[ext=mp4]`,
     `best`
   ].join('/');
 
-  // Put android first (it worked for you with Rick)
-  const clients = ['android', 'mweb', 'web'];
+  const clients = ['ios', 'tv_embedded', 'android', 'mweb', 'web'];
 
   for (const client of clients) {
     const args = [
@@ -196,7 +192,6 @@ async function getProgressiveMp4Url(videoId, quality) {
 
 let youtube;
 
-// YouTube.js init
 async function initYouTube() {
   try {
     youtube = await Innertube.create({
@@ -239,12 +234,10 @@ app.get('/api/search', async (req, res) => {
 
 /**
  * INFO (duration/title)
- * Tries youtubei.js first; falls back to yt-dlp.
  */
 app.get('/api/info/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
-  // 1) Try youtubei.js basic info first
   if (youtube) {
     try {
       const info = await youtube.getBasicInfo(videoId);
@@ -256,8 +249,7 @@ app.get('/api/info/:videoId', async (req, res) => {
     }
   }
 
-  // 2) Fallback to yt-dlp
-  const clients = ['android', 'mweb', 'web'];
+  const clients = ['ios', 'tv_embedded', 'android', 'mweb', 'web'];
   for (const client of clients) {
     try {
       const ytArgs = [
@@ -291,9 +283,8 @@ app.get('/api/info/:videoId', async (req, res) => {
 });
 
 /**
- * NEW: PROXY endpoint for playback (recommended)
- * - Forwards Range requests to upstream so browser seeking works.
- * - Much better UX than fragmented MP4 piping.
+ * PROXY: stream progressive MP4 with range request support.
+ * Enables native browser seeking and HTTP-level caching.
  */
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
@@ -305,57 +296,42 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   try {
     const upstreamUrl = await getProgressiveMp4Url(videoId, quality);
 
-    const headers = {};
+    const headers = { 'User-Agent': YT_UA, 'Referer': 'https://www.youtube.com/' };
     if (req.headers.range) headers['Range'] = req.headers.range;
 
-    const upstream = await fetch(upstreamUrl, {
-      headers,
-      signal: controller.signal
-    });
+    const upstream = await fetch(upstreamUrl, { headers, signal: controller.signal });
 
-    // Mirror status (200 or 206 typically)
     res.status(upstream.status);
 
-    // Pass through key headers
-    const passthrough = [
-      'content-type',
-      'content-length',
-      'content-range',
-      'accept-ranges',
-      'etag',
-      'last-modified'
-    ];
+    const passthrough = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified'];
     for (const h of passthrough) {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
     }
 
-    // Improve caching behavior (browser + SW)
     res.setHeader('Cache-Control', 'private, max-age=3600');
     res.setHeader('Vary', 'Range');
 
     if (!upstream.body) {
-      return res.status(502).json({
-        error: 'Upstream returned no body',
-        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
-      });
+      return res.status(502).json({ error: 'Upstream returned no body' });
     }
 
-    // Convert WebStream to Node stream and pipe
     await pipeline(Readable.fromWeb(upstream.body), res);
 
   } catch (e) {
     if (controller.signal.aborted) return;
     console.error('[proxy] error:', e.message);
-    res.status(502).json({
-      error: e.message,
-      fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
-    });
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: e.message,
+        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+      });
+    }
   }
 });
 
 /**
- * STREAM (legacy / fallback): yt-dlp URLs + ffmpeg -> fragmented MP4 pipe
+ * STREAM (legacy): yt-dlp + ffmpeg fragmented MP4 pipe
  */
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
@@ -371,9 +347,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
   const cleanup = () => {
     activeStreams = Math.max(0, activeStreams - 1);
-    if (ffmpeg) {
-      try { ffmpeg.kill('SIGKILL'); } catch (_) {}
-    }
+    if (ffmpeg) { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }
   };
 
   try {
@@ -386,12 +360,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
     const seekArgs = startSec > 0 ? ['-ss', String(startSec)] : [];
     const inputOpts = [
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5'
+      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+      '-user_agent', YT_UA,
+      '-headers', 'Referer: https://www.youtube.com/\r\n'
     ];
 
-    // Fragmented MP4 for pipe output
     const outFlags = ['-f', 'mp4', '-movflags', 'frag_keyframe+empty_moov+default_base_moof'];
 
     let ffmpegArgs;
@@ -470,15 +443,46 @@ app.get('/api/stream/:videoId', async (req, res) => {
 });
 
 /**
- * DOWNLOAD: keeps your old behavior (ffmpeg muxing/conversion).
- * You may also switch this to proxy+range if you want “download original mp4”.
+ * DOWNLOAD
+ * - MP4: proxy the progressive URL directly — no ffmpeg, no 403 from Google CDN
+ * - Audio (mp3/flac/opus/ogg): get bestaudio URL, transcode with ffmpeg using
+ *   proper User-Agent so Google CDN accepts the request
  */
 app.get('/api/download/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { format = 'mp4', quality = '720' } = req.query;
   const ext = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' }[format] || 'mp4';
   const isAudio = format !== 'mp4';
+  const safeTitle = `video_${videoId}`;
 
+  // ── MP4: stream the progressive file directly, no re-encode ──────────────
+  if (!isAudio) {
+    try {
+      const upstreamUrl = await getProgressiveMp4Url(videoId, quality);
+
+      const upstream = await fetch(upstreamUrl, {
+        headers: { 'User-Agent': YT_UA, 'Referer': 'https://www.youtube.com/' }
+      });
+
+      if (!upstream.ok) {
+        console.error(`[download mp4] upstream ${upstream.status} for ${videoId}`);
+        return res.status(upstream.status).json({ error: `Upstream error: ${upstream.status}` });
+      }
+
+      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+      res.setHeader('Content-Type', 'video/mp4');
+      const cl = upstream.headers.get('content-length');
+      if (cl) res.setHeader('Content-Length', cl);
+
+      await pipeline(Readable.fromWeb(upstream.body), res);
+    } catch (error) {
+      console.error('Download MP4 error:', error.message);
+      if (!res.headersSent) res.status(502).json({ error: error.message });
+    }
+    return;
+  }
+
+  // ── Audio: get bestaudio URL then transcode with ffmpeg ──────────────────
   if (activeStreams >= MAX_CONCURRENT_STREAMS) {
     return res.status(503).json({ error: 'Server busy, please try again' });
   }
@@ -488,66 +492,44 @@ app.get('/api/download/:videoId', async (req, res) => {
 
   const cleanup = () => {
     activeStreams = Math.max(0, activeStreams - 1);
-    if (ffmpeg) {
-      try { ffmpeg.kill('SIGKILL'); } catch (_) {}
-    }
+    if (ffmpeg) { try { ffmpeg.kill('SIGKILL'); } catch (_) {} }
   };
 
   try {
-    const urls = await getDashStreamUrls(videoId, quality, isAudio);
-    const videoUrl = urls[0];
-    const audioUrl = urls[1] || null;
+    const urls = await getDashStreamUrls(videoId, quality, true);
+    const audioUrl = urls[0];
 
-    res.setHeader('Content-Disposition', `attachment; filename="download_${videoId}.${ext}"`);
+    const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
+    const fmtMap   = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
 
-    const inputOpts = [
+    const ffmpegArgs = [
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '5'
+      '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+      '-user_agent', YT_UA,
+      '-headers', 'Referer: https://www.youtube.com/\r\n',
+      '-i', audioUrl,
+      '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0',
+      '-f', fmtMap[format] || 'mp3', 'pipe:1'
     ];
 
-    let ffmpegArgs;
-    if (isAudio) {
-      const codecMap = { mp3: 'libmp3lame', flac: 'flac', opus: 'libopus', ogg: 'libvorbis' };
-      const fmtMap = { mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' };
-      ffmpegArgs = [
-        ...inputOpts, '-i', videoUrl,
-        '-vn', '-c:a', codecMap[format] || 'libmp3lame', '-q:a', '0',
-        '-f', fmtMap[format] || 'mp3', 'pipe:1'
-      ];
-      res.setHeader('Content-Type', `audio/${format}`);
-    } else {
-      ffmpegArgs = audioUrl
-        ? [...inputOpts, '-i', videoUrl, ...inputOpts, '-i', audioUrl,
-           '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-           '-c:a', 'aac', '-shortest', '-f', 'mp4', 'pipe:1']
-        : [...inputOpts, '-i', videoUrl,
-           '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-           '-c:a', 'aac', '-f', 'mp4', 'pipe:1'];
-      res.setHeader('Content-Type', 'video/mp4');
-    }
+    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${ext}"`);
+    res.setHeader('Content-Type', `audio/${ext}`);
 
     ffmpeg = spawn('ffmpeg', ffmpegArgs);
     ffmpeg.stdout.pipe(res);
     ffmpeg.stderr.on('data', () => {});
     ffmpeg.on('error', err => {
       cleanup();
-      console.error('[ffmpeg download] error:', err.message);
-      if (!res.headersSent) res.status(500).send('Download error');
+      console.error('[ffmpeg audio download] error:', err.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Transcoding error' });
     });
     ffmpeg.on('close', () => cleanup());
     req.on('close', cleanup);
 
   } catch (error) {
     cleanup();
-    console.error('Download error:', error.message);
-    if (!res.headersSent) {
-      res.status(502).json({
-        error: error.message,
-        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
-      });
-    }
+    console.error('Download audio error:', error.message);
+    if (!res.headersSent) res.status(502).json({ error: error.message });
   }
 });
 
@@ -560,7 +542,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// WebSocket (your progress signaling)
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   console.log('WebSocket client connected');
