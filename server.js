@@ -8,11 +8,11 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 
-process.env.PATH = `${process.env.HOME}/.local/bin:${process.env.PATH}`;
+process.env.PATH = `${process.env.HOME}/.local/bin:${process.env.HOME}/workspace/.pythonlibs/bin:${process.env.PATH}`;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 8080;
 
 // Limit concurrent ffmpeg processes to prevent OOM (Render free tier style RAM)
 const MAX_CONCURRENT_STREAMS = 3;
@@ -42,11 +42,15 @@ function releaseYtDlp() {
   if (next) next();
 }
 
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+
 async function runYtDlp(args, timeoutMs = 25000) {
   await acquireYtDlp();
+  // Prepend cookies file to every yt-dlp call (helps with bot-detection)
+  const fullArgs = ['--cookies', COOKIES_PATH, ...args];
   try {
     return await new Promise((resolve) => {
-      const proc = spawn('yt-dlp', args);
+      const proc = spawn('yt-dlp', fullArgs);
       let out = '', err = '';
 
       const timer = setTimeout(() => {
