@@ -1,5 +1,6 @@
 import express from 'express';
-import { Innertube, UniversalCache } from 'youtubei.js';
+import { Innertube, UniversalCache, Platform } from 'youtubei.js';
+import { BG } from 'bgutils-js';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import path from 'path';
@@ -15,33 +16,60 @@ const MAX_CONCURRENT_STREAMS = 5;
 let activeStreams = 0;
 
 const YT_UA = 'Mozilla/5.0 (Linux; Android 13; SM-A135F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+const YT_REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
+// --- Fix #1: N-parameter shim ---
+// Enables YouTube.js to run the player's JS decipher/throttle challenge inside Node,
+// preventing the ~50 KB/s speed cap YouTube enforces on unsigned requests.
+Platform.shim.eval = (code, env) => {
+  return new Function(...Object.keys(env), code)(...Object.values(env));
+};
 
 let youtube;
+let refreshTimer = null;
+
+// --- Fix #2: PoToken generation via bgutils-js ---
+// generateColdStartToken is a pure-JS implementation — no browser APIs needed.
+// It works for most videos (StreamProtectionStatus ≤ 2) and runs fine in Node.js.
+function generatePoToken(visitorData) {
+  return BG.PoToken.generateColdStartToken(visitorData);
+}
 
 async function initYouTube() {
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+
   try {
+    // First create a bare instance to obtain a stable visitorData
+    const bare = await Innertube.create({ generate_session_locally: true });
+    const visitorData = bare.session.context.client.visitorData;
+
+    let po_token;
+    try {
+      po_token = await generatePoToken(visitorData);
+      console.log('>>> [SUCCESS] PoToken generated');
+    } catch (e) {
+      console.warn('>>> [WARN] PoToken generation failed:', e.message, '— proceeding without it');
+    }
+
     youtube = await Innertube.create({
+      visitor_data: visitorData,
+      po_token,
       cache: new UniversalCache(false),
       generate_session_locally: true,
       enable_session_cache: true,
       retrieve_player: true,
-      fetch: (url, options = {}) => {
-        return fetch(url, {
-          ...options,
-          headers: {
-            ...options.headers,
-            'User-Agent': YT_UA,
-          }
-        });
-      }
+      fetch: (url, options = {}) => fetch(url, {
+        ...options,
+        headers: { ...options.headers, 'User-Agent': YT_UA },
+      }),
     });
-    console.log(">>> [SUCCESS] YouTube API Initialised");
+
+    console.log('>>> [SUCCESS] YouTube API Initialised');
+
+    // Refresh every 25 minutes — PoTokens expire after ~30 minutes
+    refreshTimer = setTimeout(initYouTube, 25 * 60 * 1000);
   } catch (e) {
-    console.error(">>> [ERROR] Init Failed:", e.message);
+    console.error('>>> [ERROR] Init Failed:', e.message);
     setTimeout(initYouTube, 10000);
   }
 }
@@ -53,7 +81,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
 
 const formatCache = new Map();
-const CACHE_TTL = 4 * 60 * 60 * 1000;
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour — YouTube stream URLs expire, keep cache short
 
 setInterval(() => {
   const now = Date.now();
@@ -95,19 +123,47 @@ async function getVideoFormats(videoId) {
 }
 
 function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
-  const allFormats = [...formats.videoFormats, ...formats.adaptiveFormats];
-
   if (isAudio) {
-    return allFormats
-      .filter(f => f.audio_channels && !f.video_channels)
+    // Best audio-only adaptive format
+    const audioOnly = formats.adaptiveFormats
+      .filter(f => f.has_audio && !f.has_video)
+      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+    if (audioOnly.length > 0) return audioOnly[0];
+    // Fallback: any format with audio
+    return [...formats.videoFormats, ...formats.adaptiveFormats]
+      .filter(f => f.has_audio)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
   }
 
-  const videoFormats = allFormats
-    .filter(f => f.video_channels && f.height && f.height <= qualityLimit)
+  // 1. Prefer muxed formats (streaming_data.formats) — they have both audio + video combined
+  //    These are what a browser <video> element can play natively with sound.
+  const muxedAtLimit = formats.videoFormats
+    .filter(f => f.has_video && f.height && f.height <= qualityLimit)
     .sort((a, b) => (b.height || 0) - (a.height || 0));
+  if (muxedAtLimit.length > 0) {
+    console.log(`[format] muxed ${muxedAtLimit[0].height}p itag=${muxedAtLimit[0].itag}`);
+    return muxedAtLimit[0];
+  }
 
-  return videoFormats[0] || allFormats.filter(f => f.height)[0];
+  // 2. Any muxed format (ignore quality limit — best available)
+  const anyMuxed = formats.videoFormats
+    .filter(f => f.has_video && f.height)
+    .sort((a, b) => (b.height || 0) - (a.height || 0));
+  if (anyMuxed.length > 0) {
+    console.log(`[format] muxed fallback ${anyMuxed[0].height}p itag=${anyMuxed[0].itag}`);
+    return anyMuxed[0];
+  }
+
+  // 3. Last resort: adaptive video stream (no audio, but at least something plays)
+  const adaptiveVideo = formats.adaptiveFormats
+    .filter(f => f.has_video && f.height && f.height <= qualityLimit)
+    .sort((a, b) => (b.height || 0) - (a.height || 0));
+  if (adaptiveVideo.length > 0) {
+    console.warn(`[format] WARNING: using video-only adaptive stream — no audio`);
+    return adaptiveVideo[0];
+  }
+
+  return formats.adaptiveFormats.filter(f => f.has_video)[0];
 }
 
 app.get('/api/search', async (req, res) => {
@@ -152,6 +208,26 @@ app.get('/api/info/:videoId', async (req, res) => {
   }
 });
 
+// Debug endpoint — lists available formats for a video
+app.get('/api/formats/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  try {
+    const formats = await getVideoFormats(videoId);
+    res.json({
+      muxed: formats.videoFormats.map(f => ({
+        itag: f.itag, height: f.height, has_audio: f.has_audio, has_video: f.has_video,
+        mime: f.mime_type, bitrate: f.bitrate
+      })),
+      adaptive: formats.adaptiveFormats.map(f => ({
+        itag: f.itag, height: f.height, has_audio: f.has_audio, has_video: f.has_video,
+        mime: f.mime_type, bitrate: f.bitrate
+      })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720' } = req.query;
@@ -174,7 +250,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     };
     if (req.headers.range) headers['Range'] = req.headers.range;
 
-    console.log(`[proxy] ${videoId} quality=${quality} using format height=${format.height} itag=${format.itag}`);
+    console.log(`[proxy] ${videoId} quality=${quality} format: height=${format.height} has_audio=${format.has_audio} has_video=${format.has_video} itag=${format.itag}`);
 
     const upstream = await fetch(format.url, {
       headers,
@@ -183,6 +259,10 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     });
 
     if (!upstream.ok) {
+      // If URL has expired (403/410), evict cache and retry once
+      if (upstream.status === 403 || upstream.status === 410) {
+        formatCache.delete(`formats:${videoId}`);
+      }
       throw new Error(`Upstream error: ${upstream.status}`);
     }
 
@@ -192,6 +272,10 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     for (const h of passthrough) {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
+    }
+    // Always declare we support range requests so browsers can seek
+    if (!upstream.headers.get('accept-ranges')) {
+      res.setHeader('Accept-Ranges', 'bytes');
     }
 
     res.setHeader('Cache-Control', 'public, max-age=3600');
