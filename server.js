@@ -39,8 +39,7 @@ async function getStreamUrls(videoId, quality, audioOnly) {
   const cached = urlCache.get(key);
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.urls;
 
-  // Prefer H.264 (avc1) so ffmpeg can copy-mux without re-encoding when possible.
-  // ios client is reliable - returns HLS manifest URLs for both video and audio.
+  // Prefer H.264 (avc1) for browser compatibility
   const ytFormat = audioOnly
     ? 'bestaudio'
     : [
@@ -50,31 +49,42 @@ async function getStreamUrls(videoId, quality, audioOnly) {
         'best'
       ].join('/');
 
-  const args = [
-    '--no-check-certificate',
-    '--extractor-args', 'youtube:player_client=ios',
-    '-g', '-f', ytFormat,
-    '--no-playlist',
-    '--socket-timeout', '30',
-    `https://www.youtube.com/watch?v=${videoId}`
-  ];
+  // Try multiple player clients - some get blocked by YouTube bot detection
+  const clients = ['mweb', 'android', 'web'];
+  
+  for (const client of clients) {
+    const args = [
+      '--no-check-certificate',
+      '--no-warnings',
+      '--extractor-args', `youtube:player_client=${client}`,
+      '-g', '-f', ytFormat,
+      '--no-playlist',
+      '--socket-timeout', '20',
+      `https://www.youtube.com/watch?v=${videoId}`
+    ];
 
-  const proc = spawn('yt-dlp', args);
-  let out = '', err = '';
-  proc.stdout.on('data', d => { out += d; });
-  proc.stderr.on('data', d => { err += d; });
+    const proc = spawn('yt-dlp', args);
+    let out = '', err = '';
+    proc.stdout.on('data', d => { out += d; });
+    proc.stderr.on('data', d => { err += d; });
 
-  await new Promise((resolve, reject) => {
-    proc.on('close', code =>
-      code === 0 ? resolve() : reject(new Error(err.slice(-800) || 'yt-dlp failed'))
-    );
-  });
+    const code = await new Promise((resolve) => {
+      proc.on('close', resolve);
+      proc.on('error', () => resolve(-1));
+    });
 
-  const urls = out.trim().split('\n').filter(Boolean);
-  if (!urls.length) throw new Error('No stream URLs returned');
+    if (code === 0) {
+      const urls = out.trim().split('\n').filter(Boolean);
+      if (urls.length > 0) {
+        console.log(`[yt-dlp] ${videoId} success with ${client} client, ${urls.length} URLs`);
+        urlCache.set(key, { urls, ts: Date.now() });
+        return urls;
+      }
+    }
+    console.log(`[yt-dlp] ${videoId} failed with ${client} client: ${err.slice(-200)}`);
+  }
 
-  urlCache.set(key, { urls, ts: Date.now() });
-  return urls;
+  throw new Error('All player clients failed - YouTube may be blocking requests');
 }
 
 let youtube;
@@ -121,31 +131,45 @@ app.get('/api/search', async (req, res) => {
 // Info endpoint - returns duration and basic info for a video
 app.get('/api/info/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  try {
-    const ytArgs = [
-      '--no-check-certificate',
-      '--extractor-args', 'youtube:player_client=ios',
-      '--print', 'duration',
-      '--print', 'title',
-      '--no-playlist',
-      '--socket-timeout', '30',
-      `https://www.youtube.com/watch?v=${videoId}`
-    ];
-    const proc = spawn('yt-dlp', ytArgs);
-    let out = '', err = '';
-    proc.stdout.on('data', d => { out += d.toString(); });
-    proc.stderr.on('data', d => { err += d.toString(); });
-    await new Promise((resolve, reject) => {
-      proc.on('close', code => code === 0 ? resolve() : reject(new Error(err.trim())));
-    });
-    const lines = out.trim().split('\n');
-    const duration = parseFloat(lines[0]) || 0;
-    const title = lines[1] || '';
-    res.json({ duration, title });
-  } catch (error) {
-    console.error('Info error:', error.message);
-    res.status(500).json({ error: error.message });
+  
+  // Try multiple player clients
+  const clients = ['mweb', 'android', 'web'];
+  
+  for (const client of clients) {
+    try {
+      const ytArgs = [
+        '--no-check-certificate',
+        '--no-warnings',
+        '--extractor-args', `youtube:player_client=${client}`,
+        '--print', 'duration',
+        '--print', 'title',
+        '--no-playlist',
+        '--socket-timeout', '15',
+        `https://www.youtube.com/watch?v=${videoId}`
+      ];
+      const proc = spawn('yt-dlp', ytArgs);
+      let out = '', err = '';
+      proc.stdout.on('data', d => { out += d.toString(); });
+      proc.stderr.on('data', d => { err += d.toString(); });
+      
+      const code = await new Promise((resolve) => {
+        proc.on('close', resolve);
+        proc.on('error', () => resolve(-1));
+      });
+      
+      if (code === 0) {
+        const lines = out.trim().split('\n');
+        const duration = parseFloat(lines[0]) || 0;
+        const title = lines[1] || '';
+        if (duration > 0) {
+          return res.json({ duration, title });
+        }
+      }
+    } catch (_) {}
   }
+  
+  console.error('Info error: All clients failed for', videoId);
+  res.status(500).json({ error: 'Could not fetch video info' });
 });
 
 // Stream endpoint - uses yt-dlp to get CDN URLs, ffmpeg to transcode + mux
