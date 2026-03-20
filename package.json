@@ -16,7 +16,7 @@
     "fluent-ffmpeg": "^2.1.2",
     "lucide-react": "^0.577.0",
     "ws": "^8.16.0",
-    "youtubei.js": "^16.01.1"
+    "youtubei.js": "^15.01.1"
   },
   "devDependencies": {
     "@tanstack/react-query": "^5.20.0",
