@@ -107,12 +107,13 @@ async function getVideoFormats(videoId) {
 
   try {
     const info = await youtube.getInfo(videoId);
-    
+
     if (!info || !info.streaming_data) {
       throw new Error('No streaming data available');
     }
 
     const formats = {
+      info,                                                   // keep for info.download()
       videoFormats: info.streaming_data.formats || [],
       adaptiveFormats: info.streaming_data.adaptive_formats || [],
       duration: info.basic_info?.duration || 0,
@@ -130,38 +131,36 @@ async function getVideoFormats(videoId) {
 }
 
 function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
-  const allFormats = [...formats.videoFormats, ...formats.adaptiveFormats];
-
   if (isAudio) {
-    const audioFormats = allFormats
-      .filter(f => f.audio_channels && !f.video_channels)
+    const audioFormats = formats.adaptiveFormats
+      .filter(f => f.has_audio && !f.has_video)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    
+
     if (audioFormats.length > 0) return audioFormats[0];
-    
-    const anyAudio = allFormats
-      .filter(f => f.audio_channels)
+
+    const anyAudio = [...formats.videoFormats, ...formats.adaptiveFormats]
+      .filter(f => f.has_audio)
       .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-    
+
     if (anyAudio.length > 0) return anyAudio[0];
     throw new Error('No audio format available');
   }
 
-  // Select video formats
-  const videoFormats = allFormats
-    .filter(f => f.video_channels && f.height && f.height <= qualityLimit)
+  // Prefer muxed formats (has_audio + has_video) — browser plays these natively with sound
+  const muxed = formats.videoFormats
+    .filter(f => f.has_video && f.has_audio && f.height && f.height <= qualityLimit)
     .sort((a, b) => (b.height || 0) - (a.height || 0));
 
-  if (videoFormats.length > 0) return videoFormats[0];
+  if (muxed.length > 0) return muxed[0];
 
-  // Fallback to any video format
-  const anyVideo = allFormats
-    .filter(f => f.height)
+  // Fallback: any muxed format regardless of quality cap
+  const anyMuxed = formats.videoFormats
+    .filter(f => f.has_video && f.has_audio && f.height)
     .sort((a, b) => (b.height || 0) - (a.height || 0));
-  
-  if (anyVideo.length > 0) return anyVideo[0];
-  
-  throw new Error('No playable format found');
+
+  if (anyMuxed.length > 0) return anyMuxed[0];
+
+  throw new Error('No muxed (audio+video) format available');
 }
 
 app.get('/api/search', async (req, res) => {
@@ -256,18 +255,28 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
     console.log(`[proxy] Using format: height=${format.height}p, itag=${format.itag}`);
 
-    // Use innertube's download method which handles URL generation and deciphering
-    const stream = await format.download();
+    const streamUrl = format.url || format.decipher(youtube.session.player);
+    if (!streamUrl) throw new Error('Could not resolve stream URL');
+    console.log(`[proxy] URL sig param: ${new URL(streamUrl).searchParams.get('sig') || '(none)'} n param: ${new URL(streamUrl).searchParams.get('n')?.slice(0,8)}...`);
 
-    res.setHeader('Content-Type', format.mime_type || 'video/mp4');
+    const fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+      'Referer': 'https://www.youtube.com/',
+      'Origin': 'https://www.youtube.com',
+    };
+    if (req.headers['range']) fetchHeaders['Range'] = req.headers['range'];
+
+    const upstream = await fetch(streamUrl, { signal: controller.signal, headers: fetchHeaders });
+    if (!upstream.ok && upstream.status !== 206) throw new Error(`Upstream HTTP ${upstream.status}`);
+
+    res.status(upstream.status);
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || format.mime_type || 'video/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
+    if (upstream.headers.get('content-length')) res.setHeader('Content-Length', upstream.headers.get('content-length'));
+    if (upstream.headers.get('content-range')) res.setHeader('Content-Range', upstream.headers.get('content-range'));
 
-    if (format.content_length) {
-      res.setHeader('Content-Length', format.content_length);
-    }
-
-    await pipeline(stream, res);
+    await pipeline(Readable.fromWeb(upstream.body), res);
     console.log(`[proxy] Successfully streamed ${videoId}`);
 
   } catch (e) {
@@ -316,12 +325,22 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
     console.log(`[stream] ${videoId} q=${quality} audioOnly=${audioOnly}`);
 
-    const stream = await format.download();
+    const streamUrl = format.url || format.decipher(youtube.session.player);
+    if (!streamUrl) throw new Error('Could not resolve stream URL');
 
-    res.setHeader('Content-Type', format.mime_type || 'video/mp4');
+    const upstream = await fetch(streamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com',
+      },
+    });
+    if (!upstream.ok) throw new Error(`Upstream HTTP ${upstream.status}`);
+
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || format.mime_type || 'video/mp4');
     res.setHeader('Cache-Control', 'public, max-age=3600');
 
-    await pipeline(stream, res);
+    await pipeline(Readable.fromWeb(upstream.body), res);
 
   } catch (error) {
     cleanup();
@@ -354,17 +373,24 @@ app.get('/api/download/:videoId', async (req, res) => {
       throw new Error('No suitable format found');
     }
 
-    const stream = await selectedFormat.download();
+    const streamUrl = selectedFormat.url || selectedFormat.decipher(youtube.session.player);
+    if (!streamUrl) throw new Error('Could not resolve stream URL');
+
+    const upstream = await fetch(streamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+        'Referer': 'https://www.youtube.com/',
+        'Origin': 'https://www.youtube.com',
+      },
+    });
+    if (!upstream.ok) throw new Error(`Upstream HTTP ${upstream.status}`);
 
     const ext = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' }[format] || 'mp4';
     res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${ext}"`);
-    res.setHeader('Content-Type', selectedFormat.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || selectedFormat.mime_type || 'application/octet-stream');
+    if (upstream.headers.get('content-length')) res.setHeader('Content-Length', upstream.headers.get('content-length'));
 
-    if (selectedFormat.content_length) {
-      res.setHeader('Content-Length', selectedFormat.content_length);
-    }
-
-    await pipeline(stream, res);
+    await pipeline(Readable.fromWeb(upstream.body), res);
 
   } catch (error) {
     console.error('[download] error:', error.message);
