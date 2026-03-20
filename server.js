@@ -7,6 +7,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
+import { readFileSync } from 'fs';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const ffmpeg = require('fluent-ffmpeg');
 
 // Set log level to ERROR to see critical issues but suppress verbose warnings
 Log.setLevel(Log.Level.ERROR);
@@ -14,6 +18,31 @@ Log.setLevel(Log.Level.ERROR);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// Parse cookies.txt (Netscape format) into a cookie header string
+function parseCookiesTxt(filePath) {
+  try {
+    const content = readFileSync(filePath, 'utf8');
+    const cookies = [];
+    for (const raw of content.split('\n')) {
+      const line = raw.replace(/\r/g, '').trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('\t');
+      if (parts.length >= 7) {
+        const name = parts[5].trim();
+        const value = parts[6].trim();
+        if (name && value) cookies.push(`${name}=${value}`);
+      }
+    }
+    const result = cookies.join('; ');
+    if (result) console.log('[cookies] Loaded', cookies.length, 'cookies from cookies.txt');
+    return result;
+  } catch {
+    return '';
+  }
+}
+
+const cookieString = parseCookiesTxt(path.join(__dirname, 'cookies.txt'));
 
 const MAX_CONCURRENT_STREAMS = 5;
 let activeStreams = 0;
@@ -39,6 +68,17 @@ Platform.shim.fetch = (input, init = {}) => {
 let youtube;
 let refreshTimer = null;
 
+// Cache VideoInfo objects (not just raw format data) so we can decipher URLs
+const infoCache = new Map();
+const CACHE_TTL = 60 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of infoCache) {
+    if (now - val.ts > CACHE_TTL) infoCache.delete(key);
+  }
+}, 30 * 60 * 1000);
+
 function generatePoToken(visitorData) {
   return BG.PoToken.generateColdStartToken(visitorData);
 }
@@ -61,6 +101,7 @@ async function initYouTube() {
     youtube = await Innertube.create({
       visitor_data: visitorData,
       po_token,
+      cookie: cookieString || undefined,
       cache: new UniversalCache(false),
       // generate_session_locally must be false so the player JS is fetched from
       // YouTube and signature/n-parameter deciphering algorithms are extracted
@@ -85,17 +126,6 @@ await initYouTube();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
-
-// Cache VideoInfo objects (not just raw format data) so we can decipher URLs
-const infoCache = new Map();
-const CACHE_TTL = 60 * 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, val] of infoCache) {
-    if (now - val.ts > CACHE_TTL) infoCache.delete(key);
-  }
-}, 30 * 60 * 1000);
 
 async function getVideoInfo(videoId) {
   const cached = infoCache.get(videoId);
@@ -361,25 +391,63 @@ app.get('/api/download/:videoId', async (req, res) => {
   const controller = new AbortController();
   req.on('close', () => controller.abort());
 
+  // ffmpeg settings per output format
+  const AUDIO_FORMATS = {
+    mp3:  { codec: 'libmp3lame', ffFormat: 'mp3',  mime: 'audio/mpeg',  ext: 'mp3'  },
+    flac: { codec: 'flac',       ffFormat: 'flac', mime: 'audio/flac',  ext: 'flac' },
+    opus: { codec: 'libopus',    ffFormat: 'ogg',  mime: 'audio/ogg',   ext: 'opus' },
+    ogg:  { codec: 'libvorbis',  ffFormat: 'ogg',  mime: 'audio/ogg',   ext: 'ogg'  },
+  };
+
   try {
     const info = await getVideoInfo(videoId);
     const formats = getFormatsFromInfo(info);
     const qualityNum = parseInt(quality, 10);
 
-    const selectedFormat = format === 'mp4'
-      ? selectBestFormat(formats, qualityNum, false)
-      : selectBestFormat(formats, 999, true);
+    if (format === 'mp4') {
+      // Video download — pipe raw stream directly
+      const selectedFormat = selectBestFormat(formats, qualityNum, false);
+      const resp = await fetchFormatStream(selectedFormat, info, controller.signal);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+      res.setHeader('Content-Type', 'video/mp4');
+      if (resp.headers.get('content-length')) {
+        res.setHeader('Content-Length', resp.headers.get('content-length'));
+      }
+      await pipeline(Readable.fromWeb(resp.body), res);
+    } else {
+      // Audio download — transcode via ffmpeg
+      const audioSpec = AUDIO_FORMATS[format];
+      if (!audioSpec) return res.status(400).json({ error: `Unsupported format: ${format}` });
 
-    const resp = await fetchFormatStream(selectedFormat, info, controller.signal);
+      // Prefer audio-only adaptive stream; fall back to muxed if unavailable
+      let selectedFormat;
+      try {
+        selectedFormat = selectBestFormat(formats, 999, true);
+      } catch {
+        selectedFormat = selectBestFormat(formats, qualityNum, false);
+      }
 
-    const ext = { mp4: 'mp4', mp3: 'mp3', flac: 'flac', opus: 'opus', ogg: 'ogg' }[format] || 'mp4';
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${ext}"`);
-    res.setHeader('Content-Type', selectedFormat.mime_type || 'application/octet-stream');
-    if (resp.headers.get('content-length')) {
-      res.setHeader('Content-Length', resp.headers.get('content-length'));
+      const resp = await fetchFormatStream(selectedFormat, info, controller.signal);
+      const sourceStream = Readable.fromWeb(resp.body);
+
+      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${audioSpec.ext}"`);
+      res.setHeader('Content-Type', audioSpec.mime);
+
+      const proc = ffmpeg(sourceStream)
+        .noVideo()
+        .audioCodec(audioSpec.codec)
+        .format(audioSpec.ffFormat)
+        .on('error', (err) => {
+          if (!controller.signal.aborted) {
+            console.error('[download/ffmpeg] error:', err.message);
+          }
+          if (!res.headersSent) res.status(502).json({ error: err.message });
+        });
+
+      req.on('close', () => proc.kill('SIGKILL'));
+
+      proc.pipe(res, { end: true });
     }
-
-    await pipeline(Readable.fromWeb(resp.body), res);
   } catch (error) {
     if (!controller.signal.aborted) {
       console.error('[download] error:', error.message);
