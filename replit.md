@@ -59,6 +59,9 @@ The app does NOT hand raw `googlevideo.com` URLs to the browser. Instead:
 - `generate_session_locally: false` + `retrieve_player: true` causes youtubei.js to fetch the real YouTube player JS and extract the n-parameter / signature decipher algorithms
 - Without this, signature extraction fails → all stream URLs return 403
 
-## Deployment
+## Replit Setup
 
-Deployed on Render (VM target). The `PORT` environment variable is set by Render automatically. Build command: `npm run build`. Run command: `node server.js`. The production server serves the built `dist/` folder as static files.
+- **Workflow**: "Start application" runs `bash start-dev.sh` — starts backend on PORT=10000 then Vite on port 5000
+- **Bug fix**: Moved `infoCache` declaration before `await initYouTube()` call to prevent "Cannot access before initialization" error
+- **Deployment config**: autoscale target, build=`npm run build`, run=`node server.js` (server serves `dist/` + handles API)
+- The production server uses `process.env.PORT` (defaults to 8080) and serves the built `dist/` folder as static files

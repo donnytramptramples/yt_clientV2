@@ -256,27 +256,42 @@ export default function VideoPlayer({ video, onBack }) {
         onDoubleClick={toggleFullscreen}
       >
         {/* Video — key on streamKey+quality so it reloads when quality changes */}
-        <video
-          key={`${streamKey}-${quality}`}
-          ref={videoRef}
-          src={proxyUrl}
-          className="w-full aspect-video block"
-          autoPlay
-          playsInline
-          preload="auto"
-          onError={(e) => { console.error('Video error:', e.target.error); setIsLoading(false); }}
-        />
+        {embedFallback ? (
+          <iframe
+            key={video.id}
+            src={`https://www.youtube.com/embed/${video.id}?autoplay=1`}
+            className="w-full aspect-video block"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            title={video.title}
+          />
+        ) : (
+          <video
+            key={`${streamKey}-${quality}`}
+            ref={videoRef}
+            src={proxyUrl}
+            className="w-full aspect-video block"
+            autoPlay
+            playsInline
+            preload="auto"
+            onError={(e) => {
+              console.warn('Proxy stream failed, switching to YouTube embed:', e.target.error);
+              setIsLoading(false);
+              setEmbedFallback(true);
+            }}
+          />
+        )}
 
         {/* Loading spinner */}
-        {isLoading && (
+        {isLoading && !embedFallback && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/60 pointer-events-none">
             <Loader2 size={48} className="text-[var(--accent)] animate-spin" />
           </div>
         )}
 
-        {/* Controls overlay */}
+        {/* Controls overlay — hidden when using YouTube embed fallback */}
         <div
-          className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
+          className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${embedFallback ? 'hidden' : ''} ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
           style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 40%)' }}
           onClick={e => e.stopPropagation()}
         >
