@@ -40,6 +40,25 @@ The app does NOT hand raw `googlevideo.com` URLs to the browser. Instead:
 | `GET /api/download/:videoId?format=mp4&quality=720` | Download video/audio |
 | `GET /api/formats/:videoId` | Debug: list available formats |
 
+## Critical Implementation Notes
+
+### youtubei.js version & Platform.shim.eval (v17+)
+- The library is **v17.0.1** (upgraded from v12.2.0 which had broken signature extraction patterns)
+- In v17, `Format.decipher()` is **async** — always `await` it
+- In v17, `Platform.shim.eval` is called with `(data, env)` where `data` is an object from `JsExtractor.buildScript()`. The `data.output` field is a self-contained compiled script that returns the deciphered result. The correct shim is:
+  ```js
+  Platform.shim.eval = (data, _env) => new Function(data.output)();
+  ```
+- The old v12 shim `(code, env) => new Function(...Object.keys(env), code)(...Object.values(env))` does NOT work in v17
+
+### PoToken (BG / bgutils-js)
+- A "cold start" PoToken is generated on session init via `BG.PoToken.generateColdStartToken(visitorData)`
+- Required on Innertube session to pass YouTube's bot detection
+
+### Session Initialization
+- `generate_session_locally: false` + `retrieve_player: true` causes youtubei.js to fetch the real YouTube player JS and extract the n-parameter / signature decipher algorithms
+- Without this, signature extraction fails → all stream URLs return 403
+
 ## Deployment
 
 Deployed on Render (VM target). The `PORT` environment variable is set by Render automatically. Build command: `npm run build`. Run command: `node server.js`. The production server serves the built `dist/` folder as static files.
