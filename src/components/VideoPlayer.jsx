@@ -47,15 +47,9 @@ export default function VideoPlayer({ video, onBack }) {
   const [showDownload, setShowDownload] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [draggingProgress, setDraggingProgress] = useState(false);
-  const [embedFallback, setEmbedFallback] = useState(false);
 
   // Use proxy endpoint: supports HTTP range requests so browser can seek and cache natively
   const proxyUrl = `/api/proxy/${video.id}?quality=${quality}`;
-
-  // Reset fallback when video changes
-  useEffect(() => {
-    setEmbedFallback(false);
-  }, [video.id]);
 
   // Fetch video duration from info endpoint
   useEffect(() => {
@@ -256,42 +250,27 @@ export default function VideoPlayer({ video, onBack }) {
         onDoubleClick={toggleFullscreen}
       >
         {/* Video — key on streamKey+quality so it reloads when quality changes */}
-        {embedFallback ? (
-          <iframe
-            key={video.id}
-            src={`https://www.youtube.com/embed/${video.id}?autoplay=1`}
-            className="w-full aspect-video block"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-            allowFullScreen
-            title={video.title}
-          />
-        ) : (
-          <video
-            key={`${streamKey}-${quality}`}
-            ref={videoRef}
-            src={proxyUrl}
-            className="w-full aspect-video block"
-            autoPlay
-            playsInline
-            preload="auto"
-            onError={(e) => {
-              console.warn('Proxy stream failed, switching to YouTube embed:', e.target.error);
-              setIsLoading(false);
-              setEmbedFallback(true);
-            }}
-          />
-        )}
+        <video
+          key={`${streamKey}-${quality}`}
+          ref={videoRef}
+          src={proxyUrl}
+          className="w-full aspect-video block"
+          autoPlay
+          playsInline
+          preload="auto"
+          onError={(e) => { console.error('Video error:', e.target.error); setIsLoading(false); }}
+        />
 
         {/* Loading spinner */}
-        {isLoading && !embedFallback && (
+        {isLoading && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/60 pointer-events-none">
             <Loader2 size={48} className="text-[var(--accent)] animate-spin" />
           </div>
         )}
 
-        {/* Controls overlay — hidden when using YouTube embed fallback */}
+        {/* Controls overlay */}
         <div
-          className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${embedFallback ? 'hidden' : ''} ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
+          className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
           style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 40%)' }}
           onClick={e => e.stopPropagation()}
         >

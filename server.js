@@ -415,17 +415,12 @@ app.get('/api/download/:videoId', async (req, res) => {
       }
       await pipeline(Readable.fromWeb(resp.body), res);
     } else {
-      // Audio download — transcode via ffmpeg
+      // Audio download — use muxed format (audio-only adaptive formats fail to decipher)
+      // then strip the video track via ffmpeg
       const audioSpec = AUDIO_FORMATS[format];
       if (!audioSpec) return res.status(400).json({ error: `Unsupported format: ${format}` });
 
-      // Prefer audio-only adaptive stream; fall back to muxed if unavailable
-      let selectedFormat;
-      try {
-        selectedFormat = selectBestFormat(formats, 999, true);
-      } catch {
-        selectedFormat = selectBestFormat(formats, qualityNum, false);
-      }
+      const selectedFormat = selectBestFormat(formats, qualityNum, false);
 
       const resp = await fetchFormatStream(selectedFormat, info, controller.signal);
       const sourceStream = Readable.fromWeb(resp.body);
