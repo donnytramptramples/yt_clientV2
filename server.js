@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 
+// Set log level to ERROR to see critical issues but suppress verbose warnings
 Log.setLevel(Log.Level.ERROR);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,7 @@ Platform.shim.eval = (data, _env) => {
   return new Function(data.output)();
 };
 
+// Safe fetch shim
 const _nativeFetch = Platform.shim.fetch ?? fetch;
 Platform.shim.fetch = (input, init = {}) => {
   if (init?.headers && typeof init.headers === 'object') {
@@ -36,10 +38,6 @@ Platform.shim.fetch = (input, init = {}) => {
 
 let youtube;
 let refreshTimer = null;
-
-// Cache VideoInfo objects (not just raw format data) so we can decipher URLs
-const infoCache = new Map();
-const CACHE_TTL = 60 * 60 * 1000;
 
 function generatePoToken(visitorData) {
   return BG.PoToken.generateColdStartToken(visitorData);
@@ -87,6 +85,10 @@ await initYouTube();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'dist')));
+
+// Cache VideoInfo objects (not just raw format data) so we can decipher URLs
+const infoCache = new Map();
+const CACHE_TTL = 60 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -197,18 +199,18 @@ async function fetchFormatStream(format, info, signal) {
 
 app.get('/api/search', async (req, res) => {
   try {
-    if (!youtube) return res.status(503).json({ error: 'API Initialising...' });
+    if (!youtube) return res.status(503).json({ error: "API Initialising..." });
     const { q } = req.query;
     const results = await youtube.search(q, { type: 'video' });
 
     const videos = (results.videos || []).map(v => ({
       id: v.id,
-      title: v.title?.text || 'Video',
-      thumbnail: v.thumbnails?.[0]?.url || '',
-      duration: v.duration?.text || '0:00',
-      views: v.view_count?.text || '0',
-      channel: v.author?.name || 'Channel',
-      channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+      title: v.title?.text || "Video",
+      thumbnail: v.thumbnails?.[0]?.url || "",
+      duration: v.duration?.text || "0:00",
+      views: v.view_count?.text || "0",
+      channel: v.author?.name || "Channel",
+      channelAvatar: v.author?.thumbnails?.[0]?.url || ""
     }));
 
     res.json({ videos });
@@ -404,4 +406,4 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log('Server fully staged and ready for traffic');
+console.log("Server fully staged and ready for traffic");
