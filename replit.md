@@ -1,67 +1,80 @@
 # YouTube Client & Downloader
 
-A self-hosted YouTube web client with a KDE Breeze-inspired dark/light theme. Lets users search, stream, and download YouTube videos via a true proxy architecture.
+A high-performance YouTube client with proxied streaming, downloads, subtitles, user auth, subscriptions, and feed — styled with a KDE Breeze-inspired UI.
 
 ## Architecture
 
-- **Frontend**: React 18 + Vite + TailwindCSS, served on port 5000 (dev)
-- **Backend**: Node.js (Express) API server
-  - Dev: port 10000 (set via `PORT=10000` in `start-dev.sh`)
-  - Production (Render): uses `process.env.PORT` (set by the platform)
-- **Vite proxy**: All `/api/*` requests are proxied from port 5000 → port 10000 in dev
+**Backend** (`server.js`) — Express on port 10000 (dev) / 8080 (prod):
+- `youtubei.js` (TV_EMBEDDED client) for search, metadata, comments, channel data
+- `yt-dlp` for format extraction with multi-client fallback (tv_embedded → android_vr → mweb → android → ios)
+- `ffmpeg` for real-time muxing of separate video+audio streams
+- SQLite via `better-sqlite3`:
+  - `data/auth.db` — users + sessions (30-day cookie tokens, hashed passwords via bcryptjs)
+  - `data/subscriptions.db` — channel subscriptions per user
+- Custom cookie-based auth (no express-session needed)
 
-## How Video Streaming Works (Piped-style proxy)
+**Frontend** (`src/`) — React + Vite + TailwindCSS on port 5000 (dev):
+- Proxies `/api/*` to backend at port 10000
 
-The app does NOT hand raw `googlevideo.com` URLs to the browser. Instead:
-1. **Innertube extraction** (`youtubei.js`) fetches video metadata + stream URLs server-side
-2. **True proxy** (`/api/proxy/:videoId`): the server fetches the video data from Google and pipes it directly to the browser, so Google only ever sees the server's IP (fixing IP-mismatch 403s)
-3. **Muxed format priority**: `streaming_data.formats` (combined audio+video) are preferred over adaptive streams so the browser `<video>` element always gets audio
+## Key Features
 
-### Format Selection Logic
-- `selectBestFormat` uses `has_audio` / `has_video` properties from youtubei.js Format objects
-- Muxed formats (both audio+video) from `streaming_data.formats` are tried first at the requested quality
-- Falls back to the best available muxed format if quality not available
-- Only falls back to video-only adaptive streams as a last resort (logs a warning)
+1. **Auth** — Login/signup on first visit, 30-day persistent sessions, stored in SQLite
+2. **Search** — Video + channel search with Load More pagination
+3. **Feed** — Subscription-based feed with algorithm (recency-sorted)
+4. **Subscriptions** — Subscribe/unsubscribe from channel pages
+5. **Channel Pages** — Search for channels, view all videos, sort by newest/oldest/popular
+6. **Video Playback** — Custom proxy player with quality switching, speed control
+7. **Subtitles** — Custom VTT renderer (not native track): centered, size-adjustable (12–36px), position (top/center/bottom), language selector, shows "unavailable" when not available
+8. **Description + Comments** — Expandable below the video player
+9. **Downloads** — MP4, MP3, FLAC, Opus, Ogg; filename matches video title
 
-## Key Files
+## File Structure
 
-- `server.js` — Express backend: search, info, proxy, stream, download endpoints
-- `src/components/VideoPlayer.jsx` — Video player UI, uses `/api/proxy/:videoId?quality=N`
-- `vite.config.js` — Dev server config (port 5000, proxy to 10000, allowedHosts: true)
-- `start-dev.sh` — Dev startup script (starts backend on PORT=10000, then Vite on 5000)
+```
+server.js              # All backend logic
+src/
+  App.jsx              # Auth routing, navigation state
+  main.jsx             # React entry
+  index.css            # KDE Breeze theme variables
+  components/
+    AuthPage.jsx        # Login/signup form
+    SearchBar.jsx       # Search input
+    VideoGrid.jsx       # Search results + Load More + Channel tabs
+    VideoCard.jsx       # Thumbnail card with channel click
+    VideoPlayer.jsx     # Custom player + subtitles + description + comments
+    ChannelPage.jsx     # Channel videos with subscribe button + sort
+    FeedPage.jsx        # Subscription feed + channel avatars
+data/
+  auth.db              # Users and sessions (auto-created)
+  subscriptions.db     # Subscriptions (auto-created)
+```
 
-## API Endpoints
+## Development
 
-| Endpoint | Description |
-|---|---|
-| `GET /api/search?q=...` | Search YouTube videos |
-| `GET /api/info/:videoId` | Get video duration/title |
-| `GET /api/proxy/:videoId?quality=720` | Stream video through server proxy |
-| `GET /api/download/:videoId?format=mp4&quality=720` | Download video/audio |
-| `GET /api/formats/:videoId` | Debug: list available formats |
+```bash
+bash start-dev.sh
+# Backend: PORT=10000 node server.js
+# Frontend: npx vite --port 5000
+```
 
-## Critical Implementation Notes
+## Production Deployment
 
-### youtubei.js version & Platform.shim.eval (v17+)
-- The library is **v17.0.1** (upgraded from v12.2.0 which had broken signature extraction patterns)
-- In v17, `Format.decipher()` is **async** — always `await` it
-- In v17, `Platform.shim.eval` is called with `(data, env)` where `data` is an object from `JsExtractor.buildScript()`. The `data.output` field is a self-contained compiled script that returns the deciphered result. The correct shim is:
-  ```js
-  Platform.shim.eval = (data, _env) => new Function(data.output)();
-  ```
-- The old v12 shim `(code, env) => new Function(...Object.keys(env), code)(...Object.values(env))` does NOT work in v17
+- Build: `npm run build` (creates `dist/`)
+- Run: `node server.js` (serves dist/ statically + API on PORT)
 
-### PoToken (BG / bgutils-js)
-- A "cold start" PoToken is generated on session init via `BG.PoToken.generateColdStartToken(visitorData)`
-- Required on Innertube session to pass YouTube's bot detection
+## Bot Detection Fixes
 
-### Session Initialization
-- `generate_session_locally: false` + `retrieve_player: true` causes youtubei.js to fetch the real YouTube player JS and extract the n-parameter / signature decipher algorithms
-- Without this, signature extraction fails → all stream URLs return 403
+yt-dlp tries these clients in order until one works:
+1. `tv_embedded` (best bypass)
+2. `android_vr`
+3. `mweb`
+4. `android`
+5. `ios`
 
-## Replit Setup
+All attempts include proper Origin/Referer headers.
 
-- **Workflow**: "Start application" runs `bash start-dev.sh` — starts backend on PORT=10000 then Vite on port 5000
-- **Bug fix**: Moved `infoCache` declaration before `await initYouTube()` call to prevent "Cannot access before initialization" error
-- **Deployment config**: autoscale target, build=`npm run build`, run=`node server.js` (server serves `dist/` + handles API)
-- The production server uses `process.env.PORT` (defaults to 8080) and serves the built `dist/` folder as static files
+## Environment
+
+- Node.js 20
+- yt-dlp auto-downloaded to `$HOME/bin/yt-dlp` if missing
+- ffmpeg from system PATH

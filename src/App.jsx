@@ -1,66 +1,179 @@
 import React, { useState, useEffect } from 'react';
-import { Menu, Sun, Moon } from 'lucide-react';
-import Sidebar from './components/Sidebar';
+import { Sun, Moon, Rss, Search, LogOut, User } from 'lucide-react';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
 import VideoPlayer from './components/VideoPlayer';
+import AuthPage from './components/AuthPage';
+import ChannelPage from './components/ChannelPage';
+import FeedPage from './components/FeedPage';
 
 function App() {
   const [darkMode, setDarkMode] = useState(true);
+  const [user, setUser] = useState(undefined); // undefined = loading
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVideo, setSelectedVideo] = useState(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [selectedChannel, setSelectedChannel] = useState(null);
+  const [view, setView] = useState('search'); // search | feed
+  const [channelRefreshKey, setChannelRefreshKey] = useState(0);
 
   useEffect(() => {
-    if (darkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
+    if (darkMode) document.documentElement.classList.add('dark');
+    else document.documentElement.classList.remove('dark');
   }, [darkMode]);
 
-  return (
-    <div className="min-h-screen flex bg-[var(--bg-primary)] text-[var(--text-primary)]">
-      <Sidebar
-        collapsed={sidebarCollapsed}
-        onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
-      />
+  // Check auth on mount
+  useEffect(() => {
+    fetch('/api/auth/me', { credentials: 'include' })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => setUser(data?.user || null))
+      .catch(() => setUser(null));
+  }, []);
 
-      <div className="flex-1 flex flex-col min-w-0">
-        <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-6 py-3 flex-shrink-0">
-          <div className="flex items-center gap-4">
-            <button
-              onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
-            >
-              <Menu size={20} />
-            </button>
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    setUser(null);
+    setSelectedVideo(null);
+    setSelectedChannel(null);
+    setView('search');
+    setSearchQuery('');
+  };
 
-            <SearchBar onSearch={setSearchQuery} />
+  const handleVideoSelect = (video) => {
+    setSelectedVideo(video);
+    setSelectedChannel(null);
+  };
 
+  const handleChannelSelect = (channelId) => {
+    setSelectedChannel(channelId);
+    setSelectedVideo(null);
+  };
+
+  const handleBack = () => {
+    if (selectedVideo) {
+      setSelectedVideo(null);
+    } else if (selectedChannel) {
+      setSelectedChannel(null);
+    }
+  };
+
+  // Show loading state while checking auth
+  if (user === undefined) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[var(--bg-primary)]">
+        <div className="text-[var(--accent)] text-lg">Loading…</div>
+      </div>
+    );
+  }
+
+  // Show auth page if not logged in
+  if (user === null) {
+    return (
+      <div className={darkMode ? 'dark' : ''}>
+        <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+          <div className="absolute top-4 right-4">
             <button
               onClick={() => setDarkMode(!darkMode)}
-              className="ml-auto p-2 hover:bg-[var(--bg-primary)] rounded transition-colors flex-shrink-0"
+              className="p-2 hover:bg-[var(--bg-secondary)] rounded transition-colors"
             >
-              {darkMode ? <Sun size={20} /> : <Moon size={20} />}
+              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
           </div>
-        </header>
+          <AuthPage onAuth={setUser} />
+        </div>
+      </div>
+    );
+  }
 
-        <main className="flex-1 overflow-y-auto p-6">
+  return (
+    <div className="min-h-screen flex flex-col bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-4 py-3 flex-shrink-0">
+        <div className="flex items-center gap-3 max-w-6xl mx-auto w-full">
+          {/* Feed / Search tabs */}
+          <div className="flex gap-1">
+            <button
+              onClick={() => { setView('feed'); setSelectedVideo(null); setSelectedChannel(null); }}
+              className={`p-2 rounded transition-colors ${view === 'feed' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+              title="Feed"
+            >
+              <Rss size={18} />
+            </button>
+            <button
+              onClick={() => { setView('search'); setSelectedVideo(null); setSelectedChannel(null); }}
+              className={`p-2 rounded transition-colors ${view === 'search' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+              title="Search"
+            >
+              <Search size={18} />
+            </button>
+          </div>
+
+          {view === 'search' && !selectedVideo && !selectedChannel && (
+            <div className="flex-1">
+              <SearchBar onSearch={q => { setSearchQuery(q); setSelectedVideo(null); setSelectedChannel(null); }} />
+            </div>
+          )}
+
+          {(selectedVideo || selectedChannel) && (
+            <div className="flex-1" />
+          )}
+
+          {view === 'feed' && !selectedVideo && !selectedChannel && (
+            <div className="flex-1" />
+          )}
+
+          <div className="flex items-center gap-2 ml-auto flex-shrink-0">
+            <span className="text-xs text-[var(--text-secondary)] hidden sm:block">
+              <User size={12} className="inline mr-1" />
+              {user.username}
+            </span>
+            <button
+              onClick={handleLogout}
+              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
+              title="Logout"
+            >
+              <LogOut size={16} />
+            </button>
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
+            >
+              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main className="flex-1 overflow-y-auto p-4 md:p-6">
+        <div className="max-w-6xl mx-auto">
           {selectedVideo ? (
             <VideoPlayer
               video={selectedVideo}
-              onBack={() => setSelectedVideo(null)}
+              onBack={handleBack}
+              onChannelSelect={handleChannelSelect}
+            />
+          ) : selectedChannel ? (
+            <ChannelPage
+              channelId={selectedChannel}
+              onBack={handleBack}
+              onVideoSelect={handleVideoSelect}
+              user={user}
+              onSubscribeChange={() => setChannelRefreshKey(k => k + 1)}
+            />
+          ) : view === 'feed' ? (
+            <FeedPage
+              key={channelRefreshKey}
+              user={user}
+              onVideoSelect={handleVideoSelect}
+              onChannelSelect={handleChannelSelect}
             />
           ) : (
             <VideoGrid
               searchQuery={searchQuery}
-              onVideoSelect={setSelectedVideo}
+              onVideoSelect={handleVideoSelect}
+              onChannelSelect={handleChannelSelect}
             />
           )}
-        </main>
-      </div>
+        </div>
+      </main>
     </div>
   );
 }

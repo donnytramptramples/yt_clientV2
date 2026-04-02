@@ -7,15 +7,9 @@ if [ ! -f "$HOME/bin/yt-dlp" ]; then
   mkdir -p "$HOME/bin"
   curl -sL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux" -o "$HOME/bin/yt-dlp"
   chmod +x "$HOME/bin/yt-dlp"
-  echo "[setup] yt-dlp $(\"$HOME/bin/yt-dlp\" --version) ready"
+  echo "[setup] yt-dlp $("$HOME/bin/yt-dlp" --version) ready"
+else
+  echo "[setup] yt-dlp already installed"
 fi
 
-# Start backend on port 10000 (matches Vite proxy config)
-PORT=10000 node server.js &
-BACKEND_PID=$!
-
-# Start Vite dev server on port 5000
-npx vite --port 5000 --host 0.0.0.0
-
-# If vite exits, kill the backend
-kill $BACKEND_PID 2>/dev/null
+exec PORT=5000 node server.js
