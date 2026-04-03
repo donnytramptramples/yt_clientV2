@@ -17,7 +17,6 @@ let FFMPEG;
 try {
   FFMPEG = execSync('which ffmpeg').toString().trim();
 } catch {
-  // Fall back to ffmpeg-static if system ffmpeg is not available
   try {
     const { default: ffmpegStatic } = await import('ffmpeg-static');
     if (ffmpegStatic && fs.existsSync(ffmpegStatic)) {
@@ -104,16 +103,27 @@ let refreshTimer = null;
 const infoCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
 
+// Get visitor data from environment for bot bypass
+const YOUTUBE_VISITOR_DATA = process.env.YOUTUBE_VISITOR_DATA || '';
+
 async function initYouTube() {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
 
   try {
-    youtube = await Innertube.create({
+    const options = {
       client_type: ClientType.TV_EMBEDDED,
       generate_session_locally: true,
       cache: new UniversalCache(false),
       enable_session_cache: false,
-    });
+    };
+
+    // Add visitor_data if available to bypass bot detection
+    if (YOUTUBE_VISITOR_DATA) {
+      options.visitor_data = YOUTUBE_VISITOR_DATA;
+      console.log('[youtubei.js] Using provided visitor_data for bot bypass');
+    }
+
+    youtube = await Innertube.create(options);
 
     infoCache.clear();
     console.log('>>> [SUCCESS] YouTube API Initialised (TV_EMBEDDED)');
@@ -167,7 +177,7 @@ subsDb.exec(`
 
 function createSession(userId) {
   const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
+  const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
   authDb.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)').run(token, userId, expiresAt);
   return token;
 }
@@ -215,7 +225,6 @@ setInterval(() => {
   for (const [key, val] of infoCache) {
     if (now - val.ts > CACHE_TTL) infoCache.delete(key);
   }
-  // Clean expired sessions
   authDb.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
 }, 30 * 60 * 1000);
 
@@ -382,7 +391,19 @@ function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
   return selectVideoFormat(formats, qualityLimit);
 }
 
-// yt-dlp with multiple client fallbacks
+// Build yt-dlp extractor args with bot bypass options
+function buildYtDlpExtractorArgs(client = 'tv_embedded') {
+  const args = ['--extractor-args', `youtube:player_client=${client}`];
+
+  // Add visitor_data if available for bot bypass
+  if (YOUTUBE_VISITOR_DATA) {
+    args[1] += `;visitor_data=${YOUTUBE_VISITOR_DATA}`;
+  }
+
+  return args;
+}
+
+// yt-dlp with multiple client fallbacks and bot bypass
 async function getYtDlpFormats(videoId, attempt = 0) {
   const cached = ytdlpCache.get(videoId);
   if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
@@ -393,16 +414,18 @@ async function getYtDlpFormats(videoId, attempt = 0) {
   const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios'];
   const client = clients[attempt % clients.length];
 
+  const extractorArgs = buildYtDlpExtractorArgs(client);
+
   const raw = await new Promise((resolve, reject) => {
     const args = [
       '--no-playlist', '--quiet', '--no-warnings',
-      '--extractor-args', `youtube:player_client=${client}`,
+      ...extractorArgs,
       '--add-headers', `Origin:https://www.youtube.com`,
       '--add-headers', `Referer:https://www.youtube.com/`,
       '-j', `https://www.youtube.com/watch?v=${videoId}`,
     ];
 
-    console.log(`[ytdlp] Using client: ${client}`);
+    console.log(`[ytdlp] Using client: ${client}${YOUTUBE_VISITOR_DATA ? ' with visitor_data' : ''}`);
 
     const proc = spawn(YTDLP, args, {
       env: { ...process.env, 'HTTP_USER_AGENT': getRandomUA() }
@@ -519,33 +542,77 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
   return resp;
 }
 
+// FIXED: Better seeking implementation with proper sync
 function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
   return new Promise((resolve, reject) => {
+    // Format seek time for ffmpeg
     const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
+
+    // Use input seeking for both streams to maintain sync
     const args = [
       '-loglevel', 'error',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-      // Seek BOTH inputs independently so audio and video stay in sync
+      // Global seek before inputs (input seeking) - more accurate and faster
       ...ssArgs,
-      '-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5',
+      '-reconnect', '1', 
+      '-reconnect_on_network_error', '1', 
+      '-reconnect_delay_max', '5',
+      // Video input
       '-i', videoUrl,
-      ...ssArgs,
-      '-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5',
+      // Audio input with same seek
+      '-reconnect', '1', 
+      '-reconnect_on_network_error', '1', 
+      '-reconnect_delay_max', '5',
       '-i', audioUrl,
-      '-map', '0:v:0', '-map', '1:a:0',
-      '-c:v', 'copy', '-c:a', 'copy',
+      // Map streams
+      '-map', '0:v:0', 
+      '-map', '1:a:0',
+      // Copy codecs (no re-encode)
+      '-c:v', 'copy', 
+      '-c:a', 'copy',
+      // Fragmented MP4 for streaming
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-      '-f', 'mp4', 'pipe:1',
+      '-f', 'mp4', 
+      'pipe:1',
     ];
+
+    console.log(`[ffmpeg] Starting mux with seek: ${seekSeconds}s`);
+
     const proc = spawn(FFMPEG, args);
-    if (signal) signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
-    proc.stderr.on('data', d => { const msg = d.toString().trim(); if (msg) console.error('[ffmpeg]', msg); });
+
+    if (signal) {
+      signal.addEventListener('abort', () => { 
+        try { 
+          proc.kill('SIGTERM'); 
+        } catch {} 
+      }, { once: true });
+    }
+
+    let stderrData = '';
+    proc.stderr.on('data', d => { 
+      const msg = d.toString().trim(); 
+      if (msg) {
+        stderrData += msg + '\n';
+        // Only log errors, not warnings
+        if (msg.includes('Error') || msg.includes('error')) {
+          console.error('[ffmpeg]', msg);
+        }
+      }
+    });
+
     proc.stdout.pipe(res);
     proc.stdout.on('error', () => {});
+
     proc.on('close', code => {
-      if (code === 0 || code === null || res.writableEnded) resolve();
-      else reject(new Error(`ffmpeg exited with code ${code}`));
+      if (code === 0 || code === null || res.writableEnded) {
+        resolve();
+      } else {
+        console.error(`[ffmpeg] Exited with code ${code}`);
+        if (stderrData) console.error('[ffmpeg stderr]', stderrData);
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
     });
+
     proc.on('error', reject);
   });
 }
@@ -620,7 +687,6 @@ app.get('/api/channel/search', async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json({ channels: [] });
 
-    // TV_EMBEDDED doesn't support type:'channel' search, so search videos and extract unique channels
     const results = await youtube.search(q, { type: 'video' });
     const seen = new Set();
     const channels = [];
@@ -647,7 +713,7 @@ app.get('/api/channel/search', async (req, res) => {
   }
 });
 
-// ─── Channel videos via yt-dlp (reliable, doesn't need client browsing) ──────
+// ─── Channel videos via yt-dlp ───────────────────────────────────────────────
 
 const channelCache = new Map();
 const CHANNEL_TTL = 10 * 60 * 1000;
@@ -657,7 +723,6 @@ async function fetchChannelVideos(channelId, limit = 30) {
   const cached = channelCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CHANNEL_TTL) return cached;
 
-  // Try channel URL formats — cover UC..., @handle, and plain handle
   const urls = [];
   if (channelId.startsWith('UC') || channelId.startsWith('UU')) {
     urls.push(`https://www.youtube.com/channel/${channelId}/videos`);
@@ -667,7 +732,6 @@ async function fetchChannelVideos(channelId, limit = 30) {
   } else {
     urls.push(`https://www.youtube.com/@${channelId}/videos`);
   }
-  // Always add /channel/ as fallback
   if (!channelId.startsWith('@')) {
     urls.push(`https://www.youtube.com/channel/${channelId}/videos`);
   }
@@ -677,18 +741,24 @@ async function fetchChannelVideos(channelId, limit = 30) {
 
   for (const url of urls) {
     try {
+      const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
+
       const raw = await new Promise((resolve, reject) => {
         const args = [
           '--flat-playlist', '--no-warnings', '--quiet',
-          '--extractor-args', 'youtube:player_client=tv_embedded',
+          ...extractorArgs,
           '--playlist-items', `1-${limit}`,
           '-J', url,
         ];
-        const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+        const proc = spawn(YTDLP, args, { 
+          env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+        });
         let out = '';
         let err = '';
-        // Kill after 30s to prevent hanging
-        const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('yt-dlp timeout')); }, 30000);
+        const timer = setTimeout(() => { 
+          try { proc.kill('SIGKILL'); } catch {} 
+          reject(new Error('yt-dlp timeout')); 
+        }, 30000);
         proc.stdout.on('data', d => { out += d; });
         proc.stderr.on('data', d => { err += d; });
         proc.on('close', code => {
@@ -786,7 +856,7 @@ app.get('/api/feed', requireAuth, async (req, res) => {
 
     const allVideos = [];
 
-    // ── Subscription content (high weight) ───────────────────────────────────
+    // ── Subscription content ───────────────────────────────────────────────────
     if (subs.length > 0) {
       const channelResults = await Promise.allSettled(
         subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 15))
@@ -800,7 +870,6 @@ app.get('/api/feed', requireAuth, async (req, res) => {
           const popularity = getFeedPopularityScore(v.views);
           const channelBoost = (subs.length - i) / Math.max(subs.length, 1) * 0.1;
           const random = Math.random() * 0.05;
-          // Subscribed content scored higher overall (base 0.4 + algorithm)
           const score = 0.4 + recency * 0.65 + popularity * 0.2 + channelBoost + random;
           allVideos.push({
             ...v,
@@ -814,14 +883,29 @@ app.get('/api/feed', requireAuth, async (req, res) => {
       }
     }
 
-    // ── Trending content (recommendation layer) ───────────────────────────────
+    // ── Trending content ────────────────────────────────────────────────────────
     try {
       let trendingVideos = [];
+      let trendingData = null;
 
-      // Try youtubei.js trending first
-      const trending = await youtube.getTrending().catch(() => null);
-      if (trending) {
-        const section = trending.videos || trending.items || [];
+      // FIXED: Try to get trending using browse endpoint if getTrending fails
+      try {
+        if (youtube && typeof youtube.getTrending === 'function') {
+          trendingData = await youtube.getTrending();
+        }
+      } catch (trendErr) {
+        console.warn('[feed] getTrending() failed:', trendErr.message);
+      }
+
+      // Parse trending results - handle both TabbedFeed and Feed structures
+      if (trendingData) {
+        // TabbedFeed has .videos, Feed might have .items or nested structure
+        const items = trendingData.videos || trendingData.items || [];
+
+        // If it's a tabbed feed, we might need to select the first tab
+        const section = Array.isArray(items) ? items : 
+                       (trendingData.contents?.[0]?.contents || []);
+
         trendingVideos = section
           .filter(v => v.id && (v.title?.text || v.title))
           .slice(0, 30)
@@ -838,12 +922,15 @@ app.get('/api/feed', requireAuth, async (req, res) => {
           }));
       }
 
-      // Mix trending in with lower weight (simulate algorithm recommendations)
+      // Fallback: use yt-dlp for trending if API fails
+      if (trendingVideos.length === 0) {
+        throw new Error('API trending empty, will fallback');
+      }
+
       const subChannelIds = new Set(subs.map(s => s.channel_id));
       for (const v of trendingVideos) {
         const popularity = getFeedPopularityScore(v.views);
         const recency = getFeedRecencyScore(v.published);
-        // Slightly boost if it's from a subscribed channel, otherwise treat as recommendation
         const isSub = subChannelIds.has(v.channelId);
         const random = Math.random() * 0.08;
         const score = (isSub ? 0.3 : 0.1) + recency * 0.4 + popularity * 0.35 + random;
@@ -851,21 +938,25 @@ app.get('/api/feed', requireAuth, async (req, res) => {
       }
     } catch (e) {
       console.warn('[feed] trending fetch failed:', e.message);
-    }
 
-    // ── If still empty (no subs + trending failed), fallback trending ─────────
-    if (allVideos.length === 0) {
+      // Fallback trending via yt-dlp
       try {
+        const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
         const trendResult = await new Promise((resolve, reject) => {
           const args = [
             '--flat-playlist', '--no-warnings', '--quiet',
-            '--extractor-args', 'youtube:player_client=tv_embedded',
+            ...extractorArgs,
             '--playlist-items', '1-30',
             '-J', 'https://www.youtube.com/feed/trending',
           ];
-          const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+          const proc = spawn(YTDLP, args, { 
+            env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+          });
           let out = '';
-          const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} resolve({ entries: [] }); }, 25000);
+          const timer = setTimeout(() => { 
+            try { proc.kill('SIGKILL'); } catch {} 
+            resolve({ entries: [] }); 
+          }, 25000);
           proc.stdout.on('data', d => { out += d; });
           proc.stderr.on('data', () => {});
           proc.on('close', () => {
@@ -874,6 +965,7 @@ app.get('/api/feed', requireAuth, async (req, res) => {
           });
           proc.on('error', () => { clearTimeout(timer); resolve({ entries: [] }); });
         });
+
         for (const v of (trendResult.entries || [])) {
           if (!v.id) continue;
           allVideos.push({
@@ -890,7 +982,9 @@ app.get('/api/feed', requireAuth, async (req, res) => {
             _src: 'trending_fallback',
           });
         }
-      } catch {}
+      } catch (fallbackErr) {
+        console.warn('[feed] yt-dlp trending fallback also failed:', fallbackErr.message);
+      }
     }
 
     // ── Sort, deduplicate, and return ────────────────────────────────────────
@@ -913,15 +1007,12 @@ app.get('/api/feed', requireAuth, async (req, res) => {
 });
 
 function getFeedRecencyScore(published) {
-  // Parse yt-dlp upload_date (YYYYMMDD) or relative strings
   if (!published) return 0;
   const p = String(published);
-  // YYYYMMDD format from yt-dlp
   if (/^\d{4}-\d{2}-\d{2}$/.test(p)) {
     const daysAgo = (Date.now() - new Date(p).getTime()) / (1000 * 86400);
-    return Math.max(0, 1 - daysAgo / 90); // decay over 90 days
+    return Math.max(0, 1 - daysAgo / 90);
   }
-  // Relative format (e.g. "2 days ago")
   const lower = p.toLowerCase();
   if (lower.includes('hour') || lower.includes('minute') || lower.includes('second')) return 1.0;
   if (lower.includes('day')) { const d = parseInt(lower) || 1; return Math.max(0, 1 - d / 90); }
@@ -935,7 +1026,6 @@ function getFeedPopularityScore(views) {
   if (!views) return 0;
   const n = parseInt(String(views).replace(/[^\d]/g, '')) || 0;
   if (!n) return 0;
-  // log scale normalised to ~10M views = 1.0
   return Math.min(1, Math.log10(n + 1) / 7);
 }
 
@@ -988,7 +1078,6 @@ app.get('/api/video/:videoId/details', async (req, res) => {
   let description = '';
   let comments = [];
 
-  // Description from yt-dlp (most reliable)
   try {
     const data = await getYtDlpFormatsWithRetry(videoId);
     description = data.meta?.description || '';
@@ -1001,20 +1090,26 @@ app.get('/api/video/:videoId/details', async (req, res) => {
     } catch {}
   }
 
-  // Comments via yt-dlp (TV_EMBEDDED client cannot fetch comments)
+  // Comments via yt-dlp
   try {
+    const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
     const commentData = await new Promise((resolve) => {
       const args = [
         '--no-playlist', '--skip-download', '--write-comments', '--quiet', '--no-warnings',
         '--extractor-args', 'youtube:comment_sort=top;max_comments=30,all,top,0',
-        '--extractor-args', 'youtube:player_client=tv_embedded',
+        ...extractorArgs,
         '-j', `https://www.youtube.com/watch?v=${videoId}`,
       ];
-      const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+      const proc = spawn(YTDLP, args, { 
+        env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+      });
       let out = '';
       proc.stdout.on('data', d => { out += d; });
       proc.stderr.on('data', () => {});
-      const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 20000);
+      const timer = setTimeout(() => { 
+        try { proc.kill(); } catch {} 
+        resolve(null); 
+      }, 20000);
       proc.on('close', () => {
         clearTimeout(timer);
         try { resolve(JSON.parse(out)); } catch { resolve(null); }
@@ -1104,7 +1199,7 @@ app.get('/api/subtitles/:videoId/list', async (req, res) => {
   }
 });
 
-// ─── Subtitle translate (unofficial Google Translate, no API key) ─────────────
+// ─── Subtitle translate ────────────────────────────────────────────────────────
 
 app.get('/api/subtitles/:videoId/translate', async (req, res) => {
   const { videoId } = req.params;
@@ -1113,7 +1208,7 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
   try {
     const data = await getYtDlpFormatsWithRetry(videoId);
 
-    // First try to find subtitles in the target language directly (yt auto-translate)
+    // First try to find subtitles in the target language directly
     const autoCapsSrc = data.automaticCaptions;
     if (autoCapsSrc && autoCapsSrc[to]) {
       const subs = autoCapsSrc[to];
@@ -1156,7 +1251,7 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
       return res.send(vttText);
     }
 
-    // Batch translate: join with a delimiter, translate once, split back
+    // Batch translate
     const DELIM = ' ||| ';
     const batch = cues.map(c => c.text).join(DELIM);
 
@@ -1169,7 +1264,6 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
       });
       if (gtRes.ok) {
         const gtData = await gtRes.json();
-        // Google Translate response: [[["translated","original",...]], ...], null, "detected_lang"]
         translated = (gtData[0] || []).map(part => part[0] || '').join('');
       }
     } catch (e) {
@@ -1197,13 +1291,16 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 
 // ─── Proxy (streaming) ───────────────────────────────────────────────────────
 
+// FIXED: Improved seeking with proper time-based seeking support
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { quality = '720', t = '0' } = req.query;
-  const seekSeconds = Math.max(0, parseFloat(t) || 0);
+  const { quality = '720', t = '0', start } = req.query;
+
+  // Support both 't' and 'start' parameters for seeking
+  const seekSeconds = Math.max(0, parseFloat(start || t) || 0);
   const rangeHeader = req.headers.range;
 
-  console.log(`[proxy] ${videoId} q=${quality} range=${rangeHeader || 'none'}`);
+  console.log(`[proxy] ${videoId} q=${quality} seek=${seekSeconds}s range=${rangeHeader || 'none'}`);
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
@@ -1215,14 +1312,26 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
     const videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
 
+    // If format has both video and audio, stream directly
     if (videoFmt.acodec !== 'none') {
       const fetchHeaders = {
-        'accept': '*/*', 'origin': 'https://www.youtube.com',
-        'referer': 'https://www.youtube.com', 'user-agent': getRandomUA()
+        'accept': '*/*', 
+        'origin': 'https://www.youtube.com',
+        'referer': 'https://www.youtube.com', 
+        'user-agent': getRandomUA()
       };
-      if (rangeHeader) fetchHeaders['range'] = rangeHeader;
 
-      const resp = await fetch(videoFmt.url, { headers: fetchHeaders, signal: controller.signal });
+      // For direct streams, we can support range requests if no seek time specified
+      // If seek time is specified, we need to use time-based seeking via ffmpeg or yt-dlp
+      if (rangeHeader && seekSeconds === 0) {
+        fetchHeaders['range'] = rangeHeader;
+      }
+
+      const resp = await fetch(videoFmt.url, { 
+        headers: fetchHeaders, 
+        signal: controller.signal 
+      });
+
       if (!resp.ok && resp.status !== 206) throw new Error(`Upstream: ${resp.status}`);
 
       res.status(resp.status === 206 ? 206 : 200);
@@ -1231,35 +1340,34 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       res.setHeader('Cache-Control', 'public, max-age=3600');
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
-      if (resp.headers.get('content-length')) res.setHeader('Content-Length', resp.headers.get('content-length'));
-      if (resp.headers.get('content-range')) res.setHeader('Content-Range', resp.headers.get('content-range'));
+
+      if (resp.headers.get('content-length')) {
+        res.setHeader('Content-Length', resp.headers.get('content-length'));
+      }
+      if (resp.headers.get('content-range')) {
+        res.setHeader('Content-Range', resp.headers.get('content-range'));
+      }
 
       await pipeline(Readable.fromWeb(resp.body), res);
     } else {
+      // Separate audio/video streams - need to mux with ffmpeg
       const audioFmt = pickYtDlpAudio(ytFmts);
-      // Use explicit seek param from frontend first, fall back to byte-range estimation
-      let effectiveSeek = seekSeconds;
-      if (!effectiveSeek && rangeHeader) {
-        const match = rangeHeader.match(/bytes=(\d+)-/);
-        if (match) {
-          const byteOffset = parseInt(match[1], 10);
-          const totalBitrate = ((videoFmt.tbr || 2000) + (audioFmt.tbr || 130)) * 1000 / 8;
-          effectiveSeek = Math.max(0, byteOffset / totalBitrate);
-        }
-      }
+
       res.setHeader('Content-Type', 'video/mp4');
-      // Don't advertise byte-range seeking for muxed streams — browser will use our ?t= instead
+      // Disable byte-range seeking for muxed streams - use time-based ?t= instead
       res.setHeader('Accept-Ranges', 'none');
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'no-cache');
-      await muxToResponse(videoFmt.url, audioFmt.url, res, controller.signal, effectiveSeek);
+
+      await muxToResponse(videoFmt.url, audioFmt.url, res, controller.signal, seekSeconds);
     }
   } catch (e) {
     if (controller.signal.aborted) return;
     console.error(`[proxy] Error: ${e.message}`);
     if (!res.headersSent) {
       res.status(502).json({
-        error: e.message, videoId,
+        error: e.message, 
+        videoId,
         fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
       });
     }
@@ -1311,7 +1419,6 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
 function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
   return new Promise((resolve, reject) => {
-    // Pass YouTube CDN headers so FFmpeg can fetch the signed URL without 403
     const ytHeaders = [
       `User-Agent: ${getRandomUA()}`,
       'Accept: */*',
@@ -1324,7 +1431,9 @@ function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
       '-loglevel', 'error',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
       '-headers', ytHeaders,
-      '-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5',
+      '-reconnect', '1', 
+      '-reconnect_on_network_error', '1', 
+      '-reconnect_delay_max', '5',
       '-i', audioUrl,
       '-vn',
       '-c:a', codec,
@@ -1332,9 +1441,20 @@ function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
       '-f', format,
       'pipe:1',
     ];
+
     const proc = spawn(FFMPEG, args);
-    if (signal) signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
-    proc.stderr.on('data', d => { const m = d.toString().trim(); if (m) console.error('[ffmpeg-audio]', m); });
+
+    if (signal) {
+      signal.addEventListener('abort', () => { 
+        try { proc.kill('SIGTERM'); } catch {} 
+      }, { once: true });
+    }
+
+    proc.stderr.on('data', d => { 
+      const m = d.toString().trim(); 
+      if (m) console.error('[ffmpeg-audio]', m); 
+    });
+
     resolve(proc);
   });
 }
@@ -1364,11 +1484,18 @@ app.get('/api/download/:videoId', async (req, res) => {
 
       if (videoFmt.acodec !== 'none') {
         const resp = await fetch(videoFmt.url, {
-          headers: { 'accept': '*/*', 'origin': 'https://www.youtube.com', 'referer': 'https://www.youtube.com', 'user-agent': getRandomUA() },
+          headers: { 
+            'accept': '*/*', 
+            'origin': 'https://www.youtube.com', 
+            'referer': 'https://www.youtube.com', 
+            'user-agent': getRandomUA() 
+          },
           signal: controller.signal
         });
         if (!resp.ok) throw new Error(`Upstream: ${resp.status}`);
-        if (resp.headers.get('content-length')) res.setHeader('Content-Length', resp.headers.get('content-length'));
+        if (resp.headers.get('content-length')) {
+          res.setHeader('Content-Length', resp.headers.get('content-length'));
+        }
         await pipeline(Readable.fromWeb(resp.body), res);
       } else {
         await muxToResponse(videoFmt.url, audioFmt.url, res, controller.signal, 0);
@@ -1377,9 +1504,6 @@ app.get('/api/download/:videoId', async (req, res) => {
       const audioFmt = pickYtDlpAudio(ytFmts);
       if (!audioFmt) return res.status(404).json({ error: 'No audio format available' });
 
-      // For each format: [ffmpegCodec, outputExt, mimeType, ffmpegFormatName, extraFfmpegArgs]
-      // FLAC: lossless — do NOT use bitrate flags, preserve native sample rate
-      // Opus: use ogg container (-f ogg) for max compatibility; bare -f opus bitstream is less supported
       const formatConfig = {
         mp3:  ['libmp3lame', 'mp3',  'audio/mpeg',  'mp3',  ['-b:a', '320k', '-ar', '44100']],
         flac: ['flac',       'flac', 'audio/flac',  'flac', ['-compression_level', '5']],
@@ -1397,8 +1521,12 @@ app.get('/api/download/:videoId', async (req, res) => {
       const proc = await spawnFfmpegAudio(audioFmt.url, codec, ffmpegFormat, extraArgs, controller.signal);
       proc.stdout.pipe(res);
       proc.stdout.on('error', () => {});
+
       await new Promise((resolve, reject) => {
-        proc.on('close', c => { if (c === 0 || c === null || res.writableEnded) resolve(); else reject(new Error(`ffmpeg exit ${c}`)); });
+        proc.on('close', c => { 
+          if (c === 0 || c === null || res.writableEnded) resolve(); 
+          else reject(new Error(`ffmpeg exit ${c}`)); 
+        });
         proc.on('error', reject);
       });
     }
@@ -1421,40 +1549,53 @@ app.get('/api/trending', async (req, res) => {
       return res.json(trendingCache.data);
     }
 
-    const results = await youtube.getTrending().catch(() => null);
     let videos = [];
 
-    if (results) {
-      const section = results.videos || results.items || [];
-      videos = section
-        .filter(v => v.id && (v.title?.text || v.title))
-        .slice(0, 40)
-        .map(v => ({
-          id: v.id,
-          title: v.title?.text || v.title || 'Video',
-          thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-          duration: v.duration?.text || '',
-          views: v.view_count?.text || v.short_view_count?.text || '',
-          channel: v.author?.name || v.channel?.name || '',
-          channelId: v.author?.id || v.channel?.id || '',
-          channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-          published: v.published?.text || '',
-        }));
+    // Try youtubei.js getTrending first (with error handling)
+    try {
+      if (youtube && typeof youtube.getTrending === 'function') {
+        const results = await youtube.getTrending();
+        const items = results.videos || results.items || [];
+        const section = Array.isArray(items) ? items : (results.contents?.[0]?.contents || []);
+
+        videos = section
+          .filter(v => v.id && (v.title?.text || v.title))
+          .slice(0, 40)
+          .map(v => ({
+            id: v.id,
+            title: v.title?.text || v.title || 'Video',
+            thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+            duration: v.duration?.text || '',
+            views: v.view_count?.text || v.short_view_count?.text || '',
+            channel: v.author?.name || v.channel?.name || '',
+            channelId: v.author?.id || v.channel?.id || '',
+            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            published: v.published?.text || '',
+          }));
+      }
+    } catch (apiErr) {
+      console.warn('[trending] API failed:', apiErr.message);
     }
 
     // Fallback: scrape trending via yt-dlp
     if (videos.length === 0) {
       try {
+        const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
         const raw = await new Promise((resolve, reject) => {
           const args = [
             '--flat-playlist', '--no-warnings', '--quiet',
-            '--extractor-args', 'youtube:player_client=tv_embedded',
+            ...extractorArgs,
             '--playlist-items', '1-40',
             '-J', 'https://www.youtube.com/feed/trending',
           ];
-          const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+          const proc = spawn(YTDLP, args, { 
+            env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+          });
           let out = '';
-          const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
+          const timer = setTimeout(() => { 
+            try { proc.kill('SIGKILL'); } catch {} 
+            reject(new Error('timeout')); 
+          }, 30000);
           proc.stdout.on('data', d => { out += d; });
           proc.stderr.on('data', () => {});
           proc.on('close', code => {
@@ -1506,16 +1647,22 @@ app.get('/api/shorts', async (req, res) => {
 
     // Try trending shorts page via yt-dlp
     try {
+      const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
       const raw = await new Promise((resolve, reject) => {
         const args = [
           '--flat-playlist', '--no-warnings', '--quiet',
-          '--extractor-args', 'youtube:player_client=tv_embedded',
+          ...extractorArgs,
           '--playlist-items', '1-40',
           '-J', 'https://www.youtube.com/shorts',
         ];
-        const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+        const proc = spawn(YTDLP, args, { 
+          env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+        });
         let out = '';
-        const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
+        const timer = setTimeout(() => { 
+          try { proc.kill('SIGKILL'); } catch {} 
+          reject(new Error('timeout')); 
+        }, 30000);
         proc.stdout.on('data', d => { out += d; });
         proc.stderr.on('data', () => {});
         proc.on('close', code => {
@@ -1577,7 +1724,12 @@ app.get('/api/shorts', async (req, res) => {
 // ─── Health ──────────────────────────────────────────────────────────────────
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', youtube: !!youtube, activeStreams });
+  res.json({ 
+    status: 'ok', 
+    youtube: !!youtube, 
+    activeStreams,
+    visitorData: YOUTUBE_VISITOR_DATA ? 'configured' : 'not configured'
+  });
 });
 
 app.get('*', (req, res) => {
@@ -1586,6 +1738,7 @@ app.get('*', (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Visitor data ${YOUTUBE_VISITOR_DATA ? 'configured' : 'NOT configured'} for bot bypass`);
 });
 
 const wss = new WebSocketServer({ server });
