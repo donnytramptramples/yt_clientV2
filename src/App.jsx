@@ -13,7 +13,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVideo, setSelectedVideo] = useState(null);
   const [selectedChannel, setSelectedChannel] = useState(null);
-  const [view, setView] = useState('search'); // search | feed
+  const [view, setView] = useState('feed'); // feed | search
   const [channelRefreshKey, setChannelRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -88,37 +88,30 @@ function App() {
     <div className="min-h-screen flex flex-col bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-4 py-3 flex-shrink-0">
         <div className="flex items-center gap-3 max-w-6xl mx-auto w-full">
-          {/* Feed / Search tabs */}
-          <div className="flex gap-1">
-            <button
-              onClick={() => { setView('feed'); setSelectedVideo(null); setSelectedChannel(null); }}
-              className={`p-2 rounded transition-colors ${view === 'feed' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
-              title="Feed"
-            >
-              <Rss size={18} />
-            </button>
-            <button
-              onClick={() => { setView('search'); setSelectedVideo(null); setSelectedChannel(null); }}
-              className={`p-2 rounded transition-colors ${view === 'search' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
-              title="Search"
-            >
-              <Search size={18} />
-            </button>
-          </div>
+          {/* Feed tab */}
+          <button
+            onClick={() => { setView('feed'); setSelectedVideo(null); setSelectedChannel(null); }}
+            className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'feed' && !selectedVideo && !selectedChannel ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+            title="Feed"
+          >
+            <Rss size={18} />
+          </button>
 
-          {view === 'search' && !selectedVideo && !selectedChannel && (
+          {/* Search bar — always visible; submitting switches to search view */}
+          {!selectedVideo && !selectedChannel && (
             <div className="flex-1">
-              <SearchBar onSearch={q => { setSearchQuery(q); setSelectedVideo(null); setSelectedChannel(null); }} />
+              <SearchBar
+                onSearch={q => {
+                  setSearchQuery(q);
+                  setView('search');
+                  setSelectedVideo(null);
+                  setSelectedChannel(null);
+                }}
+              />
             </div>
           )}
 
-          {(selectedVideo || selectedChannel) && (
-            <div className="flex-1" />
-          )}
-
-          {view === 'feed' && !selectedVideo && !selectedChannel && (
-            <div className="flex-1" />
-          )}
+          {(selectedVideo || selectedChannel) && <div className="flex-1" />}
 
           <div className="flex items-center gap-2 ml-auto flex-shrink-0">
             <span className="text-xs text-[var(--text-secondary)] hidden sm:block">

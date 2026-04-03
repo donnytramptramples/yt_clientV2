@@ -13,6 +13,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   const [sort, setSort] = useState('newest');
   const [subscribed, setSubscribed] = useState(false);
   const [subLoading, setSubLoading] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     if (!channelId) return;
@@ -20,7 +21,13 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     setError('');
     setVisibleCount(PAGE_SIZE);
     fetch(`/api/channel/${channelId}/videos?sort=${sort}`)
-      .then(r => r.json())
+      .then(async r => {
+        if (!r.ok) {
+          const text = await r.text().catch(() => '');
+          throw new Error(text.startsWith('<') ? `Server error ${r.status}` : text || `Server error ${r.status}`);
+        }
+        return r.json();
+      })
       .then(data => {
         if (data.error) { setError(data.error); return; }
         setChannel(data.channel || null);
@@ -28,7 +35,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
-  }, [channelId, sort]);
+  }, [channelId, sort, retryKey]);
 
   useEffect(() => {
     if (!user || !channelId) return;
@@ -83,8 +90,14 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
           <p className="text-[var(--text-secondary)] text-sm">Loading channel videos…</p>
         </div>
       ) : error ? (
-        <div className="flex items-center justify-center h-40">
-          <p className="text-red-400 text-sm">{error}</p>
+        <div className="flex flex-col items-center justify-center h-40 gap-3">
+          <p className="text-red-400 text-sm text-center max-w-sm">{error}</p>
+          <button
+            className="breeze-btn text-sm"
+            onClick={() => setRetryKey(k => k + 1)}
+          >
+            Retry
+          </button>
         </div>
       ) : (
         <>

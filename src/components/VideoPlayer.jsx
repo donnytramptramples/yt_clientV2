@@ -21,6 +21,11 @@ function parseTimestamp(ts) {
   return parseFloat(parts[0]);
 }
 
+function decodeHtml(str) {
+  return str.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
 function parseVTT(text) {
   const cues = [];
   if (!text) return cues;
@@ -33,17 +38,65 @@ function parseVTT(text) {
     if (tsParts.length < 2) continue;
     const start = parseTimestamp(tsParts[0].trim().split(' ')[0]);
     const end = parseTimestamp(tsParts[1].trim().split(' ')[0]);
+    if (isNaN(start) || isNaN(end)) continue;
+
     const rawText = lines.slice(tsIdx + 1).join('\n');
-    const cleanText = rawText
-      .replace(/<[^>]+>/g, '')
-      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-      .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"')
-      .trim();
-    if (cleanText && !isNaN(start) && !isNaN(end)) {
-      cues.push({ start, end, text: cleanText });
+
+    // Extract word-level timestamps for karaoke highlighting
+    // YouTube VTT format: <HH:MM:SS.mmm><c>word</c>
+    const words = [];
+    const wordRe = /<(\d{2}:\d{2}[:.]\d{3})><c>(.*?)<\/c>/g;
+    let wm;
+    while ((wm = wordRe.exec(rawText)) !== null) {
+      const wStart = parseTimestamp(wm[1]);
+      const wText = decodeHtml(wm[2]);
+      if (!isNaN(wStart) && wText.trim()) {
+        words.push({ start: wStart, text: wText });
+      }
+    }
+
+    const cleanText = decodeHtml(rawText.replace(/<[^>]+>/g, '')).trim();
+    if (cleanText) {
+      cues.push({ start, end, text: cleanText, words: words.length >= 2 ? words : null });
     }
   }
   return cues;
+}
+
+function SubtitleOverlay({ cue, currentTime, size, pos }) {
+  if (!cue) return null;
+
+  const posStyle = {
+    bottom: { bottom: '68px', top: 'auto' },
+    center: { top: '50%', transform: 'translateX(-50%) translateY(-50%)', bottom: 'auto' },
+    top: { top: '12px', bottom: 'auto' },
+  }[pos] || { bottom: '68px' };
+
+  return (
+    <div
+      className="absolute left-1/2 pointer-events-none text-center"
+      style={{ left: '50%', transform: pos === 'center' ? 'translateX(-50%) translateY(-50%)' : 'translateX(-50%)', ...posStyle, maxWidth: '90%' }}
+    >
+      <span
+        className="inline-block px-3 py-1 rounded"
+        style={{ fontSize: `${size}px`, backgroundColor: 'rgba(0,0,0,0.82)', lineHeight: 1.4, whiteSpace: 'pre-wrap', textAlign: 'center' }}
+      >
+        {cue.words ? (
+          cue.words.map((word, i) => {
+            const nextStart = cue.words[i + 1]?.start ?? cue.end;
+            const active = currentTime >= word.start && currentTime < nextStart;
+            return (
+              <span key={i} style={{ color: active ? '#fff' : 'rgba(255,255,255,0.6)', fontWeight: active ? 700 : 400, transition: 'color 0.1s' }}>
+                {word.text}
+              </span>
+            );
+          })
+        ) : (
+          <span style={{ color: '#fff' }}>{cue.text}</span>
+        )}
+      </span>
+    </div>
+  );
 }
 
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
@@ -80,6 +133,7 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [settingsTab, setSettingsTab] = useState('quality');
   const [showDownload, setShowDownload] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(-1); // -1=idle, 0-100=progress, 101=processing
   const [draggingProgress, setDraggingProgress] = useState(false);
   const [formatsLoading, setFormatsLoading] = useState(true);
 
@@ -88,7 +142,7 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(false);
   const [currentSubtitleLang, setCurrentSubtitleLang] = useState('en');
   const [subtitleCues, setSubtitleCues] = useState([]);
-  const [currentCue, setCurrentCue] = useState('');
+  const [currentCue, setCurrentCue] = useState(null); // full cue object {start,end,text,words}
   const [subtitleSize, setSubtitleSize] = useState(18);
   const [subtitlePos, setSubtitlePos] = useState('bottom'); // bottom | center | top
   const [loadingSubtitles, setLoadingSubtitles] = useState(false);
@@ -220,9 +274,9 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
 
   // Update current cue based on currentTime
   useEffect(() => {
-    if (!subtitlesEnabled || subtitleCues.length === 0) { setCurrentCue(''); return; }
-    const cue = subtitleCues.find(c => currentTime >= c.start && currentTime <= c.end);
-    setCurrentCue(cue ? cue.text : '');
+    if (!subtitlesEnabled || subtitleCues.length === 0) { setCurrentCue(null); return; }
+    const cue = subtitleCues.find(c => currentTime >= c.start && currentTime <= c.end) || null;
+    setCurrentCue(cue);
   }, [currentTime, subtitleCues, subtitlesEnabled]);
 
   const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
@@ -384,43 +438,65 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
 
   const handleDownload = async (format) => {
     setDownloading(true);
+    setDownloadProgress(0);
     setShowDownload(false);
     try {
       const titleParam = encodeURIComponent(video.title || 'video');
       const url = `/api/download/${video.id}?format=${format}&quality=${quality || 720}&title=${titleParam}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: `Server error ${res.status}` }));
-        throw new Error(err.error || `Server error ${res.status}`);
+      const response = await fetch(url);
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: `Server error ${response.status}` }));
+        throw new Error(err.error || `Server error ${response.status}`);
       }
-      const blob = await res.blob();
+
+      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+      const cd = response.headers.get('content-disposition') || '';
+      const nameMatch = cd.match(/filename="([^"]+)"/);
+      const filename = nameMatch ? nameMatch[1] : `${(video.title || 'video').replace(/[<>:"/\\|?*]/g, '')}.${format}`;
+
+      // Stream the response body and track progress
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (contentLength > 0) {
+          setDownloadProgress(Math.min(99, Math.round((received / contentLength) * 100)));
+        } else {
+          // FFmpeg stream — pulse between 0-99 based on received bytes
+          setDownloadProgress(101); // "processing" state
+        }
+      }
+
+      setDownloadProgress(100);
+
+      const mimeTypes = { mp4: 'video/mp4', mp3: 'audio/mpeg', flac: 'audio/flac', opus: 'audio/ogg', ogg: 'audio/ogg' };
+      const blob = new Blob(chunks, { type: mimeTypes[format] || 'application/octet-stream' });
       if (blob.size === 0) throw new Error('Downloaded file is empty');
+
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = blobUrl;
-      const cd = res.headers.get('content-disposition') || '';
-      const nameMatch = cd.match(/filename="([^"]+)"/);
-      a.download = nameMatch ? nameMatch[1] : `${video.title || 'video'}.${format}`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
     } catch (err) {
       console.error('Download failed:', err);
       alert(`Download failed: ${err.message}`);
     } finally {
       setDownloading(false);
+      setTimeout(() => setDownloadProgress(-1), 2000);
     }
   };
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
-
-  const subtitlePosStyle = {
-    bottom: { bottom: '60px', top: 'auto' },
-    center: { top: '50%', transform: 'translateX(-50%) translateY(-50%)', bottom: 'auto' },
-    top: { top: '12px', bottom: 'auto' },
-  }[subtitlePos] || { bottom: '60px' };
 
   const noSubtitlesAvailable = availableSubtitles.length === 0;
 
@@ -456,40 +532,18 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
           />
         )}
 
-        {/* Custom subtitle overlay */}
-        {subtitlesEnabled && currentCue && (
-          <div
-            className="absolute left-1/2 pointer-events-none text-center"
-            style={{
-              left: '50%',
-              transform: subtitlePos === 'center' ? 'translateX(-50%) translateY(-50%)' : 'translateX(-50%)',
-              ...subtitlePosStyle,
-              maxWidth: '90%',
-            }}
-          >
-            <span
-              className="inline-block px-3 py-1 rounded"
-              style={{
-                fontSize: `${subtitleSize}px`,
-                backgroundColor: 'rgba(0,0,0,0.82)',
-                color: '#fff',
-                lineHeight: 1.4,
-                whiteSpace: 'pre-wrap',
-                textAlign: 'center',
-              }}
-            >
-              {currentCue}
-            </span>
-          </div>
-        )}
-
-        {/* Subtitle unavailable notice */}
-        {subtitlesEnabled && noSubtitlesAvailable && (
-          <div className="absolute bottom-16 left-1/2 -translate-x-1/2 pointer-events-none">
-            <span className="px-3 py-1 rounded text-sm bg-black/80 text-gray-300">
-              Subtitles unavailable for this video
-            </span>
-          </div>
+        {/* Subtitle overlay with word-level karaoke highlighting */}
+        {subtitlesEnabled && (
+          <>
+            <SubtitleOverlay cue={currentCue} currentTime={currentTime} size={subtitleSize} pos={subtitlePos} />
+            {noSubtitlesAvailable && (
+              <div className="absolute bottom-16 left-1/2 -translate-x-1/2 pointer-events-none">
+                <span className="px-3 py-1 rounded text-sm bg-black/80 text-gray-300">
+                  Subtitles unavailable for this video
+                </span>
+              </div>
+            )}
+          </>
         )}
 
         {(isLoading || formatsLoading || !proxyUrl) && (
@@ -556,23 +610,12 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
 
             <div className="flex-1" />
 
-            {/* Subtitles button */}
+            {/* Subtitles toggle */}
             <button
               className={`hover:text-[var(--accent)] transition-colors relative ${subtitlesEnabled ? 'text-[var(--accent)]' : ''}`}
               onClick={(e) => {
                 e.stopPropagation();
-                if (noSubtitlesAvailable) {
-                  setSubtitlesEnabled(false);
-                  return;
-                }
-                if (!subtitlesEnabled) {
-                  setSubtitlesEnabled(true);
-                  setSettingsTab('subtitles');
-                  setShowSettings(true);
-                  setShowDownload(false);
-                } else {
-                  setSubtitlesEnabled(false);
-                }
+                setSubtitlesEnabled(s => !s);
               }}
               title={noSubtitlesAvailable ? 'Subtitles unavailable' : subtitlesEnabled ? 'Disable subtitles' : 'Enable subtitles'}
             >
@@ -759,10 +802,17 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
             <div className="relative">
               <button
                 className="flex items-center gap-1 hover:text-[var(--accent)] transition-colors"
-                onClick={(e) => { e.stopPropagation(); setShowDownload(d => !d); setShowSettings(false); }}
+                onClick={(e) => { e.stopPropagation(); if (!downloading) { setShowDownload(d => !d); setShowSettings(false); } }}
                 disabled={downloading}
+                title={downloading ? (downloadProgress === 101 ? 'Processing…' : downloadProgress >= 0 ? `Downloading ${downloadProgress}%` : 'Downloading…') : 'Download'}
               >
-                {downloading ? <Loader2 size={17} className="animate-spin" /> : <Download size={17} />}
+                {downloading
+                  ? downloadProgress === 101
+                    ? <><Loader2 size={17} className="animate-spin" /><span className="text-xs">…</span></>
+                    : downloadProgress >= 0 && downloadProgress < 100
+                      ? <span className="text-xs font-bold text-[var(--accent)]">{downloadProgress}%</span>
+                      : <Loader2 size={17} className="animate-spin" />
+                  : <Download size={17} />}
               </button>
               {showDownload && (
                 <div

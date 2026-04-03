@@ -506,21 +506,22 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
 
 function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
   return new Promise((resolve, reject) => {
+    const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
     const args = [
       '-loglevel', 'error',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-    ];
-    if (seekSeconds > 0) args.push('-ss', String(seekSeconds.toFixed(3)));
-    args.push(
+      // Seek BOTH inputs independently so audio and video stay in sync
+      ...ssArgs,
       '-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5',
       '-i', videoUrl,
+      ...ssArgs,
       '-reconnect', '1', '-reconnect_on_network_error', '1', '-reconnect_delay_max', '5',
       '-i', audioUrl,
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'copy', '-c:a', 'copy',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
       '-f', 'mp4', 'pipe:1',
-    );
+    ];
     const proc = spawn(FFMPEG, args);
     if (signal) signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
     proc.stderr.on('data', d => { const msg = d.toString().trim(); if (msg) console.error('[ffmpeg]', msg); });
@@ -662,13 +663,16 @@ async function fetchChannelVideos(channelId, limit = 30) {
         const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
         let out = '';
         let err = '';
+        // Kill after 30s to prevent hanging
+        const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('yt-dlp timeout')); }, 30000);
         proc.stdout.on('data', d => { out += d; });
         proc.stderr.on('data', d => { err += d; });
         proc.on('close', code => {
+          clearTimeout(timer);
           if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.substring(0, 150)}`));
           try { resolve(JSON.parse(out)); } catch { reject(new Error('JSON parse failed')); }
         });
-        proc.on('error', reject);
+        proc.on('error', e => { clearTimeout(timer); reject(e); });
       });
 
       entries = raw.entries || [];
@@ -757,64 +761,71 @@ app.get('/api/feed', requireAuth, async (req, res) => {
     const subs = subsDb.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(req.user.id);
     if (!subs.length) return res.json({ videos: [] });
 
-    const allVideos = [];
-    // Fetch videos for each subscribed channel (limit per channel to be fast)
-    for (const sub of subs.slice(0, 10)) {
-      try {
-        const channel = await youtube.getChannel(sub.channel_id);
-        let videosTab;
-        try { videosTab = await channel.getVideos(); } catch { videosTab = channel; }
-        const rawVideos = videosTab.videos || videosTab.contents || [];
+    // Fetch videos for each subscribed channel in parallel (limit per channel)
+    const channelResults = await Promise.allSettled(
+      subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 15))
+    );
 
-        for (const v of rawVideos.slice(0, 5)) {
-          if (v.id) {
-            allVideos.push({
-              id: v.id,
-              title: v.title?.text || v.title || 'Video',
-              thumbnail: v.thumbnails?.[0]?.url || '',
-              duration: v.duration?.text || '',
-              views: v.view_count?.text || v.short_view_count?.text || '',
-              published: v.published?.text || '',
-              channel: sub.channel_name,
-              channelId: sub.channel_id,
-              channelAvatar: sub.channel_avatar || '',
-            });
-          }
-        }
-      } catch { /* skip failed channels */ }
+    // Score and rank using a YouTube-like algorithm
+    const allVideos = [];
+    for (let i = 0; i < channelResults.length; i++) {
+      const result = channelResults[i];
+      if (result.status !== 'fulfilled') continue;
+      const sub = subs[i];
+      for (const v of result.value.videos.slice(0, 10)) {
+        const recency = getFeedRecencyScore(v.published);
+        const popularity = getFeedPopularityScore(v.views);
+        // Diversity: interleave channels by adding a channel-index factor
+        const channelBoost = (subs.length - i) / subs.length * 0.1;
+        // Random factor for freshness (so feed doesn't look identical each load)
+        const random = Math.random() * 0.05;
+        const score = recency * 0.65 + popularity * 0.2 + channelBoost + random;
+        allVideos.push({ ...v, channel: sub.channel_name, channelId: sub.channel_id, channelAvatar: sub.channel_avatar || '', _score: score });
+      }
     }
 
-    // Simple algorithm: sort by recency (those with "ago" lower index first)
-    allVideos.sort((a, b) => {
-      const aScore = getRecencyScore(a.published);
-      const bScore = getRecencyScore(b.published);
-      return bScore - aScore;
-    });
+    // Sort by composite score (high = show first)
+    allVideos.sort((a, b) => b._score - a._score);
 
-    res.json({ videos: allVideos });
+    // Deduplicate by video ID (channel may overlap)
+    const seen = new Set();
+    const deduped = allVideos.filter(v => { if (seen.has(v.id)) return false; seen.add(v.id); return true; });
+
+    // Strip internal score field
+    const videos = deduped.map(({ _score, ...v }) => v);
+
+    res.json({ videos });
   } catch (e) {
     console.error('[feed] error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-function getRecencyScore(published) {
+function getFeedRecencyScore(published) {
+  // Parse yt-dlp upload_date (YYYYMMDD) or relative strings
   if (!published) return 0;
-  const p = published.toLowerCase();
-  if (p.includes('hour') || p.includes('minute') || p.includes('second')) return 1000;
-  if (p.includes('day')) {
-    const d = parseInt(p) || 1;
-    return 500 - d;
+  const p = String(published);
+  // YYYYMMDD format from yt-dlp
+  if (/^\d{4}-\d{2}-\d{2}$/.test(p)) {
+    const daysAgo = (Date.now() - new Date(p).getTime()) / (1000 * 86400);
+    return Math.max(0, 1 - daysAgo / 90); // decay over 90 days
   }
-  if (p.includes('week')) {
-    const w = parseInt(p) || 1;
-    return 300 - w * 7;
-  }
-  if (p.includes('month')) {
-    const m = parseInt(p) || 1;
-    return 100 - m * 30;
-  }
+  // Relative format (e.g. "2 days ago")
+  const lower = p.toLowerCase();
+  if (lower.includes('hour') || lower.includes('minute') || lower.includes('second')) return 1.0;
+  if (lower.includes('day')) { const d = parseInt(lower) || 1; return Math.max(0, 1 - d / 90); }
+  if (lower.includes('week')) { const w = parseInt(lower) || 1; return Math.max(0, 1 - (w * 7) / 90); }
+  if (lower.includes('month')) { const m = parseInt(lower) || 1; return Math.max(0, 1 - (m * 30) / 365); }
+  if (lower.includes('year')) return 0.01;
   return 0;
+}
+
+function getFeedPopularityScore(views) {
+  if (!views) return 0;
+  const n = parseInt(String(views).replace(/[^\d]/g, '')) || 0;
+  if (!n) return 0;
+  // log scale normalised to ~10M views = 1.0
+  return Math.min(1, Math.log10(n + 1) / 7);
 }
 
 // ─── Video info / formats / subtitles ────────────────────────────────────────
@@ -879,52 +890,42 @@ app.get('/api/video/:videoId/details', async (req, res) => {
     } catch {}
   }
 
-  // Comments via youtubei.js — use getComments directly on the youtube instance
+  // Comments via yt-dlp (TV_EMBEDDED client cannot fetch comments)
   try {
-    const commentsResult = await youtube.getComments({ video_id: videoId });
-    // Walk through comment thread renderers
-    const threads = commentsResult?.contents?.contents
-      || commentsResult?.on_response_received_endpoints?.flatMap(e => e?.item_section_renderer?.contents || [])
-      || [];
-
-    for (const thread of threads.slice(0, 30)) {
-      const c = thread.comment_thread_renderer?.comment
-        || thread.comment_renderer
-        || thread.comment
-        || thread;
-      const textRuns = c?.content_text?.runs || c?.rendered_content?.runs || [];
-      const text = textRuns.map(r => r.text || '').join('').trim()
-        || c?.content?.text || '';
-      if (!text) continue;
-      comments.push({
-        id: c?.comment_id || Math.random().toString(36),
-        author: c?.author?.name || c?.author_text?.text || 'User',
-        authorAvatar: c?.author?.thumbnails?.[0]?.url || c?.author_thumbnail?.thumbnails?.[0]?.url || '',
-        text,
-        likes: c?.vote_count?.text || c?.like_count || '0',
-        published: c?.published?.text || c?.published_time_text?.text || '',
+    const commentData = await new Promise((resolve) => {
+      const args = [
+        '--no-playlist', '--skip-download', '--write-comments', '--quiet', '--no-warnings',
+        '--extractor-args', 'youtube:comment_sort=top;max_comments=30,all,top,0',
+        '--extractor-args', 'youtube:player_client=tv_embedded',
+        '-j', `https://www.youtube.com/watch?v=${videoId}`,
+      ];
+      const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+      let out = '';
+      proc.stdout.on('data', d => { out += d; });
+      proc.stderr.on('data', () => {});
+      const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 20000);
+      proc.on('close', () => {
+        clearTimeout(timer);
+        try { resolve(JSON.parse(out)); } catch { resolve(null); }
       });
+      proc.on('error', () => { clearTimeout(timer); resolve(null); });
+    });
+
+    if (commentData?.comments?.length) {
+      comments = commentData.comments
+        .filter(c => c.parent === 'root' && c.text)
+        .slice(0, 30)
+        .map(c => ({
+          id: c.id || Math.random().toString(36),
+          author: c.author || 'User',
+          authorAvatar: c.author_thumbnail || '',
+          text: c.text || '',
+          likes: c.like_count ?? 0,
+          published: c.timestamp ? new Date(c.timestamp * 1000).toLocaleDateString() : '',
+        }));
     }
   } catch (e) {
     console.warn('[details] comments fetch failed:', e.message);
-    // Try alternative path
-    try {
-      const info = await getVideoInfo(videoId);
-      const cr = await info.getComments();
-      const items = cr?.contents?.contents || cr?.header?.comments_count ? [] : [];
-      for (const item of items.slice(0, 20)) {
-        const c = item.comment_thread_renderer?.comment || item;
-        const text = c?.content_text?.runs?.map(r => r.text).join('').trim() || '';
-        if (text) comments.push({
-          id: c.comment_id || Math.random().toString(36),
-          author: c.author?.name || 'User',
-          authorAvatar: c.author?.thumbnails?.[0]?.url || '',
-          text,
-          likes: c.vote_count?.text || '0',
-          published: c.published?.text || '',
-        });
-      }
-    } catch {}
   }
 
   res.json({ description, comments });

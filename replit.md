@@ -20,13 +20,13 @@ A high-performance YouTube client with proxied streaming, downloads, subtitles, 
 
 1. **Auth** — Login/signup on first visit, 30-day persistent sessions, stored in SQLite
 2. **Search** — Video + channel search with Load More pagination
-3. **Feed** — Subscription-based feed with algorithm (recency-sorted)
+3. **Feed** — Subscription-based feed with composite algorithm: 65% recency (exponential decay 90d) + 20% log-scale popularity + 10% channel diversity + 5% random; parallel `fetchChannelVideos` per subscribed channel
 4. **Subscriptions** — Subscribe/unsubscribe from channel pages
 5. **Channel Pages** — Search for channels, view all videos, sort by newest/oldest/popular
 6. **Video Playback** — Custom proxy player with quality switching, speed control
-7. **Subtitles** — Custom VTT renderer (not native track): centered, size-adjustable (12–36px), position (top/center/bottom), language selector, shows "unavailable" when not available
-8. **Description + Comments** — Expandable below the video player
-9. **Downloads** — MP4, MP3, FLAC, Opus, Ogg; filename matches video title
+7. **Subtitles** — Custom VTT renderer with word-level karaoke highlighting (YouTube `<c>` tags); simple toggle button; size-adjustable (12–36px); position top/center/bottom; auto-translate via Google Translate unofficial API
+8. **Description + Comments** — Expandable below the video player; comments via yt-dlp `--write-comments` (top sort)
+9. **Downloads** — MP4, MP3, FLAC, Opus, Ogg; real-time progress % shown in button for muxed streams; `Processing…` shown for FFmpeg streams
 
 ## File Structure
 
