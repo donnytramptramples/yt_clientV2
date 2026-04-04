@@ -1,19 +1,21 @@
 import React, { useState, useEffect } from 'react';
-import { Sun, Moon, Rss, Search, LogOut, User } from 'lucide-react';
+import { Sun, Moon, Rss, Search, LogOut, User, Zap, TrendingUp, Bookmark } from 'lucide-react';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
 import VideoPlayer from './components/VideoPlayer';
 import AuthPage from './components/AuthPage';
 import ChannelPage from './components/ChannelPage';
 import FeedPage from './components/FeedPage';
+import ShortsPage from './components/ShortsPage';
+import SavedPage from './components/SavedPage';
 
 function App() {
   const [darkMode, setDarkMode] = useState(true);
-  const [user, setUser] = useState(undefined); // undefined = loading
+  const [user, setUser] = useState(undefined);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVideo, setSelectedVideo] = useState(null);
   const [selectedChannel, setSelectedChannel] = useState(null);
-  const [view, setView] = useState('feed'); // feed | search
+  const [view, setView] = useState('feed'); // feed | search | shorts | saved
   const [channelRefreshKey, setChannelRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -21,7 +23,6 @@ function App() {
     else document.documentElement.classList.remove('dark');
   }, [darkMode]);
 
-  // Check auth on mount
   useEffect(() => {
     fetch('/api/auth/me', { credentials: 'include' })
       .then(r => r.ok ? r.json() : null)
@@ -49,14 +50,16 @@ function App() {
   };
 
   const handleBack = () => {
-    if (selectedVideo) {
-      setSelectedVideo(null);
-    } else if (selectedChannel) {
-      setSelectedChannel(null);
-    }
+    if (selectedVideo) setSelectedVideo(null);
+    else if (selectedChannel) setSelectedChannel(null);
   };
 
-  // Show loading state while checking auth
+  const goToView = (v) => {
+    setView(v);
+    setSelectedVideo(null);
+    setSelectedChannel(null);
+  };
+
   if (user === undefined) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[var(--bg-primary)]">
@@ -65,16 +68,12 @@ function App() {
     );
   }
 
-  // Show auth page if not logged in
   if (user === null) {
     return (
       <div className={darkMode ? 'dark' : ''}>
         <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
           <div className="absolute top-4 right-4">
-            <button
-              onClick={() => setDarkMode(!darkMode)}
-              className="p-2 hover:bg-[var(--bg-secondary)] rounded transition-colors"
-            >
+            <button onClick={() => setDarkMode(!darkMode)} className="p-2 hover:bg-[var(--bg-secondary)] rounded transition-colors">
               {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
           </div>
@@ -84,21 +83,45 @@ function App() {
     );
   }
 
+  const isMain = !selectedVideo && !selectedChannel;
+  const isShorts = isMain && view === 'shorts';
+
   return (
     <div className="min-h-screen flex flex-col bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <header className="bg-[var(--bg-secondary)] border-b border-[var(--border)] px-4 py-3 flex-shrink-0">
         <div className="flex items-center gap-3 max-w-6xl mx-auto w-full">
-          {/* Feed tab */}
-          <button
-            onClick={() => { setView('feed'); setSelectedVideo(null); setSelectedChannel(null); }}
-            className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'feed' && !selectedVideo && !selectedChannel ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
-            title="Feed"
-          >
-            <Rss size={18} />
-          </button>
+          {isMain && (
+            <>
+              {/* Feed */}
+              <button
+                onClick={() => goToView('feed')}
+                className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'feed' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+                title="Feed"
+              >
+                <Rss size={18} />
+              </button>
 
-          {/* Search bar — always visible; submitting switches to search view */}
-          {!selectedVideo && !selectedChannel && (
+              {/* Shorts */}
+              <button
+                onClick={() => goToView('shorts')}
+                className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'shorts' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+                title="Shorts"
+              >
+                <Zap size={18} />
+              </button>
+
+              {/* Saved Videos */}
+              <button
+                onClick={() => goToView('saved')}
+                className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'saved' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+                title="Saved Videos"
+              >
+                <Bookmark size={18} />
+              </button>
+            </>
+          )}
+
+          {isMain && (
             <div className="flex-1">
               <SearchBar
                 onSearch={q => {
@@ -118,25 +141,19 @@ function App() {
               <User size={12} className="inline mr-1" />
               {user.username}
             </span>
-            <button
-              onClick={handleLogout}
-              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
-              title="Logout"
-            >
+            <button onClick={handleLogout} className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors" title="Logout">
               <LogOut size={16} />
             </button>
-            <button
-              onClick={() => setDarkMode(!darkMode)}
-              className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors"
-            >
+            <button onClick={() => setDarkMode(!darkMode)} className="p-2 hover:bg-[var(--bg-primary)] rounded transition-colors">
               {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 overflow-y-auto p-4 md:p-6">
-        <div className="max-w-6xl mx-auto">
+      {/* Shorts gets no padding so it can fill the full available height */}
+      <main className={`flex-1 overflow-y-auto ${isShorts ? '' : 'p-4 md:p-6'}`}>
+        <div className={isShorts ? 'h-full' : 'max-w-6xl mx-auto'}>
           {selectedVideo ? (
             <VideoPlayer
               video={selectedVideo}
@@ -155,6 +172,16 @@ function App() {
             <FeedPage
               key={channelRefreshKey}
               user={user}
+              onVideoSelect={handleVideoSelect}
+              onChannelSelect={handleChannelSelect}
+            />
+          ) : view === 'shorts' ? (
+            <ShortsPage
+              onVideoSelect={handleVideoSelect}
+              onChannelSelect={handleChannelSelect}
+            />
+          ) : view === 'saved' ? (
+            <SavedPage
               onVideoSelect={handleVideoSelect}
               onChannelSelect={handleChannelSelect}
             />

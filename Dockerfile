@@ -1,18 +1,29 @@
-FROM node:20
+FROM node:22-slim
 
-RUN apt-get update && apt-get install -y python3 python3-pip ffmpeg curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    ffmpeg \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+RUN curl -sSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+    -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install
+RUN npm ci --include=dev
 
 COPY . .
 RUN npm run build
 
-EXPOSE 10000
+RUN npm prune --production
+
+EXPOSE 8080
+
+ENV NODE_ENV=production
 
 CMD ["node", "server.js"]

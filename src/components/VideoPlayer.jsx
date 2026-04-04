@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Minimize,
   Loader2, Settings, Download, Video, Music, Disc3, Headphones, FileAudio,
-  Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp
+  Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp, Bookmark, BookmarkCheck
 } from 'lucide-react';
 
 function formatTime(secs) {
@@ -42,23 +42,17 @@ function parseVTT(text) {
 
     const rawText = lines.slice(tsIdx + 1).join('\n');
 
-    // Extract word-level timestamps for karaoke highlighting
-    // YouTube VTT format: <HH:MM:SS.mmm><c>word</c>
     const words = [];
     const wordRe = /<(\d{2}:\d{2}[:.]\d{3})><c>(.*?)<\/c>/g;
     let wm;
     while ((wm = wordRe.exec(rawText)) !== null) {
       const wStart = parseTimestamp(wm[1]);
       const wText = decodeHtml(wm[2]);
-      if (!isNaN(wStart) && wText.trim()) {
-        words.push({ start: wStart, text: wText });
-      }
+      if (!isNaN(wStart) && wText.trim()) words.push({ start: wStart, text: wText });
     }
 
     const cleanText = decodeHtml(rawText.replace(/<[^>]+>/g, '')).trim();
-    if (cleanText) {
-      cues.push({ start, end, text: cleanText, words: words.length >= 2 ? words : null });
-    }
+    if (cleanText) cues.push({ start, end, text: cleanText, words: words.length >= 2 ? words : null });
   }
   return cues;
 }
@@ -100,13 +94,192 @@ function SubtitleOverlay({ cue, currentTime, size, pos }) {
 }
 
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
-const FORMATS = [
-  { value: 'mp4', label: 'MP4 (Video)', Icon: Video },
-  { value: 'mp3', label: 'MP3 (Audio)', Icon: Music },
-  { value: 'flac', label: 'FLAC (Lossless)', Icon: Disc3 },
-  { value: 'opus', label: 'Opus', Icon: Headphones },
-  { value: 'ogg', label: 'Ogg Vorbis', Icon: FileAudio },
+
+const FORMAT_OPTIONS = [
+  { value: 'mp4',  label: 'MP4 (Video)',      Icon: Video,     hasQuality: true,  hasBitrate: false, hasCompression: false },
+  { value: 'mp3',  label: 'MP3 (Audio)',       Icon: Music,     hasQuality: false, hasBitrate: true,  hasCompression: false },
+  { value: 'flac', label: 'FLAC (Lossless)',   Icon: Disc3,     hasQuality: false, hasBitrate: false, hasCompression: true  },
+  { value: 'opus', label: 'Opus',              Icon: Headphones,hasQuality: false, hasBitrate: true,  hasCompression: false },
+  { value: 'ogg',  label: 'Ogg Vorbis',        Icon: FileAudio, hasQuality: false, hasBitrate: true,  hasCompression: false },
+  { value: 'm4a',  label: 'M4A (AAC)',         Icon: Music,     hasQuality: false, hasBitrate: true,  hasCompression: false },
 ];
+
+const BITRATE_OPTIONS = ['96k', '128k', '192k', '256k', '320k'];
+const COMPRESSION_OPTIONS = [
+  { value: '0', label: '0 – Fastest' },
+  { value: '3', label: '3 – Fast' },
+  { value: '5', label: '5 – Default' },
+  { value: '8', label: '8 – Best' },
+];
+
+function DownloadPanel({ video, quality, availableHeights, onClose }) {
+  const [selFormat, setSelFormat] = useState('mp4');
+  const [selQuality, setSelQuality] = useState(quality || '720');
+  const [selBitrate, setSelBitrate] = useState('320k');
+  const [selCompression, setSelCompression] = useState('5');
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState(-1);
+
+  const fmt = FORMAT_OPTIONS.find(f => f.value === selFormat);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    setProgress(0);
+    try {
+      let url = `/api/download/${video.id}?format=${selFormat}&title=${encodeURIComponent(video.title || 'video')}`;
+      if (fmt?.hasQuality) url += `&quality=${selQuality}`;
+      if (fmt?.hasBitrate) url += `&bitrate=${selBitrate}`;
+      if (fmt?.hasCompression) url += `&compression=${selCompression}`;
+
+      const response = await fetch(url);
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: `Server error ${response.status}` }));
+        throw new Error(err.error || `Server error ${response.status}`);
+      }
+
+      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+      const cd = response.headers.get('content-disposition') || '';
+      const nameMatch = cd.match(/filename="([^"]+)"/);
+      const filename = nameMatch ? nameMatch[1] : `${(video.title || 'video').replace(/[<>:"/\\|?*]/g, '')}.${selFormat}`;
+
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (contentLength > 0) {
+          setProgress(Math.min(99, Math.round((received / contentLength) * 100)));
+        } else {
+          setProgress(101);
+        }
+      }
+
+      setProgress(100);
+
+      const mimeTypes = { mp4: 'video/mp4', mp3: 'audio/mpeg', flac: 'audio/flac', opus: 'audio/ogg', ogg: 'audio/ogg', m4a: 'audio/mp4' };
+      const blob = new Blob(chunks, { type: mimeTypes[selFormat] || 'application/octet-stream' });
+      if (blob.size === 0) throw new Error('Downloaded file is empty');
+
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
+      onClose();
+    } catch (err) {
+      alert(`Download failed: ${err.message}`);
+    } finally {
+      setDownloading(false);
+      setTimeout(() => setProgress(-1), 2000);
+    }
+  };
+
+  return (
+    <div
+      className="absolute bottom-full right-0 mb-2 bg-[var(--bg-secondary)] border border-[var(--border)] rounded-lg p-4 min-w-[280px] z-50 text-[var(--text-primary)]"
+      style={{ boxShadow: '0 -4px 32px rgba(0,0,0,0.6)' }}
+      onClick={e => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-sm font-semibold">Download</span>
+        <button onClick={onClose} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-lg leading-none">×</button>
+      </div>
+
+      {/* Format selector */}
+      <div className="mb-3">
+        <label className="block text-xs font-semibold mb-1.5 text-[var(--text-secondary)] uppercase tracking-wide">Format</label>
+        <div className="grid grid-cols-3 gap-1">
+          {FORMAT_OPTIONS.map(({ value, label, Icon }) => (
+            <button
+              key={value}
+              onClick={() => setSelFormat(value)}
+              className={`flex flex-col items-center gap-1 p-2 rounded text-xs transition-colors ${selFormat === value ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] hover:bg-[var(--border)]'}`}
+            >
+              <Icon size={14} />
+              {value.toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Quality selector (MP4 only) */}
+      {fmt?.hasQuality && availableHeights.length > 0 && (
+        <div className="mb-3">
+          <label className="block text-xs font-semibold mb-1.5 text-[var(--text-secondary)] uppercase tracking-wide">Quality</label>
+          <div className="flex flex-wrap gap-1">
+            {availableHeights.map(h => (
+              <button
+                key={h}
+                onClick={() => setSelQuality(String(h))}
+                className={`px-2.5 py-1 rounded text-xs transition-colors ${selQuality === String(h) ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] hover:bg-[var(--border)]'}`}
+              >
+                {h}p
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Bitrate selector (audio formats) */}
+      {fmt?.hasBitrate && (
+        <div className="mb-3">
+          <label className="block text-xs font-semibold mb-1.5 text-[var(--text-secondary)] uppercase tracking-wide">Bitrate</label>
+          <div className="flex flex-wrap gap-1">
+            {BITRATE_OPTIONS.map(b => (
+              <button
+                key={b}
+                onClick={() => setSelBitrate(b)}
+                className={`px-2.5 py-1 rounded text-xs transition-colors ${selBitrate === b ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] hover:bg-[var(--border)]'}`}
+              >
+                {b}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Compression selector (FLAC) */}
+      {fmt?.hasCompression && (
+        <div className="mb-3">
+          <label className="block text-xs font-semibold mb-1.5 text-[var(--text-secondary)] uppercase tracking-wide">Compression</label>
+          <select
+            value={selCompression}
+            onChange={e => setSelCompression(e.target.value)}
+            className="w-full breeze-input text-xs py-1"
+          >
+            {COMPRESSION_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      {/* Download button */}
+      <button
+        onClick={handleDownload}
+        disabled={downloading}
+        className="w-full flex items-center justify-center gap-2 py-2 rounded bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-all"
+      >
+        {downloading ? (
+          progress === 101
+            ? <><Loader2 size={14} className="animate-spin" /> Processing…</>
+            : progress >= 0 && progress < 100
+              ? <><Loader2 size={14} className="animate-spin" /> {progress}%</>
+              : <Loader2 size={14} className="animate-spin" />
+        ) : (
+          <><Download size={14} /> Download {selFormat.toUpperCase()}</>
+        )}
+      </button>
+    </div>
+  );
+}
 
 export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const videoRef = useRef(null);
@@ -132,8 +305,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState('quality');
   const [showDownload, setShowDownload] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState(-1); // -1=idle, 0-100=progress, 101=processing
   const [draggingProgress, setDraggingProgress] = useState(false);
   const [formatsLoading, setFormatsLoading] = useState(true);
 
@@ -142,9 +313,9 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [subtitlesEnabled, setSubtitlesEnabled] = useState(false);
   const [currentSubtitleLang, setCurrentSubtitleLang] = useState('en');
   const [subtitleCues, setSubtitleCues] = useState([]);
-  const [currentCue, setCurrentCue] = useState(null); // full cue object {start,end,text,words}
+  const [currentCue, setCurrentCue] = useState(null);
   const [subtitleSize, setSubtitleSize] = useState(18);
-  const [subtitlePos, setSubtitlePos] = useState('bottom'); // bottom | center | top
+  const [subtitlePos, setSubtitlePos] = useState('bottom');
   const [loadingSubtitles, setLoadingSubtitles] = useState(false);
   const [autoTranslate, setAutoTranslate] = useState(false);
   const [translateTo, setTranslateTo] = useState('en');
@@ -161,15 +332,16 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [subscribeLoading, setSubscribeLoading] = useState(false);
 
-  // Seeking via proxy URL param (for adaptive/muxed streams)
+  // Save
+  const [isSaved, setIsSaved] = useState(false);
+  const [saveLoading, setSaveLoading] = useState(false);
+
+  // Proxy seeking — all seeking goes through proxySeekRef; no native seeking for proxy streams
   const [proxySeek, setProxySeek] = useState(0);
+  const proxySeekRef = useRef(0);
   const seekReloadRef = useRef(false);
-
-  const savedTimeRef = useRef(0);
   const wasPlayingRef = useRef(false);
-  const qualityChangeInProgress = useRef(false);
 
-  // Fetch formats, info, subtitles list, and details when video changes
   useEffect(() => {
     setFormatsLoading(true);
     setAvailableHeights([]);
@@ -178,12 +350,16 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     apiDuration.current = 0;
     setSubtitlesEnabled(false);
     setSubtitleCues([]);
-    setCurrentCue('');
+    setCurrentCue(null);
     setAvailableSubtitles([]);
     setDescription('');
     setComments([]);
     setShowDescription(false);
     setShowComments(false);
+    setProxySeek(0);
+    proxySeekRef.current = 0;
+    seekReloadRef.current = false;
+    wasPlayingRef.current = false;
 
     fetch(`/api/formats/${video.id}`)
       .then(r => r.json())
@@ -215,18 +391,13 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
       })
       .catch(() => {});
 
-    // Load description + comments
     setDetailsLoading(true);
     fetch(`/api/video/${video.id}/details`)
       .then(r => r.json())
-      .then(data => {
-        setDescription(data.description || '');
-        setComments(data.comments || []);
-      })
+      .then(data => { setDescription(data.description || ''); setComments(data.comments || []); })
       .catch(() => {})
       .finally(() => setDetailsLoading(false));
 
-    // Load subscription status
     if (video.channelId) {
       fetch(`/api/subscriptions/${video.channelId}/status`)
         .then(r => r.ok ? r.json() : { subscribed: false })
@@ -234,16 +405,16 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
         .catch(() => setIsSubscribed(false));
     }
 
-    // Reset seek on video change
-    setProxySeek(0);
-    seekReloadRef.current = false;
+    fetch(`/api/saved/${video.id}/status`)
+      .then(r => r.ok ? r.json() : { saved: false })
+      .then(data => setIsSaved(data.saved || false))
+      .catch(() => setIsSaved(false));
   }, [video.id]);
 
-  // Load subtitle cues when enabled or language changes
   useEffect(() => {
     if (!subtitlesEnabled || !currentSubtitleLang || availableSubtitles.length === 0) {
       setSubtitleCues([]);
-      setCurrentCue('');
+      setCurrentCue(null);
       return;
     }
     const sub = availableSubtitles.find(s => s.lang === currentSubtitleLang);
@@ -251,28 +422,17 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
 
     setLoadingSubtitles(true);
     const autoFlag = sub.auto ? 'true' : 'false';
-
-    let url;
-    if (autoTranslate && translateTo) {
-      url = `/api/subtitles/${video.id}/translate?lang=${currentSubtitleLang}&auto=${autoFlag}&to=${translateTo}`;
-    } else {
-      url = `/api/subtitles/${video.id}?lang=${currentSubtitleLang}&auto=${autoFlag}`;
-    }
+    const url = autoTranslate && translateTo
+      ? `/api/subtitles/${video.id}/translate?lang=${currentSubtitleLang}&auto=${autoFlag}&to=${translateTo}`
+      : `/api/subtitles/${video.id}?lang=${currentSubtitleLang}&auto=${autoFlag}`;
 
     fetch(url)
-      .then(r => {
-        if (!r.ok) throw new Error('Failed to load subtitles');
-        return r.text();
-      })
-      .then(text => {
-        const cues = parseVTT(text);
-        setSubtitleCues(cues);
-      })
+      .then(r => { if (!r.ok) throw new Error('Failed'); return r.text(); })
+      .then(text => setSubtitleCues(parseVTT(text)))
       .catch(() => setSubtitleCues([]))
       .finally(() => setLoadingSubtitles(false));
   }, [subtitlesEnabled, currentSubtitleLang, availableSubtitles, video.id, autoTranslate, translateTo]);
 
-  // Update current cue based on currentTime
   useEffect(() => {
     if (!subtitlesEnabled || subtitleCues.length === 0) { setCurrentCue(null); return; }
     const cue = subtitleCues.find(c => currentTime >= c.start && currentTime <= c.end) || null;
@@ -296,36 +456,74 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     setSubscribeLoading(false);
   };
 
-  // Video event wiring
+  const toggleSave = async () => {
+    if (saveLoading) return;
+    setSaveLoading(true);
+    try {
+      const method = isSaved ? 'DELETE' : 'POST';
+      const r = await fetch(`/api/saved/${video.id}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: video.title,
+          thumbnail: video.thumbnail,
+          channel: video.channel,
+          channelId: video.channelId,
+          channelAvatar: video.channelAvatar,
+          duration: video.duration,
+          views: video.views,
+        }),
+      });
+      if (r.ok) setIsSaved(s => !s);
+    } catch {}
+    setSaveLoading(false);
+  };
+
+  // FIXED: Proper video event wiring
+  // - onLoadStart does NOT change playing state (fixes wrong pause icon during loading)
+  // - onCanPlay resumes play if was playing (for seek reloads and quality changes)
+  // - All time tracking accounts for proxySeekRef offset
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
 
     const onTimeUpdate = () => {
-      setCurrentTime(v.currentTime);
-      if (v.buffered.length > 0) setBufferedEnd(v.buffered.end(v.buffered.length - 1));
+      setCurrentTime(proxySeekRef.current + v.currentTime);
+      if (v.buffered.length > 0) {
+        setBufferedEnd(proxySeekRef.current + v.buffered.end(v.buffered.length - 1));
+      }
     };
+
     const onDurationChange = () => {
-      if (v.duration && isFinite(v.duration)) setDuration(prev => Math.max(prev, v.duration, apiDuration.current));
+      if (v.duration && isFinite(v.duration)) {
+        const elementDuration = proxySeekRef.current + v.duration;
+        const best = apiDuration.current > 0
+          ? Math.max(apiDuration.current, elementDuration)
+          : elementDuration;
+        setDuration(prev => Math.max(prev, best));
+      }
     };
+
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
     const onWaiting = () => setIsLoading(true);
     const onCanPlay = () => {
       setIsLoading(false);
-      if (qualityChangeInProgress.current && savedTimeRef.current > 0) {
-        v.currentTime = savedTimeRef.current;
-        savedTimeRef.current = 0;
-        qualityChangeInProgress.current = false;
-        if (wasPlayingRef.current) v.play().catch(() => {});
-      } else if (seekReloadRef.current) {
-        // After a seek-based reload, just resume playing if was playing
+      // Resume if we were playing before a seek/quality-change reload
+      if (seekReloadRef.current || wasPlayingRef.current) {
         seekReloadRef.current = false;
-        if (wasPlayingRef.current) v.play().catch(() => {});
+        if (wasPlayingRef.current && v.paused) {
+          v.play().catch(() => {});
+        }
       }
     };
-    const onLoadStart = () => { setIsLoading(true); setPlaying(false); };
-    const onSeeked = () => { if (wasPlayingRef.current && v.paused) v.play().catch(() => {}); };
+
+    // FIXED: Do NOT call setPlaying(false) on loadstart.
+    // The video is loading, not paused. The isLoading state shows the spinner.
+    const onLoadStart = () => { setIsLoading(true); };
+
+    const onEnded = () => setPlaying(false);
+    const onError = () => { setIsLoading(false); };
 
     v.addEventListener('timeupdate', onTimeUpdate);
     v.addEventListener('durationchange', onDurationChange);
@@ -334,7 +532,8 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     v.addEventListener('waiting', onWaiting);
     v.addEventListener('canplay', onCanPlay);
     v.addEventListener('loadstart', onLoadStart);
-    v.addEventListener('seeked', onSeeked);
+    v.addEventListener('ended', onEnded);
+    v.addEventListener('error', onError);
 
     return () => {
       v.removeEventListener('timeupdate', onTimeUpdate);
@@ -344,11 +543,12 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
       v.removeEventListener('waiting', onWaiting);
       v.removeEventListener('canplay', onCanPlay);
       v.removeEventListener('loadstart', onLoadStart);
-      v.removeEventListener('seeked', onSeeked);
+      v.removeEventListener('ended', onEnded);
+      v.removeEventListener('error', onError);
     };
-  }, [quality]);
+  }, [quality, proxySeek]);
 
-  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed, quality]);
+  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
 
   useEffect(() => {
     const onChange = () => setFullscreen(!!document.fullscreenElement);
@@ -368,21 +568,51 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     return () => clearTimeout(hideControlsTimer.current);
   }, [playing]);
 
+  // FIXED: seekTo uses proxy seek exclusively. Only falls back to native seek
+  // if the target is within the already-buffered range (instant, no reload).
   const seekTo = useCallback((targetTime) => {
     const v = videoRef.current;
     if (!v) return;
+
+    const clamped = Math.max(0, Math.min(duration > 0 ? duration - 1 : 1e9, targetTime));
     wasPlayingRef.current = !v.paused;
-    const diff = Math.abs(targetTime - (v.currentTime || 0));
-    // For large seeks (> 8 seconds), use proxy ?t= param which restarts FFmpeg at the right position
-    // This handles adaptive (muxed) streams that don't support byte-range seeking
-    if (diff > 8 || !v.seekable.length) {
-      seekReloadRef.current = true;
-      setCurrentTime(targetTime);
-      setProxySeek(Math.floor(targetTime));
-    } else {
-      v.currentTime = targetTime;
+
+    // Check if target is already buffered (no need to reload)
+    const currentProxyStart = proxySeekRef.current;
+    const bufferedMax = v.buffered.length > 0
+      ? currentProxyStart + v.buffered.end(v.buffered.length - 1)
+      : currentProxyStart;
+
+    if (clamped >= currentProxyStart && clamped <= bufferedMax) {
+      // Native seek within buffered range — fast and no reload
+      v.currentTime = clamped - currentProxyStart;
+      setCurrentTime(clamped);
+      return;
     }
-  }, []);
+
+    // Outside buffered range — reload stream at new position
+    seekReloadRef.current = true;
+    setCurrentTime(clamped);
+    const newSeek = Math.floor(clamped);
+    proxySeekRef.current = newSeek;
+    setProxySeek(newSeek);
+  }, [duration]);
+
+  // FIXED: changeQuality sets proxySeek directly to current absolute position
+  // so the new stream starts from exactly where we are — no native seek needed.
+  const changeQuality = useCallback((q) => {
+    const v = videoRef.current;
+    if (!v || q === quality) return;
+    const absoluteTime = Math.floor(proxySeekRef.current + (v.currentTime || 0));
+    wasPlayingRef.current = !v.paused;
+    // Set proxy to current position so new stream starts from here
+    proxySeekRef.current = absoluteTime;
+    setProxySeek(absoluteTime);
+    seekReloadRef.current = true;
+    setIsLoading(true);
+    setQuality(q);
+    setShowSettings(false);
+  }, [quality]);
 
   const getProgressRatio = useCallback((e) => {
     const rect = progressRef.current.getBoundingClientRect();
@@ -425,79 +655,8 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     else document.exitFullscreen();
   };
 
-  const changeQuality = (q) => {
-    const v = videoRef.current;
-    if (!v || q === quality) return;
-    savedTimeRef.current = v.currentTime;
-    wasPlayingRef.current = !v.paused;
-    qualityChangeInProgress.current = true;
-    setQuality(q);
-    setIsLoading(true);
-    setShowSettings(false);
-  };
-
-  const handleDownload = async (format) => {
-    setDownloading(true);
-    setDownloadProgress(0);
-    setShowDownload(false);
-    try {
-      const titleParam = encodeURIComponent(video.title || 'video');
-      const url = `/api/download/${video.id}?format=${format}&quality=${quality || 720}&title=${titleParam}`;
-      const response = await fetch(url);
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: `Server error ${response.status}` }));
-        throw new Error(err.error || `Server error ${response.status}`);
-      }
-
-      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-      const cd = response.headers.get('content-disposition') || '';
-      const nameMatch = cd.match(/filename="([^"]+)"/);
-      const filename = nameMatch ? nameMatch[1] : `${(video.title || 'video').replace(/[<>:"/\\|?*]/g, '')}.${format}`;
-
-      // Stream the response body and track progress
-      const reader = response.body.getReader();
-      const chunks = [];
-      let received = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (contentLength > 0) {
-          setDownloadProgress(Math.min(99, Math.round((received / contentLength) * 100)));
-        } else {
-          // FFmpeg stream — pulse between 0-99 based on received bytes
-          setDownloadProgress(101); // "processing" state
-        }
-      }
-
-      setDownloadProgress(100);
-
-      const mimeTypes = { mp4: 'video/mp4', mp3: 'audio/mpeg', flac: 'audio/flac', opus: 'audio/ogg', ogg: 'audio/ogg' };
-      const blob = new Blob(chunks, { type: mimeTypes[format] || 'application/octet-stream' });
-      if (blob.size === 0) throw new Error('Downloaded file is empty');
-
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
-    } catch (err) {
-      console.error('Download failed:', err);
-      alert(`Download failed: ${err.message}`);
-    } finally {
-      setDownloading(false);
-      setTimeout(() => setDownloadProgress(-1), 2000);
-    }
-  };
-
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
-
   const noSubtitlesAvailable = availableSubtitles.length === 0;
 
   return (
@@ -532,15 +691,12 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
           />
         )}
 
-        {/* Subtitle overlay with word-level karaoke highlighting */}
         {subtitlesEnabled && (
           <>
             <SubtitleOverlay cue={currentCue} currentTime={currentTime} size={subtitleSize} pos={subtitlePos} />
             {noSubtitlesAvailable && (
               <div className="absolute bottom-16 left-1/2 -translate-x-1/2 pointer-events-none">
-                <span className="px-3 py-1 rounded text-sm bg-black/80 text-gray-300">
-                  Subtitles unavailable for this video
-                </span>
+                <span className="px-3 py-1 rounded text-sm bg-black/80 text-gray-300">Subtitles unavailable</span>
               </div>
             )}
           </>
@@ -554,13 +710,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                 {formatsLoading ? 'Preparing video…' : 'Loading video…'}
               </p>
               <p className="text-white/50 text-xs mt-1">This may take a moment</p>
-            </div>
-            {/* Animated loading bar */}
-            <div className="w-48 h-1 bg-white/20 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-[var(--accent)] rounded-full animate-pulse"
-                style={{ animation: 'loading-bar 1.5s ease-in-out infinite' }}
-              />
             </div>
           </div>
         )}
@@ -610,23 +759,20 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
 
             <div className="flex-1" />
 
-            {/* Subtitles toggle */}
+            {/* Subtitles */}
             <button
               className={`hover:text-[var(--accent)] transition-colors relative ${subtitlesEnabled ? 'text-[var(--accent)]' : ''}`}
-              onClick={(e) => {
-                e.stopPropagation();
-                setSubtitlesEnabled(s => !s);
-              }}
+              onClick={(e) => { e.stopPropagation(); setSubtitlesEnabled(s => !s); }}
               title={noSubtitlesAvailable ? 'Subtitles unavailable' : subtitlesEnabled ? 'Disable subtitles' : 'Enable subtitles'}
             >
               <Subtitles size={18} />
               {noSubtitlesAvailable && <span className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full" />}
             </button>
 
-            {/* Speed indicator */}
+            {/* Speed */}
             <button
               className="text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20 transition-colors"
-              onClick={(e) => { e.stopPropagation(); setSettingsTab('quality'); setShowSettings(s => !s); setShowDownload(false); }}
+              onClick={(e) => { e.stopPropagation(); setSettingsTab('speed'); setShowSettings(s => !s); setShowDownload(false); }}
             >
               {speed}x
             </button>
@@ -646,7 +792,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                   style={{ boxShadow: '0 -4px 24px rgba(0,0,0,0.5)' }}
                   onClick={e => e.stopPropagation()}
                 >
-                  {/* Tabs */}
                   <div className="flex border-b border-[var(--border)]">
                     {['quality', 'speed', 'subtitles'].map(tab => (
                       <button
@@ -671,7 +816,7 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                               onClick={() => changeQuality(String(h))}
                               className={`text-xs py-1.5 px-2 rounded transition-colors text-left ${String(quality) === String(h) ? 'bg-[var(--accent)] text-white' : 'bg-[var(--bg-primary)] hover:bg-[var(--border)]'}`}
                             >
-                              {h}p{h === 2160 ? ' (4K)' : h >= 1080 ? ' (HD)' : h >= 720 ? ' (HD)' : ''}
+                              {h}p{h >= 2160 ? ' (4K)' : h >= 1080 ? ' (HD)' : h >= 720 ? ' (HD)' : ''}
                             </button>
                           ))}
                         </div>
@@ -698,7 +843,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                           <p className="text-xs text-[var(--text-secondary)] text-center py-2">Subtitles unavailable for this video</p>
                         ) : (
                           <>
-                            {/* Enable toggle */}
                             <div className="flex items-center justify-between">
                               <span className="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Subtitles</span>
                               <button
@@ -709,7 +853,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                               </button>
                             </div>
 
-                            {/* Language */}
                             {availableSubtitles.length > 0 && (
                               <div>
                                 <label className="block text-xs font-semibold mb-1 text-[var(--text-secondary)] uppercase tracking-wide">Language</label>
@@ -719,15 +862,12 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                                   className="w-full breeze-input text-xs py-1"
                                 >
                                   {availableSubtitles.map(sub => (
-                                    <option key={sub.lang} value={sub.lang}>
-                                      {sub.name} {sub.auto ? '(Auto)' : ''}
-                                    </option>
+                                    <option key={sub.lang} value={sub.lang}>{sub.name} {sub.auto ? '(Auto)' : ''}</option>
                                   ))}
                                 </select>
                               </div>
                             )}
 
-                            {/* Auto-translate */}
                             <div className="border-t border-[var(--border)] pt-2">
                               <div className="flex items-center justify-between mb-2">
                                 <span className="text-xs font-semibold text-[var(--text-secondary)] uppercase tracking-wide">Auto-translate</span>
@@ -749,7 +889,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                                     ['it','Italian'],['pt','Portuguese'],['nl','Dutch'],['ru','Russian'],
                                     ['ja','Japanese'],['ko','Korean'],['zh-CN','Chinese (Simplified)'],
                                     ['ar','Arabic'],['hi','Hindi'],['tr','Turkish'],['pl','Polish'],
-                                    ['sv','Swedish'],['da','Danish'],['fi','Finnish'],['no','Norwegian'],
                                   ].map(([code, name]) => (
                                     <option key={code} value={code}>{name}</option>
                                   ))}
@@ -757,11 +896,8 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                               )}
                             </div>
 
-                            {/* Font size */}
                             <div>
-                              <label className="block text-xs font-semibold mb-1 text-[var(--text-secondary)] uppercase tracking-wide">
-                                Size: {subtitleSize}px
-                              </label>
+                              <label className="block text-xs font-semibold mb-1 text-[var(--text-secondary)] uppercase tracking-wide">Size: {subtitleSize}px</label>
                               <input
                                 type="range" min="12" max="36" step="2"
                                 value={subtitleSize}
@@ -770,7 +906,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                               />
                             </div>
 
-                            {/* Position */}
                             <div>
                               <label className="block text-xs font-semibold mb-1 text-[var(--text-secondary)] uppercase tracking-wide">Position</label>
                               <div className="flex gap-1">
@@ -786,9 +921,7 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                               </div>
                             </div>
 
-                            {loadingSubtitles && (
-                              <p className="text-xs text-[var(--text-secondary)] text-center">Loading subtitles…</p>
-                            )}
+                            {loadingSubtitles && <p className="text-xs text-[var(--text-secondary)] text-center">Loading subtitles…</p>}
                           </>
                         )}
                       </div>
@@ -798,39 +931,22 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
               )}
             </div>
 
-            {/* Download */}
+            {/* Download with settings panel */}
             <div className="relative">
               <button
                 className="flex items-center gap-1 hover:text-[var(--accent)] transition-colors"
-                onClick={(e) => { e.stopPropagation(); if (!downloading) { setShowDownload(d => !d); setShowSettings(false); } }}
-                disabled={downloading}
-                title={downloading ? (downloadProgress === 101 ? 'Processing…' : downloadProgress >= 0 ? `Downloading ${downloadProgress}%` : 'Downloading…') : 'Download'}
+                onClick={(e) => { e.stopPropagation(); setShowDownload(d => !d); setShowSettings(false); }}
+                title="Download"
               >
-                {downloading
-                  ? downloadProgress === 101
-                    ? <><Loader2 size={17} className="animate-spin" /><span className="text-xs">…</span></>
-                    : downloadProgress >= 0 && downloadProgress < 100
-                      ? <span className="text-xs font-bold text-[var(--accent)]">{downloadProgress}%</span>
-                      : <Loader2 size={17} className="animate-spin" />
-                  : <Download size={17} />}
+                <Download size={17} />
               </button>
               {showDownload && (
-                <div
-                  className="absolute bottom-full right-0 mb-2 bg-[var(--bg-secondary)] border border-[var(--border)] rounded p-1.5 min-w-[180px] z-50 text-[var(--text-primary)]"
-                  style={{ boxShadow: '0 -4px 24px rgba(0,0,0,0.5)' }}
-                  onClick={e => e.stopPropagation()}
-                >
-                  {FORMATS.map(({ value, label, Icon }) => (
-                    <button
-                      key={value}
-                      onClick={() => handleDownload(value)}
-                      className="w-full flex items-center gap-3 px-3 py-2 rounded hover:bg-[var(--bg-primary)] transition-colors text-sm"
-                    >
-                      <Icon size={15} className="text-[var(--accent)] flex-shrink-0" />
-                      {label}
-                    </button>
-                  ))}
-                </div>
+                <DownloadPanel
+                  video={video}
+                  quality={quality}
+                  availableHeights={availableHeights}
+                  onClose={() => setShowDownload(false)}
+                />
               )}
             </div>
 
@@ -863,19 +979,30 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
             </p>
             <p className="text-xs text-[var(--text-secondary)]">{video.views}</p>
           </div>
-          {video.channelId && (
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {/* Save button */}
             <button
-              onClick={toggleSubscribe}
-              disabled={subscribeLoading}
-              className={`flex-shrink-0 px-4 py-2 rounded-full text-sm font-semibold transition-all ${
-                isSubscribed
-                  ? 'bg-[var(--border)] text-[var(--text-secondary)] hover:bg-red-500/20 hover:text-red-400'
-                  : 'bg-[var(--accent)] text-white hover:opacity-90'
-              } ${subscribeLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+              onClick={toggleSave}
+              disabled={saveLoading}
+              title={isSaved ? 'Remove from saved' : 'Save video'}
+              className={`p-2 rounded-full transition-all ${isSaved ? 'text-[var(--accent)] bg-[var(--accent)]/10' : 'hover:bg-[var(--border)]'} ${saveLoading ? 'opacity-50' : ''}`}
             >
-              {subscribeLoading ? '…' : isSubscribed ? 'Subscribed' : 'Subscribe'}
+              {isSaved ? <BookmarkCheck size={18} /> : <Bookmark size={18} />}
             </button>
-          )}
+            {video.channelId && (
+              <button
+                onClick={toggleSubscribe}
+                disabled={subscribeLoading}
+                className={`px-4 py-2 rounded-full text-sm font-semibold transition-all ${
+                  isSubscribed
+                    ? 'bg-[var(--border)] text-[var(--text-secondary)] hover:bg-red-500/20 hover:text-red-400'
+                    : 'bg-[var(--accent)] text-white hover:opacity-90'
+                } ${subscribeLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+              >
+                {subscribeLoading ? '…' : isSubscribed ? 'Subscribed' : 'Subscribe'}
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -900,10 +1027,7 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
                   {description}
                 </p>
                 {description.length > 300 && (
-                  <button
-                    className="text-xs text-[var(--accent)] mt-2 hover:underline"
-                    onClick={() => setDescExpanded(s => !s)}
-                  >
+                  <button className="text-xs text-[var(--accent)] mt-2 hover:underline" onClick={() => setDescExpanded(s => !s)}>
                     {descExpanded ? 'Show less' : 'Show more'}
                   </button>
                 )}

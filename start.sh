@@ -1,8 +1,13 @@
 #!/bin/bash
-export PATH="$HOME/.local/bin:$PATH"
+# Find node from Replit environment
+NODE_PATH=$(available-pid2-node-paths 2>/dev/null | head -1 | xargs dirname 2>/dev/null || echo "")
+if [ -n "$NODE_PATH" ]; then
+  export PATH="$NODE_PATH:$PATH"
+fi
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
-# Start the backend API on port 3000
-node server.js &
+# Start the backend API on port 10000 (vite proxies to this port)
+PORT=10000 node server.js &
 BACKEND_PID=$!
 
 # Start the Vite dev server on port 5000

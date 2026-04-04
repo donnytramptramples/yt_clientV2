@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { ArrowLeft, Loader2, Users, SortAsc, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { ArrowLeft, Loader2, Users, SortAsc, ChevronDown, Search, X } from 'lucide-react';
 import VideoCard from './VideoCard';
 
 const PAGE_SIZE = 12;
@@ -14,12 +14,14 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   const [subscribed, setSubscribed] = useState(false);
   const [subLoading, setSubLoading] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     if (!channelId) return;
     setLoading(true);
     setError('');
     setVisibleCount(PAGE_SIZE);
+    setSearchQuery('');
     fetch(`/api/channel/${channelId}/videos?sort=${sort}`)
       .then(async r => {
         if (!r.ok) {
@@ -66,13 +68,19 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
         setSubscribed(true);
       }
       if (onSubscribeChange) onSubscribeChange();
-    } catch { } finally {
-      setSubLoading(false);
-    }
+    } catch { }
+    finally { setSubLoading(false); }
   };
 
-  const videos = allVideos.slice(0, visibleCount);
-  const hasMore = visibleCount < allVideos.length;
+  // Filter videos by search query (case-insensitive title match)
+  const filteredVideos = useMemo(() => {
+    if (!searchQuery.trim()) return allVideos;
+    const q = searchQuery.trim().toLowerCase();
+    return allVideos.filter(v => v.title?.toLowerCase().includes(q));
+  }, [allVideos, searchQuery]);
+
+  const videos = filteredVideos.slice(0, visibleCount);
+  const hasMore = visibleCount < filteredVideos.length;
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -92,12 +100,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       ) : error ? (
         <div className="flex flex-col items-center justify-center h-40 gap-3">
           <p className="text-red-400 text-sm text-center max-w-sm">{error}</p>
-          <button
-            className="breeze-btn text-sm"
-            onClick={() => setRetryKey(k => k + 1)}
-          >
-            Retry
-          </button>
+          <button className="breeze-btn text-sm" onClick={() => setRetryKey(k => k + 1)}>Retry</button>
         </div>
       ) : (
         <>
@@ -135,9 +138,33 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
             </div>
           )}
 
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg font-semibold">{allVideos.length} Videos</h2>
-            <div className="flex items-center gap-2">
+          {/* Controls row: count + search + sort */}
+          <div className="flex flex-wrap items-center gap-3 mb-4">
+            <h2 className="text-lg font-semibold flex-shrink-0">
+              {searchQuery ? `${filteredVideos.length} results` : `${allVideos.length} Videos`}
+            </h2>
+
+            {/* Video search within channel */}
+            <div className="flex-1 min-w-[180px] max-w-xs relative">
+              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={e => { setSearchQuery(e.target.value); setVisibleCount(PAGE_SIZE); }}
+                placeholder="Search videos…"
+                className="w-full breeze-input pl-8 pr-8 text-sm py-1.5"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => { setSearchQuery(''); setVisibleCount(PAGE_SIZE); }}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 ml-auto flex-shrink-0">
               <SortAsc size={16} className="text-[var(--text-secondary)]" />
               <select
                 value={sort}
@@ -153,7 +180,9 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
 
           {videos.length === 0 ? (
             <div className="flex items-center justify-center h-40">
-              <p className="text-[var(--text-secondary)]">No videos found for this channel.</p>
+              <p className="text-[var(--text-secondary)]">
+                {searchQuery ? `No videos match "${searchQuery}"` : 'No videos found for this channel.'}
+              </p>
             </div>
           ) : (
             <>
@@ -170,7 +199,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
                     className="flex items-center gap-2 px-6 py-2.5 rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] hover:bg-[var(--border)] transition-colors text-sm font-medium"
                   >
                     <ChevronDown size={16} />
-                    Load More ({allVideos.length - visibleCount} remaining)
+                    Load More ({filteredVideos.length - visibleCount} remaining)
                   </button>
                 </div>
               )}

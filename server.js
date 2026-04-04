@@ -103,8 +103,29 @@ let refreshTimer = null;
 const infoCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
 
-// Get visitor data from environment for bot bypass
+// Bot bypass environment variables
 const YOUTUBE_VISITOR_DATA = process.env.YOUTUBE_VISITOR_DATA || '';
+const YOUTUBE_PO_TOKEN = process.env.YOUTUBE_PO_TOKEN || '';
+// Base64-encoded cookies.txt content — set this in Render/production env
+const YOUTUBE_COOKIES_B64 = process.env.YOUTUBE_COOKIES || '';
+
+// Write cookies to disk once on startup if provided
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const COOKIES_PATH = path.join(DATA_DIR, 'cookies.txt');
+if (YOUTUBE_COOKIES_B64) {
+  try {
+    fs.writeFileSync(COOKIES_PATH, Buffer.from(YOUTUBE_COOKIES_B64, 'base64').toString('utf8'));
+    console.log('[setup] YouTube cookies written to', COOKIES_PATH);
+  } catch (e) {
+    console.warn('[setup] Failed to write cookies:', e.message);
+  }
+}
+
+function hasCookies() {
+  return fs.existsSync(COOKIES_PATH) && fs.statSync(COOKIES_PATH).size > 0;
+}
 
 async function initYouTube() {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
@@ -117,10 +138,9 @@ async function initYouTube() {
       enable_session_cache: false,
     };
 
-    // Add visitor_data if available to bypass bot detection
     if (YOUTUBE_VISITOR_DATA) {
       options.visitor_data = YOUTUBE_VISITOR_DATA;
-      console.log('[youtubei.js] Using provided visitor_data for bot bypass');
+      console.log('[youtubei.js] Using provided visitor_data');
     }
 
     youtube = await Innertube.create(options);
@@ -137,9 +157,6 @@ async function initYouTube() {
 await initYouTube();
 
 // ─── SQLite Databases ────────────────────────────────────────────────────────
-
-const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const authDb = new Database(path.join(DATA_DIR, 'auth.db'));
 authDb.pragma('journal_mode = WAL');
@@ -170,6 +187,25 @@ subsDb.exec(`
     channel_avatar TEXT DEFAULT '',
     subscribed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, channel_id)
+  );
+`);
+
+const savedDb = new Database(path.join(DATA_DIR, 'saved.db'));
+savedDb.pragma('journal_mode = WAL');
+savedDb.exec(`
+  CREATE TABLE IF NOT EXISTS saved_videos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    thumbnail TEXT DEFAULT '',
+    channel TEXT DEFAULT '',
+    channel_id TEXT DEFAULT '',
+    channel_avatar TEXT DEFAULT '',
+    duration TEXT DEFAULT '',
+    views TEXT DEFAULT '',
+    saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, video_id)
   );
 `);
 
@@ -205,7 +241,6 @@ function requireAuth(req, res, next) {
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// Cookie parser (manual, no extra dep)
 app.use((req, res, next) => {
   const cookieHeader = req.headers.cookie || '';
   req.cookies = {};
@@ -340,6 +375,48 @@ app.post('/api/subscriptions/:channelId', requireAuth, (req, res) => {
   }
 });
 
+// ─── Saved videos endpoints ──────────────────────────────────────────────────
+
+app.get('/api/saved', requireAuth, (req, res) => {
+  const videos = savedDb.prepare('SELECT * FROM saved_videos WHERE user_id = ? ORDER BY saved_at DESC').all(req.user.id);
+  res.json({ videos: videos.map(v => ({
+    id: v.video_id,
+    title: v.title,
+    thumbnail: v.thumbnail,
+    channel: v.channel,
+    channelId: v.channel_id,
+    channelAvatar: v.channel_avatar,
+    duration: v.duration,
+    views: v.views,
+    savedAt: v.saved_at,
+  })) });
+});
+
+app.post('/api/saved/:videoId', requireAuth, (req, res) => {
+  const { videoId } = req.params;
+  const { title, thumbnail, channel, channelId, channelAvatar, duration, views } = req.body;
+  if (!title) return res.status(400).json({ error: 'title required' });
+  try {
+    savedDb.prepare(`
+      INSERT OR REPLACE INTO saved_videos (user_id, video_id, title, thumbnail, channel, channel_id, channel_avatar, duration, views)
+      VALUES (?,?,?,?,?,?,?,?,?)
+    `).run(req.user.id, videoId, title, thumbnail || '', channel || '', channelId || '', channelAvatar || '', duration || '', views || '');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/saved/:videoId', requireAuth, (req, res) => {
+  savedDb.prepare('DELETE FROM saved_videos WHERE user_id = ? AND video_id = ?').run(req.user.id, req.params.videoId);
+  res.json({ ok: true });
+});
+
+app.get('/api/saved/:videoId/status', requireAuth, (req, res) => {
+  const row = savedDb.prepare('SELECT 1 FROM saved_videos WHERE user_id = ? AND video_id = ?').get(req.user.id, req.params.videoId);
+  res.json({ saved: !!row });
+});
+
 // ─── YouTube helpers ─────────────────────────────────────────────────────────
 
 async function getVideoInfo(videoId) {
@@ -391,15 +468,27 @@ function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
   return selectVideoFormat(formats, qualityLimit);
 }
 
-// Build yt-dlp extractor args with bot bypass options
-function buildYtDlpExtractorArgs(client = 'tv_embedded') {
-  const args = ['--extractor-args', `youtube:player_client=${client}`];
+// Build yt-dlp args with full bot bypass support
+function buildYtDlpArgs(client = 'tv_embedded', extraArgs = []) {
+  const args = [];
 
-  // Add visitor_data if available for bot bypass
-  if (YOUTUBE_VISITOR_DATA) {
-    args[1] += `;visitor_data=${YOUTUBE_VISITOR_DATA}`;
+  // Cookies (most effective bypass)
+  if (hasCookies()) {
+    args.push('--cookies', COOKIES_PATH);
   }
 
+  // Extractor args with optional visitor_data and po_token
+  let extractorArg = `youtube:player_client=${client}`;
+  if (YOUTUBE_VISITOR_DATA) extractorArg += `;visitor_data=${YOUTUBE_VISITOR_DATA}`;
+  if (YOUTUBE_PO_TOKEN && YOUTUBE_VISITOR_DATA) {
+    extractorArg += `;po_token=${YOUTUBE_VISITOR_DATA}+${YOUTUBE_PO_TOKEN}`;
+  }
+  args.push('--extractor-args', extractorArg);
+
+  args.push('--add-headers', 'Origin:https://www.youtube.com');
+  args.push('--add-headers', 'Referer:https://www.youtube.com/');
+
+  args.push(...extraArgs);
   return args;
 }
 
@@ -408,27 +497,22 @@ async function getYtDlpFormats(videoId, attempt = 0) {
   const cached = ytdlpCache.get(videoId);
   if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
 
-  console.log(`[ytdlp] Extracting formats for ${videoId} (attempt ${attempt + 1})`);
-
-  // Client fallback chain - tv_embedded first (best for bypassing bot detection)
-  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios'];
+  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios', 'web'];
   const client = clients[attempt % clients.length];
 
-  const extractorArgs = buildYtDlpExtractorArgs(client);
+  console.log(`[ytdlp] ${videoId} attempt ${attempt + 1} client=${client} cookies=${hasCookies()} po_token=${!!YOUTUBE_PO_TOKEN}`);
+
+  const ytdlpArgs = buildYtDlpArgs(client);
 
   const raw = await new Promise((resolve, reject) => {
     const args = [
       '--no-playlist', '--quiet', '--no-warnings',
-      ...extractorArgs,
-      '--add-headers', `Origin:https://www.youtube.com`,
-      '--add-headers', `Referer:https://www.youtube.com/`,
+      ...ytdlpArgs,
       '-j', `https://www.youtube.com/watch?v=${videoId}`,
     ];
 
-    console.log(`[ytdlp] Using client: ${client}${YOUTUBE_VISITOR_DATA ? ' with visitor_data' : ''}`);
-
     const proc = spawn(YTDLP, args, {
-      env: { ...process.env, 'HTTP_USER_AGENT': getRandomUA() }
+      env: { ...process.env, HTTP_USER_AGENT: getRandomUA() }
     });
 
     let out = '';
@@ -436,7 +520,7 @@ async function getYtDlpFormats(videoId, attempt = 0) {
     proc.stdout.on('data', d => { out += d; });
     proc.stderr.on('data', d => { err += d; });
     proc.on('close', code => {
-      if (code !== 0) return reject(new Error(`yt-dlp exited ${code}: ${err.trim().substring(0, 200)}`));
+      if (code !== 0) return reject(new Error(`yt-dlp exited ${code}: ${err.trim().substring(0, 300)}`));
       try { resolve(JSON.parse(out)); } catch(e) { reject(new Error('Failed to parse yt-dlp JSON')); }
     });
     proc.on('error', reject);
@@ -471,9 +555,8 @@ async function getYtDlpFormats(videoId, attempt = 0) {
   return result;
 }
 
-// Retry yt-dlp with different client on bot detection
 async function getYtDlpFormatsWithRetry(videoId) {
-  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios'];
+  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios', 'web'];
   let lastError;
   for (let i = 0; i < clients.length; i++) {
     try {
@@ -481,9 +564,11 @@ async function getYtDlpFormatsWithRetry(videoId) {
       return await getYtDlpFormats(videoId, i);
     } catch (e) {
       lastError = e;
-      const isBotError = e.message.includes('bot') || e.message.includes('Sign in') || e.message.includes('403');
+      const isBotError = e.message.includes('bot') || e.message.includes('Sign in') ||
+        e.message.includes('403') || e.message.includes('confirm') || e.message.includes('429');
       if (!isBotError) throw e;
-      console.log(`[ytdlp] Bot detection with client ${clients[i]}, trying next...`);
+      console.log(`[ytdlp] Bot/rate error with client ${clients[i]}, trying next... (${e.message.substring(0, 80)})`);
+      if (i < clients.length - 1) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
   }
   throw lastError;
@@ -542,61 +627,59 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
   return resp;
 }
 
-// FIXED: Better seeking implementation with proper sync
+// FIXED: Apply -ss seek to BOTH video AND audio inputs for perfect A/V sync
 function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
   return new Promise((resolve, reject) => {
-    // Format seek time for ffmpeg
     const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
 
-    // Use input seeking for both streams to maintain sync
+    const ytHeaders = [
+      `User-Agent: ${getRandomUA()}`,
+      'Accept: */*',
+      'Accept-Language: en-US,en;q=0.9',
+      'Origin: https://www.youtube.com',
+      'Referer: https://www.youtube.com/',
+    ].join('\r\n') + '\r\n';
+
     const args = [
       '-loglevel', 'error',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-      // Global seek before inputs (input seeking) - more accurate and faster
-      ...ssArgs,
-      '-reconnect', '1', 
-      '-reconnect_on_network_error', '1', 
+      // Video input: seek applied before -i
+      '-headers', ytHeaders,
+      '-reconnect', '1',
+      '-reconnect_on_network_error', '1',
       '-reconnect_delay_max', '5',
-      // Video input
+      ...ssArgs,           // <-- seek before video
       '-i', videoUrl,
-      // Audio input with same seek
-      '-reconnect', '1', 
-      '-reconnect_on_network_error', '1', 
+      // Audio input: SAME seek applied before -i (fixes A/V desync)
+      '-headers', ytHeaders,
+      '-reconnect', '1',
+      '-reconnect_on_network_error', '1',
       '-reconnect_delay_max', '5',
+      ...ssArgs,           // <-- seek before audio too
       '-i', audioUrl,
-      // Map streams
-      '-map', '0:v:0', 
+      '-map', '0:v:0',
       '-map', '1:a:0',
-      // Copy codecs (no re-encode)
-      '-c:v', 'copy', 
+      '-c:v', 'copy',
       '-c:a', 'copy',
-      // Fragmented MP4 for streaming
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-      '-f', 'mp4', 
+      '-f', 'mp4',
       'pipe:1',
     ];
 
-    console.log(`[ffmpeg] Starting mux with seek: ${seekSeconds}s`);
+    console.log(`[ffmpeg] Muxing with seek=${seekSeconds}s`);
 
     const proc = spawn(FFMPEG, args);
 
     if (signal) {
-      signal.addEventListener('abort', () => { 
-        try { 
-          proc.kill('SIGTERM'); 
-        } catch {} 
-      }, { once: true });
+      signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
     }
 
     let stderrData = '';
-    proc.stderr.on('data', d => { 
-      const msg = d.toString().trim(); 
+    proc.stderr.on('data', d => {
+      const msg = d.toString().trim();
       if (msg) {
         stderrData += msg + '\n';
-        // Only log errors, not warnings
-        if (msg.includes('Error') || msg.includes('error')) {
-          console.error('[ffmpeg]', msg);
-        }
+        if (msg.includes('Error') || msg.includes('error')) console.error('[ffmpeg]', msg);
       }
     });
 
@@ -607,8 +690,8 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
       if (code === 0 || code === null || res.writableEnded) {
         resolve();
       } else {
-        console.error(`[ffmpeg] Exited with code ${code}`);
-        if (stderrData) console.error('[ffmpeg stderr]', stderrData);
+        console.error(`[ffmpeg] Exit ${code}`);
+        if (stderrData) console.error('[ffmpeg stderr]', stderrData.substring(0, 500));
         reject(new Error(`ffmpeg exited with code ${code}`));
       }
     });
@@ -617,7 +700,7 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
   });
 }
 
-// ─── Search with pagination ──────────────────────────────────────────────────
+// ─── Search ──────────────────────────────────────────────────────────────────
 
 const searchContinuations = new Map();
 
@@ -679,7 +762,7 @@ function mapSearchResults(videos) {
   }));
 }
 
-// ─── Channel search (extract unique channels from video search) ───────────────
+// ─── Channel search ──────────────────────────────────────────────────────────
 
 app.get('/api/channel/search', async (req, res) => {
   try {
@@ -718,21 +801,27 @@ app.get('/api/channel/search', async (req, res) => {
 const channelCache = new Map();
 const CHANNEL_TTL = 10 * 60 * 1000;
 
-async function fetchChannelVideos(channelId, limit = 30) {
-  const cacheKey = `ch:${channelId}`;
+// FIXED: Correct URL logic for UC IDs vs @ handles vs plain names
+async function fetchChannelVideos(channelId, limit = 40) {
+  const cacheKey = `ch:${channelId}:${limit}`;
   const cached = channelCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CHANNEL_TTL) return cached;
 
+  // Build URL priority list without mixing ID formats
   const urls = [];
-  if (channelId.startsWith('UC') || channelId.startsWith('UU')) {
+  const isUCId = /^UC[a-zA-Z0-9_\-]{10,}$/.test(channelId);
+  const isHandle = channelId.startsWith('@');
+
+  if (isUCId) {
+    // YouTube channel IDs always use /channel/UCxxx/videos
     urls.push(`https://www.youtube.com/channel/${channelId}/videos`);
-  }
-  if (channelId.startsWith('@')) {
+  } else if (isHandle) {
+    // Handle with @ prefix: /@handle/videos
     urls.push(`https://www.youtube.com/${channelId}/videos`);
   } else {
+    // Plain name: try @handle, then /c/ (legacy custom URLs), then /channel/ as last resort
     urls.push(`https://www.youtube.com/@${channelId}/videos`);
-  }
-  if (!channelId.startsWith('@')) {
+    urls.push(`https://www.youtube.com/c/${channelId}/videos`);
     urls.push(`https://www.youtube.com/channel/${channelId}/videos`);
   }
 
@@ -741,29 +830,29 @@ async function fetchChannelVideos(channelId, limit = 30) {
 
   for (const url of urls) {
     try {
-      const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
+      const ytdlpArgs = buildYtDlpArgs('tv_embedded');
 
       const raw = await new Promise((resolve, reject) => {
         const args = [
           '--flat-playlist', '--no-warnings', '--quiet',
-          ...extractorArgs,
+          ...ytdlpArgs,
           '--playlist-items', `1-${limit}`,
           '-J', url,
         ];
-        const proc = spawn(YTDLP, args, { 
-          env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+        const proc = spawn(YTDLP, args, {
+          env: { ...process.env, HTTP_USER_AGENT: getRandomUA() }
         });
         let out = '';
         let err = '';
-        const timer = setTimeout(() => { 
-          try { proc.kill('SIGKILL'); } catch {} 
-          reject(new Error('yt-dlp timeout')); 
-        }, 30000);
+        const timer = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch {}
+          reject(new Error('yt-dlp timeout'));
+        }, 45000);
         proc.stdout.on('data', d => { out += d; });
         proc.stderr.on('data', d => { err += d; });
         proc.on('close', code => {
           clearTimeout(timer);
-          if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.substring(0, 150)}`));
+          if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.substring(0, 200)}`));
           try { resolve(JSON.parse(out)); } catch { reject(new Error('JSON parse failed')); }
         });
         proc.on('error', e => { clearTimeout(timer); reject(e); });
@@ -774,10 +863,13 @@ async function fetchChannelVideos(channelId, limit = 30) {
         name: raw.uploader || raw.channel || raw.title || '',
         avatar: raw.thumbnails?.[0]?.url || raw.channel_thumbnail || '',
         description: raw.description || '',
-        subscribers: raw.channel_follower_count ? String(raw.channel_follower_count) : '',
+        subscribers: raw.channel_follower_count
+          ? formatViewCount(raw.channel_follower_count).replace(' views', '')
+          : '',
         id: raw.uploader_id || raw.channel_id || channelId,
       };
-      break;
+      if (entries.length > 0) break; // success
+      console.warn(`[channel] ${url} returned 0 entries, trying next...`);
     } catch (e) {
       console.warn(`[channel] failed with ${url}: ${e.message}`);
     }
@@ -818,10 +910,7 @@ function formatViewCount(n) {
 
 function formatUploadDate(d) {
   if (!d || d.length < 8) return '';
-  const year = d.substring(0, 4);
-  const month = d.substring(4, 6);
-  const day = d.substring(6, 8);
-  return `${year}-${month}-${day}`;
+  return `${d.substring(0, 4)}-${d.substring(4, 6)}-${d.substring(6, 8)}`;
 }
 
 app.get('/api/channel/:channelId/videos', async (req, res) => {
@@ -829,7 +918,7 @@ app.get('/api/channel/:channelId/videos', async (req, res) => {
     const { channelId } = req.params;
     const { sort = 'newest' } = req.query;
 
-    const data = await fetchChannelVideos(channelId, 40);
+    const data = await fetchChannelVideos(channelId, 60);
     let videos = [...data.videos];
 
     if (sort === 'oldest') videos = videos.reverse();
@@ -848,163 +937,7 @@ app.get('/api/channel/:channelId/videos', async (req, res) => {
   }
 });
 
-// ─── Feed (subscriptions) ────────────────────────────────────────────────────
-
-app.get('/api/feed', requireAuth, async (req, res) => {
-  try {
-    const subs = subsDb.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(req.user.id);
-
-    const allVideos = [];
-
-    // ── Subscription content ───────────────────────────────────────────────────
-    if (subs.length > 0) {
-      const channelResults = await Promise.allSettled(
-        subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 15))
-      );
-      for (let i = 0; i < channelResults.length; i++) {
-        const result = channelResults[i];
-        if (result.status !== 'fulfilled') continue;
-        const sub = subs[i];
-        for (const v of result.value.videos.slice(0, 10)) {
-          const recency = getFeedRecencyScore(v.published);
-          const popularity = getFeedPopularityScore(v.views);
-          const channelBoost = (subs.length - i) / Math.max(subs.length, 1) * 0.1;
-          const random = Math.random() * 0.05;
-          const score = 0.4 + recency * 0.65 + popularity * 0.2 + channelBoost + random;
-          allVideos.push({
-            ...v,
-            channel: v.channel || sub.channel_name,
-            channelId: v.channelId || sub.channel_id,
-            channelAvatar: v.channelAvatar || sub.channel_avatar || '',
-            _score: score,
-            _src: 'subscription',
-          });
-        }
-      }
-    }
-
-    // ── Trending content ────────────────────────────────────────────────────────
-    try {
-      let trendingVideos = [];
-      let trendingData = null;
-
-      // FIXED: Try to get trending using browse endpoint if getTrending fails
-      try {
-        if (youtube && typeof youtube.getTrending === 'function') {
-          trendingData = await youtube.getTrending();
-        }
-      } catch (trendErr) {
-        console.warn('[feed] getTrending() failed:', trendErr.message);
-      }
-
-      // Parse trending results - handle both TabbedFeed and Feed structures
-      if (trendingData) {
-        // TabbedFeed has .videos, Feed might have .items or nested structure
-        const items = trendingData.videos || trendingData.items || [];
-
-        // If it's a tabbed feed, we might need to select the first tab
-        const section = Array.isArray(items) ? items : 
-                       (trendingData.contents?.[0]?.contents || []);
-
-        trendingVideos = section
-          .filter(v => v.id && (v.title?.text || v.title))
-          .slice(0, 30)
-          .map(v => ({
-            id: v.id,
-            title: v.title?.text || v.title || 'Video',
-            thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-            duration: v.duration?.text || '',
-            views: v.view_count?.text || v.short_view_count?.text || '',
-            channel: v.author?.name || v.channel?.name || '',
-            channelId: v.author?.id || v.channel?.id || '',
-            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-            published: v.published?.text || '',
-          }));
-      }
-
-      // Fallback: use yt-dlp for trending if API fails
-      if (trendingVideos.length === 0) {
-        throw new Error('API trending empty, will fallback');
-      }
-
-      const subChannelIds = new Set(subs.map(s => s.channel_id));
-      for (const v of trendingVideos) {
-        const popularity = getFeedPopularityScore(v.views);
-        const recency = getFeedRecencyScore(v.published);
-        const isSub = subChannelIds.has(v.channelId);
-        const random = Math.random() * 0.08;
-        const score = (isSub ? 0.3 : 0.1) + recency * 0.4 + popularity * 0.35 + random;
-        allVideos.push({ ...v, _score: score, _src: 'trending' });
-      }
-    } catch (e) {
-      console.warn('[feed] trending fetch failed:', e.message);
-
-      // Fallback trending via yt-dlp
-      try {
-        const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
-        const trendResult = await new Promise((resolve, reject) => {
-          const args = [
-            '--flat-playlist', '--no-warnings', '--quiet',
-            ...extractorArgs,
-            '--playlist-items', '1-30',
-            '-J', 'https://www.youtube.com/feed/trending',
-          ];
-          const proc = spawn(YTDLP, args, { 
-            env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
-          });
-          let out = '';
-          const timer = setTimeout(() => { 
-            try { proc.kill('SIGKILL'); } catch {} 
-            resolve({ entries: [] }); 
-          }, 25000);
-          proc.stdout.on('data', d => { out += d; });
-          proc.stderr.on('data', () => {});
-          proc.on('close', () => {
-            clearTimeout(timer);
-            try { resolve(JSON.parse(out)); } catch { resolve({ entries: [] }); }
-          });
-          proc.on('error', () => { clearTimeout(timer); resolve({ entries: [] }); });
-        });
-
-        for (const v of (trendResult.entries || [])) {
-          if (!v.id) continue;
-          allVideos.push({
-            id: v.id,
-            title: v.title || 'Video',
-            thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-            duration: v.duration ? formatSecondsToTime(v.duration) : '',
-            views: v.view_count ? formatViewCount(v.view_count) : '',
-            channel: v.uploader || v.channel || '',
-            channelId: v.uploader_id || v.channel_id || '',
-            channelAvatar: '',
-            published: v.upload_date ? formatUploadDate(v.upload_date) : '',
-            _score: Math.random(),
-            _src: 'trending_fallback',
-          });
-        }
-      } catch (fallbackErr) {
-        console.warn('[feed] yt-dlp trending fallback also failed:', fallbackErr.message);
-      }
-    }
-
-    // ── Sort, deduplicate, and return ────────────────────────────────────────
-    allVideos.sort((a, b) => b._score - a._score);
-
-    const seen = new Set();
-    const deduped = allVideos.filter(v => {
-      if (!v.id || seen.has(v.id)) return false;
-      seen.add(v.id);
-      return true;
-    });
-
-    const videos = deduped.map(({ _score, _src, ...v }) => v);
-
-    res.json({ videos });
-  } catch (e) {
-    console.error('[feed] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
+// ─── Feed (YouTube-like algorithm: subscriptions + trending) ─────────────────
 
 function getFeedRecencyScore(published) {
   if (!published) return 0;
@@ -1028,6 +961,74 @@ function getFeedPopularityScore(views) {
   if (!n) return 0;
   return Math.min(1, Math.log10(n + 1) / 7);
 }
+
+app.get('/api/feed', requireAuth, async (req, res) => {
+  try {
+    const subs = subsDb.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(req.user.id);
+    const allVideos = [];
+
+    // ── Subscription videos ───────────────────────────────────────────────────
+    if (subs.length > 0) {
+      const channelResults = await Promise.allSettled(
+        subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 15))
+      );
+      for (let i = 0; i < channelResults.length; i++) {
+        const result = channelResults[i];
+        if (result.status !== 'fulfilled') continue;
+        const sub = subs[i];
+        for (const v of result.value.videos.slice(0, 10)) {
+          const recency = getFeedRecencyScore(v.published);
+          const popularity = getFeedPopularityScore(v.views);
+          const channelBoost = (subs.length - i) / Math.max(subs.length, 1) * 0.1;
+          const random = Math.random() * 0.05;
+          const score = 0.4 + recency * 0.65 + popularity * 0.2 + channelBoost + random;
+          allVideos.push({ ...v, channel: v.channel || sub.channel_name, channelId: v.channelId || sub.channel_id, channelAvatar: v.channelAvatar || sub.channel_avatar || '', _score: score, _src: 'subscription' });
+        }
+      }
+    }
+
+    // ── Trending videos ───────────────────────────────────────────────────────
+    let trendingVideos = [];
+    try {
+      if (trendingCache.data && Date.now() - trendingCache.ts < TRENDING_TTL) {
+        trendingVideos = trendingCache.data.videos || [];
+      } else {
+        // Fetch fresh trending
+        const raw = await fetchTrendingYtDlp();
+        trendingVideos = raw;
+      }
+    } catch (e) {
+      console.warn('[feed] trending fetch failed:', e.message);
+    }
+
+    const subChannelIds = new Set(subs.map(s => s.channel_id));
+    for (const v of trendingVideos) {
+      const popularity = getFeedPopularityScore(v.views);
+      const recency = getFeedRecencyScore(v.published);
+      const isSub = subChannelIds.has(v.channelId);
+      const random = Math.random() * 0.08;
+      // Non-subscribers still see trending content — just with a lower base score
+      const score = (isSub ? 0.3 : 0.05) + recency * 0.4 + popularity * 0.35 + random;
+      allVideos.push({ ...v, _score: score, _src: 'trending' });
+    }
+
+    // Deduplicate by video ID, keeping highest score
+    const seen = new Map();
+    for (const v of allVideos) {
+      if (!seen.has(v.id) || seen.get(v.id)._score < v._score) seen.set(v.id, v);
+    }
+
+    const videos = [...seen.values()]
+      .sort((a, b) => b._score - a._score)
+      .slice(0, 60)
+      .map(({ _score, _src, ...v }) => v);
+
+    res.json({ videos });
+  } catch (e) {
+    console.error('[feed] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ─── Video info / formats / subtitles ────────────────────────────────────────
 
@@ -1090,30 +1091,23 @@ app.get('/api/video/:videoId/details', async (req, res) => {
     } catch {}
   }
 
-  // Comments via yt-dlp
   try {
-    const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
+    const ytdlpArgs = buildYtDlpArgs('tv_embedded');
     const commentData = await new Promise((resolve) => {
       const args = [
         '--no-playlist', '--skip-download', '--write-comments', '--quiet', '--no-warnings',
         '--extractor-args', 'youtube:comment_sort=top;max_comments=30,all,top,0',
-        ...extractorArgs,
+        ...ytdlpArgs,
         '-j', `https://www.youtube.com/watch?v=${videoId}`,
       ];
-      const proc = spawn(YTDLP, args, { 
-        env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
+      const proc = spawn(YTDLP, args, {
+        env: { ...process.env, HTTP_USER_AGENT: getRandomUA() }
       });
       let out = '';
       proc.stdout.on('data', d => { out += d; });
       proc.stderr.on('data', () => {});
-      const timer = setTimeout(() => { 
-        try { proc.kill(); } catch {} 
-        resolve(null); 
-      }, 20000);
-      proc.on('close', () => {
-        clearTimeout(timer);
-        try { resolve(JSON.parse(out)); } catch { resolve(null); }
-      });
+      const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 20000);
+      proc.on('close', () => { clearTimeout(timer); try { resolve(JSON.parse(out)); } catch { resolve(null); } });
       proc.on('error', () => { clearTimeout(timer); resolve(null); });
     });
 
@@ -1199,8 +1193,6 @@ app.get('/api/subtitles/:videoId/list', async (req, res) => {
   }
 });
 
-// ─── Subtitle translate ────────────────────────────────────────────────────────
-
 app.get('/api/subtitles/:videoId/translate', async (req, res) => {
   const { videoId } = req.params;
   const { lang = 'en', auto = 'false', to = 'en' } = req.query;
@@ -1208,7 +1200,6 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
   try {
     const data = await getYtDlpFormatsWithRetry(videoId);
 
-    // First try to find subtitles in the target language directly
     const autoCapsSrc = data.automaticCaptions;
     if (autoCapsSrc && autoCapsSrc[to]) {
       const subs = autoCapsSrc[to];
@@ -1225,10 +1216,8 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
       }
     }
 
-    // Fall back to fetching the source subtitle and translating via Google
     const subtitleSource = auto === 'true' ? data.automaticCaptions : data.subtitles;
-    const srcLang = lang;
-    const srcSubs = subtitleSource?.[srcLang];
+    const srcSubs = subtitleSource?.[lang];
     if (!srcSubs?.length) return res.status(404).json({ error: 'Source subtitles not found' });
 
     const vttSub = srcSubs.find(s => s.ext === 'vtt') || srcSubs[0];
@@ -1237,7 +1226,6 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 
     const vttText = await r.text();
 
-    // Parse VTT into cues
     const cueRegex = /(\d{2}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})[^\n]*\n([\s\S]*?)(?=\n\n|\n*$)/g;
     const cues = [];
     let m;
@@ -1251,7 +1239,6 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
       return res.send(vttText);
     }
 
-    // Batch translate
     const DELIM = ' ||| ';
     const batch = cues.map(c => c.text).join(DELIM);
 
@@ -1291,12 +1278,10 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 
 // ─── Proxy (streaming) ───────────────────────────────────────────────────────
 
-// FIXED: Improved seeking with proper time-based seeking support
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', t = '0', start } = req.query;
 
-  // Support both 't' and 'start' parameters for seeking
   const seekSeconds = Math.max(0, parseFloat(start || t) || 0);
   const rangeHeader = req.headers.range;
 
@@ -1312,24 +1297,21 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
     const videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
 
-    // If format has both video and audio, stream directly
     if (videoFmt.acodec !== 'none') {
       const fetchHeaders = {
-        'accept': '*/*', 
+        'accept': '*/*',
         'origin': 'https://www.youtube.com',
-        'referer': 'https://www.youtube.com', 
+        'referer': 'https://www.youtube.com',
         'user-agent': getRandomUA()
       };
 
-      // For direct streams, we can support range requests if no seek time specified
-      // If seek time is specified, we need to use time-based seeking via ffmpeg or yt-dlp
       if (rangeHeader && seekSeconds === 0) {
         fetchHeaders['range'] = rangeHeader;
       }
 
-      const resp = await fetch(videoFmt.url, { 
-        headers: fetchHeaders, 
-        signal: controller.signal 
+      const resp = await fetch(videoFmt.url, {
+        headers: fetchHeaders,
+        signal: controller.signal
       });
 
       if (!resp.ok && resp.status !== 206) throw new Error(`Upstream: ${resp.status}`);
@@ -1341,20 +1323,14 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length');
 
-      if (resp.headers.get('content-length')) {
-        res.setHeader('Content-Length', resp.headers.get('content-length'));
-      }
-      if (resp.headers.get('content-range')) {
-        res.setHeader('Content-Range', resp.headers.get('content-range'));
-      }
+      if (resp.headers.get('content-length')) res.setHeader('Content-Length', resp.headers.get('content-length'));
+      if (resp.headers.get('content-range')) res.setHeader('Content-Range', resp.headers.get('content-range'));
 
       await pipeline(Readable.fromWeb(resp.body), res);
     } else {
-      // Separate audio/video streams - need to mux with ffmpeg
       const audioFmt = pickYtDlpAudio(ytFmts);
 
       res.setHeader('Content-Type', 'video/mp4');
-      // Disable byte-range seeking for muxed streams - use time-based ?t= instead
       res.setHeader('Accept-Ranges', 'none');
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'no-cache');
@@ -1366,7 +1342,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     console.error(`[proxy] Error: ${e.message}`);
     if (!res.headersSent) {
       res.status(502).json({
-        error: e.message, 
+        error: e.message,
         videoId,
         fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
       });
@@ -1406,9 +1382,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
   } catch (error) {
     if (!controller.signal.aborted) {
       console.error('[stream] error:', error.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: error.message });
-      }
+      if (!res.headersSent) res.status(502).json({ error: error.message });
     }
   } finally {
     cleanup();
@@ -1417,8 +1391,8 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
 // ─── Download ────────────────────────────────────────────────────────────────
 
-function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
-  return new Promise((resolve, reject) => {
+function spawnFfmpegAudio(audioUrl, codec, ffmpegFormat, extraArgs, signal) {
+  return new Promise((resolve) => {
     const ytHeaders = [
       `User-Agent: ${getRandomUA()}`,
       'Accept: */*',
@@ -1428,31 +1402,29 @@ function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
     ].join('\r\n') + '\r\n';
 
     const args = [
-      '-loglevel', 'error',
+      '-loglevel', 'warning',
       '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
       '-headers', ytHeaders,
-      '-reconnect', '1', 
-      '-reconnect_on_network_error', '1', 
+      '-reconnect', '1',
+      '-reconnect_on_network_error', '1',
       '-reconnect_delay_max', '5',
       '-i', audioUrl,
       '-vn',
       '-c:a', codec,
       ...extraArgs,
-      '-f', format,
+      '-f', ffmpegFormat,
       'pipe:1',
     ];
 
     const proc = spawn(FFMPEG, args);
 
     if (signal) {
-      signal.addEventListener('abort', () => { 
-        try { proc.kill('SIGTERM'); } catch {} 
-      }, { once: true });
+      signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
     }
 
-    proc.stderr.on('data', d => { 
-      const m = d.toString().trim(); 
-      if (m) console.error('[ffmpeg-audio]', m); 
+    proc.stderr.on('data', d => {
+      const m = d.toString().trim();
+      if (m) console.error('[ffmpeg-audio]', m);
     });
 
     resolve(proc);
@@ -1461,7 +1433,7 @@ function spawnFfmpegAudio(audioUrl, codec, format, extraArgs, signal) {
 
 app.get('/api/download/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { format = 'mp4', quality = '720', title: titleParam } = req.query;
+  const { format = 'mp4', quality = '720', title: titleParam, bitrate, compression } = req.query;
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
@@ -1483,19 +1455,15 @@ app.get('/api/download/:videoId', async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
 
       if (videoFmt.acodec !== 'none') {
-        const resp = await fetch(videoFmt.url, {
-          headers: { 
-            'accept': '*/*', 
-            'origin': 'https://www.youtube.com', 
-            'referer': 'https://www.youtube.com', 
-            'user-agent': getRandomUA() 
-          },
-          signal: controller.signal
-        });
+        const ytHeaders = {
+          'accept': '*/*',
+          'origin': 'https://www.youtube.com',
+          'referer': 'https://www.youtube.com',
+          'user-agent': getRandomUA()
+        };
+        const resp = await fetch(videoFmt.url, { headers: ytHeaders, signal: controller.signal });
         if (!resp.ok) throw new Error(`Upstream: ${resp.status}`);
-        if (resp.headers.get('content-length')) {
-          res.setHeader('Content-Length', resp.headers.get('content-length'));
-        }
+        if (resp.headers.get('content-length')) res.setHeader('Content-Length', resp.headers.get('content-length'));
         await pipeline(Readable.fromWeb(resp.body), res);
       } else {
         await muxToResponse(videoFmt.url, audioFmt.url, res, controller.signal, 0);
@@ -1504,28 +1472,32 @@ app.get('/api/download/:videoId', async (req, res) => {
       const audioFmt = pickYtDlpAudio(ytFmts);
       if (!audioFmt) return res.status(404).json({ error: 'No audio format available' });
 
+      // Build format config — accept custom bitrate/compression from query params
+      const userBitrate = bitrate || null;
+      const userCompression = compression ? parseInt(compression) : null;
+
       const formatConfig = {
-        mp3:  ['libmp3lame', 'mp3',  'audio/mpeg',  'mp3',  ['-b:a', '320k', '-ar', '44100']],
-        flac: ['flac',       'flac', 'audio/flac',  'flac', ['-compression_level', '5']],
-        opus: ['libopus',    'opus', 'audio/ogg',   'ogg',  ['-b:a', '160k', '-ar', '48000']],
-        ogg:  ['libvorbis',  'ogg',  'audio/ogg',   'ogg',  ['-b:a', '192k', '-ar', '44100']],
-        m4a:  ['aac',        'm4a',  'audio/mp4',   'mp4',  ['-b:a', '256k']],
-      }[format] || ['libmp3lame', 'mp3', 'audio/mpeg', 'mp3', ['-b:a', '320k']];
+        mp3:  { codec: 'libmp3lame', ext: 'mp3',  mime: 'audio/mpeg', fmt: 'mp3',  args: ['-b:a', userBitrate || '320k', '-ar', '44100'] },
+        flac: { codec: 'flac',       ext: 'flac', mime: 'audio/flac', fmt: 'flac', args: ['-compression_level', String(userCompression ?? 5)] },
+        opus: { codec: 'libopus',    ext: 'opus', mime: 'audio/ogg',  fmt: 'ogg',  args: ['-b:a', userBitrate || '160k', '-ar', '48000'] },
+        ogg:  { codec: 'libvorbis',  ext: 'ogg',  mime: 'audio/ogg',  fmt: 'ogg',  args: ['-b:a', userBitrate || '192k', '-ar', '44100'] },
+        m4a:  { codec: 'aac',        ext: 'm4a',  mime: 'audio/mp4',  fmt: 'mp4',  args: ['-b:a', userBitrate || '256k'] },
+      }[format] || { codec: 'libmp3lame', ext: 'mp3', mime: 'audio/mpeg', fmt: 'mp3', args: ['-b:a', '320k'] };
 
-      const [codec, ext, mimeType, ffmpegFormat, extraArgs] = formatConfig;
-
-      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${ext}"`);
-      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${formatConfig.ext}"`);
+      res.setHeader('Content-Type', formatConfig.mime);
       res.setHeader('Access-Control-Allow-Origin', '*');
 
-      const proc = await spawnFfmpegAudio(audioFmt.url, codec, ffmpegFormat, extraArgs, controller.signal);
+      console.log(`[download] ${videoId} format=${format} codec=${formatConfig.codec} args=${formatConfig.args.join(' ')}`);
+
+      const proc = await spawnFfmpegAudio(audioFmt.url, formatConfig.codec, formatConfig.fmt, formatConfig.args, controller.signal);
       proc.stdout.pipe(res);
       proc.stdout.on('error', () => {});
 
       await new Promise((resolve, reject) => {
-        proc.on('close', c => { 
-          if (c === 0 || c === null || res.writableEnded) resolve(); 
-          else reject(new Error(`ffmpeg exit ${c}`)); 
+        proc.on('close', c => {
+          if (c === 0 || c === null || res.writableEnded) resolve();
+          else reject(new Error(`ffmpeg exit ${c}`));
         });
         proc.on('error', reject);
       });
@@ -1543,6 +1515,41 @@ app.get('/api/download/:videoId', async (req, res) => {
 const trendingCache = { data: null, ts: 0 };
 const TRENDING_TTL = 30 * 60 * 1000;
 
+async function fetchTrendingYtDlp() {
+  const ytdlpArgs = buildYtDlpArgs('tv_embedded');
+  const raw = await new Promise((resolve, reject) => {
+    const args = [
+      '--flat-playlist', '--no-warnings', '--quiet',
+      ...ytdlpArgs,
+      '--playlist-items', '1-40',
+      '-J', 'https://www.youtube.com/feed/trending',
+    ];
+    const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+    let out = '';
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
+    proc.stdout.on('data', d => { out += d; });
+    proc.stderr.on('data', () => {});
+    proc.on('close', code => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(`exit ${code}`));
+      try { resolve(JSON.parse(out)); } catch { reject(new Error('parse failed')); }
+    });
+    proc.on('error', e => { clearTimeout(timer); reject(e); });
+  });
+
+  return (raw.entries || []).map(v => ({
+    id: v.id,
+    title: v.title || 'Video',
+    thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+    duration: v.duration ? formatSecondsToTime(v.duration) : '',
+    views: v.view_count ? formatViewCount(v.view_count) : '',
+    channel: v.uploader || v.channel || '',
+    channelId: v.uploader_id || v.channel_id || '',
+    channelAvatar: '',
+    published: v.upload_date ? formatUploadDate(v.upload_date) : '',
+  })).filter(v => v.id);
+}
+
 app.get('/api/trending', async (req, res) => {
   try {
     if (trendingCache.data && Date.now() - trendingCache.ts < TRENDING_TTL) {
@@ -1551,7 +1558,6 @@ app.get('/api/trending', async (req, res) => {
 
     let videos = [];
 
-    // Try youtubei.js getTrending first (with error handling)
     try {
       if (youtube && typeof youtube.getTrending === 'function') {
         const results = await youtube.getTrending();
@@ -1577,46 +1583,9 @@ app.get('/api/trending', async (req, res) => {
       console.warn('[trending] API failed:', apiErr.message);
     }
 
-    // Fallback: scrape trending via yt-dlp
     if (videos.length === 0) {
       try {
-        const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
-        const raw = await new Promise((resolve, reject) => {
-          const args = [
-            '--flat-playlist', '--no-warnings', '--quiet',
-            ...extractorArgs,
-            '--playlist-items', '1-40',
-            '-J', 'https://www.youtube.com/feed/trending',
-          ];
-          const proc = spawn(YTDLP, args, { 
-            env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
-          });
-          let out = '';
-          const timer = setTimeout(() => { 
-            try { proc.kill('SIGKILL'); } catch {} 
-            reject(new Error('timeout')); 
-          }, 30000);
-          proc.stdout.on('data', d => { out += d; });
-          proc.stderr.on('data', () => {});
-          proc.on('close', code => {
-            clearTimeout(timer);
-            if (code !== 0) return reject(new Error(`exit ${code}`));
-            try { resolve(JSON.parse(out)); } catch { reject(new Error('parse failed')); }
-          });
-          proc.on('error', e => { clearTimeout(timer); reject(e); });
-        });
-
-        videos = (raw.entries || []).map(v => ({
-          id: v.id,
-          title: v.title || 'Video',
-          thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-          duration: v.duration ? formatSecondsToTime(v.duration) : '',
-          views: v.view_count ? formatViewCount(v.view_count) : '',
-          channel: v.uploader || v.channel || '',
-          channelId: v.uploader_id || v.channel_id || '',
-          channelAvatar: '',
-          published: v.upload_date ? formatUploadDate(v.upload_date) : '',
-        }));
+        videos = await fetchTrendingYtDlp();
       } catch (e) {
         console.warn('[trending] yt-dlp fallback failed:', e.message);
       }
@@ -1632,37 +1601,33 @@ app.get('/api/trending', async (req, res) => {
   }
 });
 
-// ─── Shorts ──────────────────────────────────────────────────────────────────
+// ─── Shorts (actual YouTube Shorts — duration ≤ 60s) ─────────────────────────
 
 const shortsCache = { data: null, ts: 0 };
 const SHORTS_TTL = 20 * 60 * 1000;
 
-app.get('/api/shorts', async (req, res) => {
-  try {
-    if (shortsCache.data && Date.now() - shortsCache.ts < SHORTS_TTL) {
-      return res.json(shortsCache.data);
-    }
+async function fetchActualShorts() {
+  // Try multiple Shorts sources in priority order
+  const sources = [
+    'https://www.youtube.com/shorts/',
+    'https://www.youtube.com/hashtag/shorts',
+    'https://www.youtube.com/feed/trending',
+  ];
 
-    let shorts = [];
+  const ytdlpArgs = buildYtDlpArgs('tv_embedded');
 
-    // Try trending shorts page via yt-dlp
+  for (const src of sources) {
     try {
-      const extractorArgs = buildYtDlpExtractorArgs('tv_embedded');
       const raw = await new Promise((resolve, reject) => {
         const args = [
           '--flat-playlist', '--no-warnings', '--quiet',
-          ...extractorArgs,
-          '--playlist-items', '1-40',
-          '-J', 'https://www.youtube.com/shorts',
+          ...ytdlpArgs,
+          '--playlist-items', '1-60',
+          '-J', src,
         ];
-        const proc = spawn(YTDLP, args, { 
-          env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } 
-        });
+        const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
         let out = '';
-        const timer = setTimeout(() => { 
-          try { proc.kill('SIGKILL'); } catch {} 
-          reject(new Error('timeout')); 
-        }, 30000);
+        const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
         proc.stdout.on('data', d => { out += d; });
         proc.stderr.on('data', () => {});
         proc.on('close', code => {
@@ -1673,43 +1638,73 @@ app.get('/api/shorts', async (req, res) => {
         proc.on('error', e => { clearTimeout(timer); reject(e); });
       });
 
-      shorts = (raw.entries || []).map(v => ({
-        id: v.id,
-        title: v.title || 'Short',
-        thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-        duration: v.duration ? formatSecondsToTime(v.duration) : '',
-        views: v.view_count ? formatViewCount(v.view_count) : '',
-        channel: v.uploader || v.channel || '',
-        channelId: v.uploader_id || v.channel_id || '',
-        channelAvatar: '',
-        isShort: true,
-      }));
+      const entries = (raw.entries || []).filter(v => v.id);
+
+      // Filter to actual Shorts: duration <= 62 seconds (allow slight buffer)
+      // If no duration available, include videos from /shorts/ source (they're all shorts)
+      const isShortsSrc = src.includes('/shorts/') || src.includes('hashtag/shorts');
+      const shorts = entries
+        .filter(v => {
+          if (isShortsSrc) return true; // /shorts/ only contains shorts
+          return v.duration && v.duration <= 62;
+        })
+        .slice(0, 30)
+        .map(v => ({
+          id: v.id,
+          title: v.title || 'Short',
+          thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+          duration: v.duration ? formatSecondsToTime(v.duration) : '',
+          durationSecs: v.duration || 0,
+          views: v.view_count ? formatViewCount(v.view_count) : '',
+          channel: v.uploader || v.channel || '',
+          channelId: v.uploader_id || v.channel_id || '',
+          channelAvatar: '',
+          isShort: true,
+        }));
+
+      if (shorts.length >= 5) {
+        console.log(`[shorts] Got ${shorts.length} shorts from ${src}`);
+        return shorts;
+      }
     } catch (e) {
-      console.warn('[shorts] yt-dlp failed:', e.message);
+      console.warn(`[shorts] source ${src} failed:`, e.message);
+    }
+  }
+
+  // Final fallback: search #shorts via youtubei.js and filter by short duration
+  if (youtube) {
+    try {
+      const results = await youtube.search('#shorts', { type: 'video' });
+      return (results.videos || [])
+        .filter(v => v.id)
+        .slice(0, 30)
+        .map(v => ({
+          id: v.id,
+          title: v.title?.text || 'Short',
+          thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+          duration: v.duration?.text || '',
+          durationSecs: 0,
+          views: v.view_count?.text || '',
+          channel: v.author?.name || '',
+          channelId: v.author?.id || '',
+          channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+          isShort: true,
+        }));
+    } catch (e) {
+      console.warn('[shorts] search fallback failed:', e.message);
+    }
+  }
+
+  return [];
+}
+
+app.get('/api/shorts', async (req, res) => {
+  try {
+    if (shortsCache.data && Date.now() - shortsCache.ts < SHORTS_TTL) {
+      return res.json(shortsCache.data);
     }
 
-    // Fallback: search YouTube Shorts
-    if (shorts.length === 0) {
-      try {
-        const results = await youtube.search('#shorts', { type: 'video' });
-        shorts = (results.videos || [])
-          .filter(v => v.id)
-          .slice(0, 40)
-          .map(v => ({
-            id: v.id,
-            title: v.title?.text || 'Short',
-            thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-            duration: v.duration?.text || '',
-            views: v.view_count?.text || '',
-            channel: v.author?.name || '',
-            channelId: v.author?.id || '',
-            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-            isShort: true,
-          }));
-      } catch (e) {
-        console.warn('[shorts] search fallback failed:', e.message);
-      }
-    }
+    const shorts = await fetchActualShorts();
 
     const result = { shorts };
     shortsCache.data = result;
@@ -1724,11 +1719,13 @@ app.get('/api/shorts', async (req, res) => {
 // ─── Health ──────────────────────────────────────────────────────────────────
 
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    youtube: !!youtube, 
+  res.json({
+    status: 'ok',
+    youtube: !!youtube,
     activeStreams,
-    visitorData: YOUTUBE_VISITOR_DATA ? 'configured' : 'not configured'
+    cookies: hasCookies(),
+    visitorData: !!YOUTUBE_VISITOR_DATA,
+    poToken: !!YOUTUBE_PO_TOKEN,
   });
 });
 
@@ -1738,12 +1735,10 @@ app.get('*', (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Visitor data ${YOUTUBE_VISITOR_DATA ? 'configured' : 'NOT configured'} for bot bypass`);
+  console.log(`Bot bypass: cookies=${hasCookies()} visitor_data=${!!YOUTUBE_VISITOR_DATA} po_token=${!!YOUTUBE_PO_TOKEN}`);
 });
 
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   ws.on('message', () => ws.send(JSON.stringify({ progress: 100 })));
 });
-
-console.log('Server fully staged and ready for traffic');
