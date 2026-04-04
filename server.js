@@ -106,21 +106,8 @@ class ResidentialProxyManager {
     this.testInterval = 30 * 1000; // 30 seconds
     this.currentIndex = 0;
     
-    // Free proxy API endpoints
+    // Simplified proxy sources - only reliable ones
     this.sources = [
-      // Webshare.io free proxies (10 free proxies, most reliable)
-      {
-        name: 'webshare',
-        url: 'https://proxy.webshare.io/api/v2/proxy/list/download/PQRSTUVWXYZ/any/any/false/', // Replace with your API key
-        parser: 'webshare'
-      },
-      // ScraperAPI free tier
-      {
-        name: 'scraperapi',
-        url: 'http://api.scraperapi.com?api_key=YOUR_API_KEY&url=https://httpbin.org/ip',
-        parser: 'scraperapi'
-      },
-      // Public proxy lists (backup)
       {
         name: 'proxyscrape',
         url: 'https://api.proxyscrape.com/v2/?request=get&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all',
@@ -132,19 +119,9 @@ class ResidentialProxyManager {
         parser: 'plain'
       },
       {
-        name: 'github-clarketm',
-        url: 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
-        parser: 'plain'
-      },
-      {
         name: 'github-monosans',
         url: 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
         parser: 'plain'
-      },
-      {
-        name: 'geonode',
-        url: 'https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&protocols=http%2Chttps',
-        parser: 'geonode'
       }
     ];
     
@@ -164,7 +141,6 @@ class ResidentialProxyManager {
     console.log('[proxy] Fetching fresh proxy lists...');
     const allProxies = [];
     
-    // Fetch from all sources in parallel
     const fetchPromises = this.sources.map(source => this.fetchFromSource(source));
     const results = await Promise.allSettled(fetchPromises);
     
@@ -177,15 +153,12 @@ class ResidentialProxyManager {
       }
     });
     
-    // Deduplicate and filter
     const uniqueProxies = [...new Set(allProxies)].filter(this.isValidProxy);
     
     if (uniqueProxies.length > 0) {
       this.proxies = uniqueProxies;
       this.lastFetch = now;
       console.log(`[proxy] Total unique proxies: ${this.proxies.length}`);
-      
-      // Immediately test a batch
       this.testBatch(this.proxies.slice(0, 20));
     }
   }
@@ -218,7 +191,6 @@ class ResidentialProxyManager {
     
     switch (parser) {
       case 'plain':
-        // Format: ip:port per line
         text.split('\n').forEach(line => {
           const match = line.trim().match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/);
           if (match) proxies.push(`http://${match[1]}:${match[2]}`);
@@ -226,7 +198,6 @@ class ResidentialProxyManager {
         break;
         
       case 'geonode':
-        // JSON format
         try {
           const data = JSON.parse(text);
           (data.data || []).forEach(p => {
@@ -237,26 +208,6 @@ class ResidentialProxyManager {
           });
         } catch {}
         break;
-        
-      case 'webshare':
-        // Format: ip:port:username:password
-        text.split('\n').forEach(line => {
-          const parts = line.trim().split(':');
-          if (parts.length >= 2) {
-            const [ip, port, user, pass] = parts;
-            if (user && pass) {
-              proxies.push(`http://${user}:${pass}@${ip}:${port}`);
-            } else {
-              proxies.push(`http://${ip}:${port}`);
-            }
-          }
-        });
-        break;
-        
-      case 'scraperapi':
-        // ScraperAPI uses single endpoint, not a list
-        // This is handled differently in getScraperApiProxy()
-        break;
     }
     
     return proxies;
@@ -264,7 +215,6 @@ class ResidentialProxyManager {
 
   isValidProxy(proxy) {
     if (!proxy || typeof proxy !== 'string') return false;
-    // Basic validation
     return /^(http|https|socks4|socks5):\/\//.test(proxy);
   }
 
@@ -287,12 +237,9 @@ class ResidentialProxyManager {
 
   async testProxies() {
     if (this.proxies.length === 0) return;
-    
-    // Test random sample
     const sample = this.proxies
       .sort(() => 0.5 - Math.random())
       .slice(0, 10);
-    
     await this.testBatch(sample);
   }
 
@@ -305,7 +252,8 @@ class ResidentialProxyManager {
         ? new SocksProxyAgent(proxy)
         : new HttpsProxyAgent(proxy);
       
-      const resp = await fetch('https://www.google.com/generate_204', {
+      // Test against YouTube instead of Google
+      const resp = await fetch('https://www.youtube.com/generate_204', {
         agent,
         signal: controller.signal,
         headers: { 'User-Agent': getRandomUA() }
@@ -319,14 +267,12 @@ class ResidentialProxyManager {
   }
 
   getProxy() {
-    // Prefer working proxies
     if (this.workingProxies.length > 0) {
       const proxy = this.workingProxies[this.currentIndex % this.workingProxies.length];
       this.currentIndex++;
       return proxy;
     }
     
-    // Fallback to any proxy
     if (this.proxies.length > 0) {
       const proxy = this.proxies[this.currentIndex % this.proxies.length];
       this.currentIndex++;
@@ -334,13 +280,6 @@ class ResidentialProxyManager {
     }
     
     return null;
-  }
-
-  getScraperApiProxy() {
-    // ScraperAPI acts as proxy
-    const apiKey = process.env.SCRAPERAPI_KEY;
-    if (!apiKey) return null;
-    return `http://scraperapi:${apiKey}@proxy-server.scraperapi.com:8001`;
   }
 
   getProxyAgent(proxy) {
@@ -361,9 +300,8 @@ class POTokenManager {
     this.tokens = new Map();
     this.visitorData = process.env.YOUTUBE_VISITOR_DATA || this.generateVisitorData();
     this.lastRefresh = 0;
-    this.refreshInterval = 15 * 60 * 1000; // 15 minutes
+    this.refreshInterval = 15 * 60 * 1000;
     
-    // Initialize with environment tokens if available
     if (process.env.PO_TOKEN) {
       this.tokens.set('default', {
         token: process.env.PO_TOKEN,
@@ -371,12 +309,9 @@ class POTokenManager {
         source: 'env'
       });
     }
-    
-    this.startGeneration();
   }
 
   generateVisitorData() {
-    // Generate valid visitor data
     const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
     let result = '';
     const length = 22;
@@ -390,236 +325,6 @@ class POTokenManager {
     return result;
   }
 
-  async startGeneration() {
-    // Generate initial token
-    await this.generateToken();
-    
-    // Refresh periodically
-    setInterval(() => this.generateToken(), this.refreshInterval);
-  }
-
-  async generateToken(videoId = null) {
-    const methods = [
-      () => this.generateViaBgUtils(videoId),
-      () => this.generateViaTrustedSession(videoId),
-      () => this.generateViaWebView(videoId),
-      () => this.fetchFromRemoteAPI(videoId)
-    ];
-    
-    for (const method of methods) {
-      try {
-        const token = await method();
-        if (token) {
-          this.tokens.set(videoId || 'default', {
-            token,
-            ts: Date.now(),
-            source: method.name
-          });
-          console.log(`[po-token] Generated via ${method.name}: ${token.substring(0, 20)}...`);
-          return token;
-        }
-      } catch (e) {
-        console.warn(`[po-token] ${method.name} failed:`, e.message);
-      }
-    }
-    
-    return null;
-  }
-
-  async generateViaBgUtils(videoId) {
-    // Use BgUtils via Python script or Node.js
-    try {
-      const contentBinding = videoId || this.visitorData;
-      
-      // Try to use bgutil-ytdlp-pot-provider if available
-      const result = await new Promise((resolve, reject) => {
-        const proc = spawn('python3', [
-          '-c',
-          `
-import sys
-try:
-    from bgutil_ytdlp_pot_provider import generate_po_token
-    token = generate_po_token("${contentBinding}")
-    print(token)
-except Exception as e:
-    print(f"Error: {e}", file=sys.stderr)
-    sys.exit(1)
-          `
-        ], { timeout: 30000 });
-        
-        let out = '';
-        let err = '';
-        
-        proc.stdout.on('data', d => out += d);
-        proc.stderr.on('data', d => err += d);
-        
-        proc.on('close', code => {
-          if (code !== 0) reject(new Error(err || 'BgUtils failed'));
-          else resolve(out.trim());
-        });
-      });
-      
-      return result || null;
-    } catch {
-      return null;
-    }
-  }
-
-  async generateViaTrustedSession(videoId) {
-    // Use Invidious trusted session generator via Docker or Python
-    try {
-      const result = await new Promise((resolve, reject) => {
-        // Try docker first
-        const proc = spawn('docker', [
-          'run', '--rm', '--network=host',
-          'quay.io/invidious/youtube-trusted-session-generator',
-          '--oneshot'
-        ], { timeout: 60000 });
-        
-        let out = '';
-        let err = '';
-        
-        proc.stdout.on('data', d => out += d);
-        proc.stderr.on('data', d => err += d);
-        
-        proc.on('close', code => {
-          if (code !== 0) {
-            // Fallback to local Python script
-            this.runLocalTrustedSession(videoId).then(resolve).catch(reject);
-          } else {
-            // Parse output for po_token
-            const match = out.match(/po_token:\s*([^\s]+)/i);
-            resolve(match ? match[1] : null);
-          }
-        });
-      });
-      
-      return result;
-    } catch {
-      return null;
-    }
-  }
-
-  async runLocalTrustedSession(videoId) {
-    return new Promise((resolve, reject) => {
-      const proc = spawn('python3', [
-        'potoken-generator.py',
-        '--oneshot'
-      ], { 
-        cwd: '/tmp',
-        timeout: 60000,
-        env: { ...process.env, PYTHONUNBUFFERED: '1' }
-      });
-      
-      let out = '';
-      proc.stdout.on('data', d => out += d);
-      proc.on('close', code => {
-        if (code !== 0) reject(new Error('Local trusted session failed'));
-        else {
-          const match = out.match(/po_token:\s*([^\s]+)/i);
-          resolve(match ? match[1] : null);
-        }
-      });
-    });
-  }
-
-  async generateViaWebView(videoId) {
-    // Simulate WebView-based generation (like YTDLnis does)
-    // This uses puppeteer or playwright if available
-    
-    try {
-      // Check if puppeteer is available
-      const puppeteer = await import('puppeteer').catch(() => null);
-      if (!puppeteer) return null;
-      
-      const browser = await puppeteer.launch({
-        headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-      });
-      
-      const page = await browser.newPage();
-      
-      // Navigate to YouTube with special headers
-      await page.setUserAgent(getRandomUA());
-      await page.setExtraHTTPHeaders({
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1'
-      });
-      
-      // Visit YouTube to get session
-      await page.goto('https://www.youtube.com', { waitUntil: 'networkidle2' });
-      
-      // Extract visitor data and PO token from page
-      const data = await page.evaluate(() => {
-        // Look for ytInitialData or ytcfg
-        const scripts = Array.from(document.querySelectorAll('script'));
-        let visitorData = null;
-        let poToken = null;
-        
-        for (const script of scripts) {
-          const text = script.textContent || '';
-          const vdMatch = text.match(/"visitorData":"([^"]+)"/);
-          const ptMatch = text.match(/"poToken":"([^"]+)"/);
-          
-          if (vdMatch) visitorData = vdMatch[1];
-          if (ptMatch) poToken = ptMatch[1];
-        }
-        
-        return { visitorData, poToken };
-      });
-      
-      await browser.close();
-      
-      if (data.visitorData) {
-        this.visitorData = data.visitorData;
-      }
-      
-      return data.poToken;
-    } catch (e) {
-      console.warn('[po-token] WebView generation failed:', e.message);
-      return null;
-    }
-  }
-
-  async fetchFromRemoteAPI(videoId) {
-    // Fetch from remote token generation services
-    // These are community-maintained endpoints
-    
-    const apis = [
-      'https://yt.lemnoslife.com/v3/videos',
-      'https://returnyoutubedislikeapi.com/votes',
-      // Add more reliable endpoints here
-    ];
-    
-    for (const api of apis) {
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
-        
-        const resp = await fetch(`${api}?id=${videoId || 'dQw4w9WgXcQ'}`, {
-          signal: controller.signal,
-          headers: { 'User-Agent': getRandomUA() }
-        });
-        
-        clearTimeout(timeout);
-        
-        if (!resp.ok) continue;
-        
-        const data = await resp.json();
-        // Extract any tokens if available
-        if (data.poToken) return data.poToken;
-        
-      } catch {
-        continue;
-      }
-    }
-    
-    return null;
-  }
-
   getToken(videoId = null) {
     const key = videoId || 'default';
     const cached = this.tokens.get(key);
@@ -628,11 +333,8 @@ except Exception as e:
       return cached.token;
     }
     
-    // Generate new token asynchronously
-    this.generateToken(videoId).catch(() => {});
-    
-    // Return stale token or null
-    return cached?.token || this.tokens.get('default')?.token || null;
+    // Return env token as fallback
+    return this.tokens.get('default')?.token || null;
   }
 
   getVisitorData() {
@@ -665,7 +367,6 @@ Platform.shim.fetch = async (input, init = {}) => {
     init.headers = {};
   }
 
-  // Add YouTube-specific headers
   if (url && (url.includes('youtube.com') || url.includes('googlevideo.com'))) {
     init.headers = {
       ...init.headers,
@@ -684,7 +385,6 @@ Platform.shim.fetch = async (input, init = {}) => {
     };
   }
 
-  // Use proxy for YouTube API calls
   if (url && (url.includes('youtubei.googleapis.com') || url.includes('googlevideo.com'))) {
     const proxy = proxyManager.getProxy();
     if (proxy) {
@@ -717,15 +417,23 @@ const YOUTUBE_COOKIES_B64 = process.env.YOUTUBE_COOKIES || '';
 
 if (YOUTUBE_COOKIES_B64) {
   try {
-    fs.writeFileSync(COOKIES_PATH, Buffer.from(YOUTUBE_COOKIES_B64, 'base64').toString('utf8'));
-    console.log('[setup] YouTube cookies written to', COOKIES_PATH);
+    const decoded = Buffer.from(YOUTUBE_COOKIES_B64, 'base64').toString('utf8');
+    // Validate cookies format
+    if (decoded.includes('youtube.com') || decoded.includes('google.com')) {
+      fs.writeFileSync(COOKIES_PATH, decoded);
+      console.log('[setup] YouTube cookies written to', COOKIES_PATH);
+    } else {
+      console.warn('[setup] Invalid cookies format, ignoring');
+    }
   } catch (e) {
     console.warn('[setup] Failed to write cookies:', e.message);
   }
 }
 
 function hasCookies() {
-  return fs.existsSync(COOKIES_PATH) && fs.statSync(COOKIES_PATH).size > 0;
+  if (!fs.existsSync(COOKIES_PATH)) return false;
+  const stats = fs.statSync(COOKIES_PATH);
+  return stats.size > 0;
 }
 
 async function initYouTube() {
@@ -739,7 +447,6 @@ async function initYouTube() {
       enable_session_cache: false,
     };
 
-    // Use generated visitor data
     const visitorData = poTokenManager.getVisitorData();
     if (visitorData) {
       options.visitor_data = visitorData;
@@ -779,13 +486,14 @@ async function initYouTube() {
     console.error('>>> [ERROR] Init Failed:', e.message);
     console.error(e.stack);
     
+    // Create minimal stub that always falls back to yt-dlp
     if (!youtube) {
       youtube = {
         session: {
           player: null,
           http: { fetch_function: fetch }
         },
-        getInfo: async () => { throw new Error('YouTube API not initialized'); },
+        getInfo: async () => { throw new Error('YouTube API not initialized - use yt-dlp fallback'); },
         search: async () => { throw new Error('YouTube API not initialized'); },
         getTrending: async () => { throw new Error('YouTube API not initialized'); }
       };
@@ -1044,7 +752,7 @@ app.delete('/api/saved/:videoId', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── YT-DLP HELPERS WITH PO TOKEN & PROXY ─────────────────────────────────────
+// ─── YT-DLP HELPERS ─────────────────────────────────────────────────────
 
 async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
   const args = [];
@@ -1053,16 +761,13 @@ async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
     args.push('--cookies', COOKIES_PATH);
   }
 
-  // Get PO token and visitor data
   const poToken = poTokenManager.getToken(videoId);
   const visitorData = poTokenManager.getVisitorData();
   
-  // Build extractor arguments
   let extractorArg = `youtube:player_client=${client}`;
   extractorArg += `;visitor_data=${visitorData}`;
   
   if (poToken) {
-    // PO tokens are now bound to video ID for web client
     if (videoId && client === 'web') {
       extractorArg += `;po_token=web.gvs+${poToken},web.player+${poToken}`;
     } else {
@@ -1073,15 +778,10 @@ async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
 
   args.push('--extractor-args', extractorArg);
   
-  // Add headers to appear more legitimate
   args.push('--add-headers', 'Origin:https://www.youtube.com');
   args.push('--add-headers', 'Referer:https://www.youtube.com/');
   args.push('--add-headers', `User-Agent:${getRandomUA()}`);
   args.push('--add-headers', 'Accept-Language:en-US,en;q=0.9');
-  args.push('--add-headers', 'Sec-Fetch-Dest:document');
-  args.push('--add-headers', 'Sec-Fetch-Mode:navigate');
-  args.push('--add-headers', 'Sec-Fetch-Site:none');
-  args.push('--add-headers', 'Sec-Fetch-User:?1');
 
   args.push(...extraArgs);
   return args;
@@ -1094,7 +794,6 @@ function getProxyEnv() {
     PYTHONUNBUFFERED: '1'
   };
   
-  // Get proxy from manager
   const proxy = proxyManager.getProxy();
   if (proxy) {
     env.HTTP_PROXY = proxy;
@@ -1107,16 +806,11 @@ function getProxyEnv() {
   return env;
 }
 
-async function getYtDlpFormats(videoId, attempt = 0) {
+async function getYtDlpFormats(videoId, client = 'tv_embedded') {
   const cached = ytdlpCache.get(videoId);
   if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
 
-  // Try multiple clients in order of reliability
-  // tv_embedded currently doesn't require PO tokens [^7^]
-  const clients = ['tv_embedded', 'android', 'web', 'ios', 'mweb'];
-  const client = clients[attempt % clients.length];
-
-  console.log(`[ytdlp] ${videoId} attempt ${attempt + 1} client=${client} cookies=${hasCookies()} proxy=${!!proxyManager.getProxy()}`);
+  console.log(`[ytdlp] ${videoId} client=${client} cookies=${hasCookies()} proxy=${!!proxyManager.getProxy()}`);
 
   const ytdlpArgs = await buildYtDlpArgs(client, videoId);
 
@@ -1143,7 +837,13 @@ async function getYtDlpFormats(videoId, attempt = 0) {
     proc.on('error', reject);
   });
 
+  // BUG FIX: Handle case where formats is missing or empty
   const formats = (raw.formats || []).filter(f => f.url);
+  
+  if (formats.length === 0) {
+    throw new Error('No formats with URLs found - video may be restricted or unavailable');
+  }
+
   const meta = {
     duration: raw.duration || 0,
     title: raw.fulltitle || raw.title || '',
@@ -1173,18 +873,17 @@ async function getYtDlpFormats(videoId, attempt = 0) {
 }
 
 async function getYtDlpFormatsWithRetry(videoId) {
+  // Priority order: tv_embedded works best without PO tokens
   const clients = ['tv_embedded', 'android', 'web', 'ios', 'mweb'];
   let lastError;
   
   for (let i = 0; i < clients.length; i++) {
     try {
       if (i > 0) {
-        // Clear cache between attempts
         ytdlpCache.delete(videoId);
-        // Wait before retry
         await new Promise(r => setTimeout(r, 2000 * i));
       }
-      return await getYtDlpFormats(videoId, i);
+      return await getYtDlpFormats(videoId, clients[i]);
     } catch (e) {
       lastError = e;
       const isBotError = e.message.includes('bot') || 
@@ -1192,16 +891,12 @@ async function getYtDlpFormatsWithRetry(videoId) {
         e.message.includes('403') || 
         e.message.includes('confirm') || 
         e.message.includes('429') ||
-        e.message.includes('Unable to download API page');
+        e.message.includes('Unable to download API page') ||
+        e.message.includes('unavailable');
         
       if (!isBotError) throw e;
       
-      console.log(`[ytdlp] Bot/rate error with client ${clients[i]}, trying next... (${e.message.substring(0, 80)})`);
-      
-      // Generate new PO token on failure
-      if (i < clients.length - 1) {
-        await poTokenManager.generateToken(videoId);
-      }
+      console.log(`[ytdlp] Error with client ${clients[i]}: ${e.message.substring(0, 80)}`);
     }
   }
   throw lastError;
@@ -1209,35 +904,10 @@ async function getYtDlpFormatsWithRetry(videoId) {
 
 // ─── VIDEO HELPERS ───────────────────────────────────────────────────────────
 
-async function getVideoInfo(videoId) {
-  const cached = infoCache.get(videoId);
-  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.info;
-
-  if (!youtube) throw new Error('YouTube API not initialized');
-  
-  if (typeof youtube.getInfo !== 'function') {
-    throw new Error('YouTube API getInfo not available');
-  }
-  
-  const info = await youtube.getInfo(videoId);
-  if (!info) throw new Error('No video info returned');
-
-  infoCache.set(videoId, { info, ts: Date.now() });
-  return info;
-}
-
-function getFormatsFromInfo(info) {
-  return {
-    videoFormats: info.streaming_data?.formats || [],
-    adaptiveFormats: info.streaming_data?.adaptive_formats || [],
-    duration: info.basic_info?.duration || 0,
-    title: info.basic_info?.title || 'Video',
-  };
-}
-
+// BUG FIX: These functions now return null instead of throwing, allowing fallback
 function selectVideoFormat(formats, targetHeight) {
   const all = [...formats.videoFormats, ...formats.adaptiveFormats].filter(f => f.has_video && f.height);
-  if (all.length === 0) throw new Error('No video formats found');
+  if (all.length === 0) return null;
   all.sort((a, b) => {
     const hDiff = Math.abs(a.height - targetHeight) - Math.abs(b.height - targetHeight);
     if (hDiff !== 0) return hDiff;
@@ -1248,7 +918,7 @@ function selectVideoFormat(formats, targetHeight) {
 
 function selectAudioFormat(formats) {
   const all = [...formats.videoFormats, ...formats.adaptiveFormats].filter(f => f.has_audio && !f.has_video);
-  if (all.length === 0) throw new Error('No audio formats found');
+  if (all.length === 0) return null;
   all.sort((a, b) => {
     const aMp4 = (a.mime_type || '').includes('mp4') ? 0 : 1;
     const bMp4 = (b.mime_type || '').includes('mp4') ? 0 : 1;
@@ -1287,38 +957,10 @@ function ytDlpAvailableHeights(formats) {
   )].sort((a, b) => b - a);
 }
 
-async function decipherUrl(format, info) {
-  if (!youtube?.session?.player) {
-    throw new Error('YouTube player not initialized');
-  }
-  const url = await format.decipher(youtube.session.player);
-  if (!url) throw new Error('Could not decipher stream URL');
-  return `${url}&cpn=${info.cpn}`;
-}
-
-async function fetchFormatStream(format, info, signal, rangeHeader = null) {
-  const fetchUrl = await decipherUrl(format, info);
-  const headers = {
-    'accept': '*/*',
-    'origin': 'https://www.youtube.com',
-    'referer': 'https://www.youtube.com',
-    'DNT': '?1',
-    'user-agent': getRandomUA(),
-  };
-  if (rangeHeader) headers['range'] = rangeHeader;
-
-  const fetchFn = youtube?.session?.http?.fetch_function || fetch;
-  
-  const resp = await fetchFn(fetchUrl, {
-    method: 'GET', headers, redirect: 'follow', signal,
-  });
-  if (!resp.ok) throw new Error(`Upstream fetch failed: ${resp.status}`);
-  return resp;
-}
-
 // ─── STREAMING HELPERS ───────────────────────────────────────────────────────
 
-function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
+// BUG FIX: Completely rewritten to handle errors better and use yt-dlp as primary
+async function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
   return new Promise((resolve, reject) => {
     const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
 
@@ -1359,28 +1001,44 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0) {
     const proc = spawn(FFMPEG, args);
 
     if (signal) {
-      signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
+      signal.addEventListener('abort', () => { 
+        try { 
+          proc.kill('SIGTERM'); 
+          setTimeout(() => proc.kill('SIGKILL'), 5000);
+        } catch {} 
+      }, { once: true });
     }
 
     let stderrData = '';
+    let hasOutput = false;
+    
     proc.stderr.on('data', d => {
       const msg = d.toString().trim();
       if (msg) {
         stderrData += msg + '\n';
-        if (msg.includes('Error') || msg.includes('error')) console.error('[ffmpeg]', msg);
+        // Only log actual errors, not warnings
+        if (msg.includes('Error') && !msg.includes('warning')) console.error('[ffmpeg]', msg);
       }
     });
 
+    proc.stdout.on('data', () => {
+      hasOutput = true;
+    });
+
     proc.stdout.pipe(res);
-    proc.stdout.on('error', () => {});
+    proc.stdout.on('error', (err) => {
+      console.error('[ffmpeg stdout error]', err.message);
+    });
 
     proc.on('close', code => {
       if (code === 0 || code === null || res.writableEnded) {
         resolve();
+      } else if (!hasOutput && code !== 0) {
+        // If we got no output and error, reject
+        reject(new Error(`ffmpeg failed with code ${code}: ${stderrData.substring(0, 200)}`));
       } else {
-        console.error(`[ffmpeg] Exit ${code}`);
-        if (stderrData) console.error('[ffmpeg stderr]', stderrData.substring(0, 500));
-        reject(new Error(`ffmpeg exited with code ${code}`));
+        // Partial success - client may have disconnected
+        resolve();
       }
     });
 
@@ -1691,33 +1349,41 @@ app.get('/api/feed', requireAuth, async (req, res) => {
 
 // ─── VIDEO INFO & FORMATS ─────────────────────────────────────────────────────
 
+// BUG FIX: Completely rewritten to use yt-dlp as primary source
 app.get('/api/info/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
-  let duration = 0, title = '';
-
   try {
-    const info = await getVideoInfo(videoId);
-    duration = info.basic_info?.duration || 0;
-    title = info.basic_info?.title || '';
-  } catch {}
-
-  if (!duration || !title) {
-    try {
-      const data = await getYtDlpFormatsWithRetry(videoId);
-      if (!duration && data.meta?.duration) duration = data.meta.duration;
-      if (!title && data.meta?.title) title = data.meta.title;
-    } catch {}
-  }
-
-  if (!duration && !title) {
-    return res.status(502).json({
-      error: 'Could not fetch video info',
-      fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
+    // Try yt-dlp first (more reliable)
+    const data = await getYtDlpFormatsWithRetry(videoId);
+    res.json({ 
+      duration: data.meta?.duration || 0, 
+      title: data.meta?.title || 'Video', 
+      source: 'yt-dlp' 
     });
+  } catch (e) {
+    console.error(`[info] yt-dlp failed for ${videoId}:`, e.message);
+    
+    // Fallback to youtubei.js
+    try {
+      if (!youtube || typeof youtube.getInfo !== 'function') {
+        throw new Error('YouTube API not available');
+      }
+      const info = await youtube.getInfo(videoId);
+      res.json({ 
+        duration: info.basic_info?.duration || 0, 
+        title: info.basic_info?.title || 'Video', 
+        source: 'youtubei.js' 
+      });
+    } catch (e2) {
+      console.error(`[info] youtubei.js also failed for ${videoId}:`, e2.message);
+      res.status(502).json({
+        error: 'Could not fetch video info',
+        details: e.message,
+        fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
+      });
+    }
   }
-
-  res.json({ duration, title, source: 'combined' });
 });
 
 app.get('/api/formats/:videoId', async (req, res) => {
@@ -1743,8 +1409,10 @@ app.get('/api/video/:videoId/details', async (req, res) => {
 
   if (!description) {
     try {
-      const info = await getVideoInfo(videoId);
-      description = info.basic_info?.short_description || '';
+      if (youtube && typeof youtube.getInfo === 'function') {
+        const info = await youtube.getInfo(videoId);
+        description = info.basic_info?.short_description || '';
+      }
     } catch {}
   }
 
@@ -1853,6 +1521,7 @@ app.get('/api/subtitles/:videoId/list', async (req, res) => {
 
 // ─── PROXY STREAMING ───────────────────────────────────────────────────────────
 
+// BUG FIX: Improved error handling and fallback
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', t = '0', start } = req.query;
@@ -1871,7 +1540,9 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
     const videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
 
-    if (videoFmt.acodec !== 'none') {
+    // If format has both audio and video, stream directly
+    if (videoFmt.acodec !== 'none' && videoFmt.vcodec !== 'none') {
+      console.log(`[proxy] Direct stream (has audio+video)`);
       const fetchHeaders = {
         'accept': '*/*',
         'origin': 'https://www.youtube.com',
@@ -1894,6 +1565,8 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
       await pipeline(Readable.fromWeb(resp.body), res);
     } else {
+      // Need to mux audio + video
+      console.log(`[proxy] Muxing required`);
       const audioFmt = pickYtDlpAudio(ytFmts);
 
       res.setHeader('Content-Type', 'video/mp4');
@@ -1918,6 +1591,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
 // ─── STREAM ───────────────────────────────────────────────────────────────────
 
+// BUG FIX: Now uses yt-dlp as primary source instead of youtubei.js
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality = '720', audioOnly = 'false' } = req.query;
@@ -1933,22 +1607,70 @@ app.get('/api/stream/:videoId', async (req, res) => {
   req.on('close', () => controller.abort());
 
   try {
-    const info = await getVideoInfo(videoId);
-    const formats = getFormatsFromInfo(info);
     const qualityNum = parseInt(quality, 10);
+    
+    // PRIMARY: Use yt-dlp (more reliable for streaming)
+    const data = await getYtDlpFormatsWithRetry(videoId);
+    const { formats: ytFmts } = data;
 
-    const format = audioOnly === 'true'
-      ? selectAudioFormat(formats)
-      : selectVideoFormat(formats, qualityNum);
-
-    const resp = await fetchFormatStream(format, info, controller.signal);
-    res.setHeader('Content-Type', format.mime_type || 'video/mp4');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    await pipeline(Readable.fromWeb(resp.body), res);
+    if (audioOnly === 'true') {
+      const audioFmt = pickYtDlpAudio(ytFmts);
+      const fetchHeaders = {
+        'accept': '*/*',
+        'origin': 'https://www.youtube.com',
+        'referer': 'https://www.youtube.com',
+        'user-agent': getRandomUA()
+      };
+      
+      const resp = await fetch(audioFmt.url, {
+        headers: fetchHeaders,
+        signal: controller.signal
+      });
+      
+      if (!resp.ok) throw new Error(`Upstream audio: ${resp.status}`);
+      
+      res.setHeader('Content-Type', audioFmt.ext === 'webm' ? 'audio/webm' : 'audio/mp4');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      await pipeline(Readable.fromWeb(resp.body), res);
+    } else {
+      const videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
+      
+      // If combined format available, stream directly
+      if (videoFmt.acodec !== 'none') {
+        const fetchHeaders = {
+          'accept': '*/*',
+          'origin': 'https://www.youtube.com',
+          'referer': 'https://www.youtube.com',
+          'user-agent': getRandomUA()
+        };
+        
+        const resp = await fetch(videoFmt.url, {
+          headers: fetchHeaders,
+          signal: controller.signal
+        });
+        
+        if (!resp.ok) throw new Error(`Upstream video: ${resp.status}`);
+        
+        res.setHeader('Content-Type', videoFmt.ext === 'webm' ? 'video/webm' : 'video/mp4');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        await pipeline(Readable.fromWeb(resp.body), res);
+      } else {
+        // Need to mux
+        const audioFmt = pickYtDlpAudio(ytFmts);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Cache-Control', 'no-cache');
+        await muxToResponse(videoFmt.url, audioFmt.url, res, controller.signal, 0);
+      }
+    }
   } catch (error) {
     if (!controller.signal.aborted) {
       console.error('[stream] error:', error.message);
-      if (!res.headersSent) res.status(502).json({ error: error.message });
+      if (!res.headersSent) {
+        res.status(502).json({ 
+          error: error.message,
+          fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` }
+        });
+      }
     }
   } finally {
     cleanup();
