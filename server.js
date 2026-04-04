@@ -148,195 +148,22 @@ function getRandomProxy() {
 fetchFreeProxies().catch(() => {});
 setInterval(() => fetchFreeProxies().catch(() => {}), PROXY_REFRESH_INTERVAL);
 
-// ─── AUTOMATIC PO TOKEN GENERATION ───────────────────────────────────────────
+// ─── DISABLED: AUTOMATIC PO TOKEN GENERATION (YouTube API changed) ───────────
+// The WAA API now returns 400 errors. PO tokens must be obtained manually
+// or through other means. Disabling this feature for now.
 
 const poTokenCache = new Map();
-const PO_TOKEN_TTL = 25 * 60 * 1000; // 25 minutes (tokens usually valid for ~30 min)
+const PO_TOKEN_TTL = 25 * 60 * 1000;
 
-// Global BotGuard state
-let bgConfig = null;
-let bgChallenge = null;
-
-async function fetchBotGuardChallenge() {
-  try {
-    // Fetch from YouTube's WAA API
-    const response = await fetch('https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/Create', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json+protobuf',
-        'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw',
-        'x-user-agent': 'grpc-web-javascript/0.1',
-      },
-      body: JSON.stringify(['yt-player'])
-    });
-
-    if (!response.ok) throw new Error(`WAA API error: ${response.status}`);
-    
-    const data = await response.json();
-    
-    // Parse challenge data (obfuscated format)
-    const challenge = parseChallengeData(data);
-    return challenge;
-  } catch (e) {
-    console.error('[bg-challenge] Failed to fetch:', e.message);
-    return null;
-  }
-}
-
-function parseChallengeData(rawData) {
-  try {
-    // Handle different response formats
-    if (!Array.isArray(rawData)) return null;
-    
-    // Extract based on known response structure
-    const messageId = rawData[0];
-    const challengeData = rawData[1];
-    
-    if (!challengeData || !Array.isArray(challengeData)) return null;
-    
-    const interpreterUrl = challengeData[0]?.[1];
-    const interpreterHash = challengeData[0]?.[0];
-    const program = challengeData[1];
-    const globalName = challengeData[2];
-    const clientExperimentsStateBlob = challengeData[3];
-    
-    return {
-      messageId,
-      interpreterUrl: interpreterUrl?.private_do_not_access_or_else_trusted_resource_url_wrapped_value || interpreterUrl,
-      interpreterHash,
-      program,
-      globalName,
-      clientExperimentsStateBlob
-    };
-  } catch (e) {
-    console.error('[bg-challenge] Parse error:', e.message);
-    return null;
-  }
-}
-
-async function loadBotGuardVM(interpreterUrl) {
-  try {
-    const url = interpreterUrl.startsWith('http') ? interpreterUrl : `https:${interpreterUrl}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': getRandomUA(),
-        'Accept': '*/*',
-      }
-    });
-    
-    if (!response.ok) throw new Error(`Failed to load VM: ${response.status}`);
-    
-    const script = await response.text();
-    
-    // Create JSDOM environment for BotGuard
-    const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', {
-      runScripts: 'dangerously',
-      url: 'https://www.youtube.com',
-      pretendToBeVisual: true,
-      resources: 'usable',
-    });
-    
-    // Inject the VM script
-    const scriptElement = dom.window.document.createElement('script');
-    scriptElement.textContent = script;
-    dom.window.document.head.appendChild(scriptElement);
-    
-    return dom;
-  } catch (e) {
-    console.error('[bg-vm] Failed to load:', e.message);
-    return null;
-  }
-}
-
+// Skip BotGuard - it's broken as of 2024
 async function generatePOToken(identifier, isVideoId = false) {
-  try {
-    // Check cache first
-    const cacheKey = isVideoId ? `vid:${identifier}` : `session:${identifier}`;
-    const cached = poTokenCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < PO_TOKEN_TTL) {
-      console.log(`[po-token] Using cached token for ${isVideoId ? 'video' : 'session'}:${identifier.substring(0, 10)}...`);
-      return cached.token;
-    }
-
-    // Step 1: Get challenge
-    if (!bgChallenge) {
-      bgChallenge = await fetchBotGuardChallenge();
-      if (!bgChallenge) throw new Error('Failed to fetch BotGuard challenge');
-    }
-
-    // Step 2: Load VM if not loaded
-    if (!bgConfig) {
-      const dom = await loadBotGuardVM(bgChallenge.interpreterUrl);
-      if (!dom) throw new Error('Failed to load BotGuard VM');
-      
-      // Get VM from global scope
-      const globalName = bgChallenge.globalName || 'botguard';
-      const vm = dom.window[globalName];
-      
-      if (!vm) throw new Error('BotGuard VM not found in global scope');
-      
-      bgConfig = { dom, vm, challenge: bgChallenge };
-    }
-
-    // Step 3: Create BotGuard client using bgutils-js
-    const bgClient = new BG.BotGuardClient({
-      program: bgChallenge.program,
-      globalName: bgChallenge.globalName,
-      vm: bgConfig.vm
-    });
-
-    // Step 4: Get integrity token
-    const webPoSignalOutput = [];
-    const botguardResponse = await bgClient.snapshot({
-      webPoSignalOutput,
-      contentBinding: isVideoId ? { videoId: identifier } : undefined
-    });
-
-    if (!botguardResponse) throw new Error('BotGuard snapshot failed');
-
-    // Step 5: Exchange for integrity token
-    const integrityResponse = await fetch('https://jnn-pa.googleapis.com/$rpc/google.internal.waa.v1.Waa/GenerateIT', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json+protobuf',
-        'x-goog-api-key': 'AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw',
-        'x-user-agent': 'grpc-web-javascript/0.1',
-      },
-      body: JSON.stringify(['yt-player', botguardResponse])
-    });
-
-    if (!integrityResponse.ok) throw new Error(`GenerateIT failed: ${integrityResponse.status}`);
-    
-    const integrityData = await integrityResponse.json();
-    const integrityToken = integrityData[0];
-    
-    if (!integrityToken) throw new Error('No integrity token received');
-
-    // Step 6: Mint PO token
-    const getMinter = webPoSignalOutput[0];
-    if (!getMinter) throw new Error('No minter function available');
-
-    const mintCallback = await getMinter(Buffer.from(integrityToken, 'base64'));
-    if (typeof mintCallback !== 'function') throw new Error('Invalid minter callback');
-
-    const poTokenBytes = await mintCallback(Buffer.from(identifier));
-    const poToken = Buffer.from(poTokenBytes).toString('base64');
-
-    // Cache the token
-    poTokenCache.set(cacheKey, { token: poToken, ts: Date.now() });
-    
-    console.log(`[po-token] Generated new token for ${isVideoId ? 'video' : 'session'}:${identifier.substring(0, 10)}...`);
-    return poToken;
-
-  } catch (e) {
-    console.error('[po-token] Generation failed:', e.message);
-    return null;
-  }
+  // Return null to disable PO token generation
+  // You can manually set PO_TOKEN env var instead
+  return process.env.PO_TOKEN || null;
 }
 
 // Generate visitor data if not provided
 function generateVisitorData() {
-  // Generate random visitor data (22 chars base64)
   const bytes = crypto.randomBytes(16);
   return bytes.toString('base64').replace(/[+/=]/g, '').substring(0, 22);
 }
@@ -391,7 +218,6 @@ let refreshTimer = null;
 const infoCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
 
-// FIX: Move trendingCache declaration BEFORE initYouTube
 const trendingCache = { data: null, ts: 0 };
 const TRENDING_TTL = 30 * 60 * 1000;
 
@@ -414,42 +240,52 @@ function hasCookies() {
   return fs.existsSync(COOKIES_PATH) && fs.statSync(COOKIES_PATH).size > 0;
 }
 
+// ─── FIXED: YouTube Initialization ───────────────────────────────────────────
+
 async function initYouTube() {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
 
   try {
+    // FIX: Use WEB client type instead of TV_EMBEDDED (which is broken)
+    // Also remove problematic options that cause "includes" error
     const options = {
-      client_type: ClientType.TV_EMBEDDED,
+      client_type: ClientType.WEB,  // Changed from TV_EMBEDDED
       generate_session_locally: true,
       cache: new UniversalCache(false),
       enable_session_cache: false,
     };
 
-    // Generate or use provided visitor data
-    const visitorData = process.env.YOUTUBE_VISITOR_DATA || generateVisitorData();
-    options.visitor_data = visitorData;
-    console.log('[youtubei.js] Using visitor_data:', visitorData.substring(0, 10) + '...');
+    // Only add visitor_data if explicitly provided
+    const visitorData = process.env.YOUTUBE_VISITOR_DATA;
+    if (visitorData) {
+      options.visitor_data = visitorData;
+      console.log('[youtubei.js] Using visitor_data:', visitorData.substring(0, 10) + '...');
+    }
 
-    // FIX: Add null checks and error handling for Innertube.create
+    // FIX: Wrap in try-catch with better error handling
     try {
       youtube = await Innertube.create(options);
+      console.log('>>> [SUCCESS] YouTube API Initialised (WEB client)');
     } catch (createError) {
       console.error('>>> [ERROR] Innertube.create failed:', createError.message);
+      
       // Try with minimal options as fallback
+      console.log('[youtubei.js] Retrying with minimal options...');
       youtube = await Innertube.create({
         client_type: ClientType.WEB,
         generate_session_locally: true,
       });
+      console.log('>>> [SUCCESS] YouTube API Initialised (fallback)');
     }
 
-    // FIX: Validate youtube object before using
+    // Validate youtube object
     if (!youtube || typeof youtube !== 'object') {
       throw new Error('Innertube.create returned invalid object');
     }
 
-    // FIX: Check if session exists before accessing properties
+    // Ensure session exists
     if (!youtube.session) {
-      console.warn('[youtubei.js] Warning: session not initialized, creating minimal session');
+      console.warn('[youtubei.js] Warning: session not initialized');
       youtube.session = {
         player: null,
         http: {
@@ -459,13 +295,15 @@ async function initYouTube() {
     }
 
     infoCache.clear();
-    console.log('>>> [SUCCESS] YouTube API Initialised (TV_EMBEDDED)');
-    console.log(`>>> [BYPASS] Cookies: ${hasCookies()}, PO Token Gen: Enabled, Proxies: ${proxyPool.length}`);
+    console.log(`>>> [BYPASS] Cookies: ${hasCookies()}, PO Token: ${process.env.PO_TOKEN ? 'Yes' : 'No'}, Proxies: ${proxyPool.length}`);
     
+    // Refresh every 25 minutes
     refreshTimer = setTimeout(initYouTube, 25 * 60 * 1000);
   } catch (e) {
     console.error('>>> [ERROR] Init Failed:', e.message);
-    // FIX: Ensure youtube is at least a valid object to prevent further crashes
+    console.error(e.stack);
+    
+    // Ensure youtube is at least a valid object to prevent further crashes
     if (!youtube) {
       youtube = {
         session: {
@@ -477,6 +315,8 @@ async function initYouTube() {
         getTrending: async () => { throw new Error('YouTube API not initialized'); }
       };
     }
+    
+    // Retry in 10 seconds
     setTimeout(initYouTube, 10000);
   }
 }
@@ -756,7 +596,6 @@ async function getVideoInfo(videoId) {
 
   if (!youtube) throw new Error('YouTube API not initialized');
   
-  // FIX: Check if getInfo exists and is a function
   if (typeof youtube.getInfo !== 'function') {
     throw new Error('YouTube API getInfo not available');
   }
@@ -805,8 +644,8 @@ function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
   return selectVideoFormat(formats, qualityLimit);
 }
 
-// Build yt-dlp args with automatic PO token generation
-async function buildYtDlpArgs(client = 'tv_embedded', videoId = null, extraArgs = []) {
+// Build yt-dlp args - simplified without broken PO token gen
+async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
   const args = [];
 
   // Cookies
@@ -814,32 +653,17 @@ async function buildYtDlpArgs(client = 'tv_embedded', videoId = null, extraArgs 
     args.push('--cookies', COOKIES_PATH);
   }
 
-  // Generate PO token if we have a video ID
-  let poToken = null;
-  let visitorData = process.env.YOUTUBE_VISITOR_DATA || generateVisitorData();
+  // Use manual PO_TOKEN from env if available
+  const poToken = process.env.PO_TOKEN;
+  const visitorData = process.env.YOUTUBE_VISITOR_DATA || generateVisitorData();
   
-  if (videoId) {
-    // Generate video-bound PO token
-    poToken = await generatePOToken(videoId, true);
-  }
-  
-  // If no video-specific token, generate session token
-  if (!poToken) {
-    poToken = await generatePOToken(visitorData, false);
-  }
-
   // Build extractor args
   let extractorArg = `youtube:player_client=${client}`;
   extractorArg += `;visitor_data=${visitorData}`;
   
   if (poToken) {
-    // Format: client+token for session-bound or client.context+token for video-bound
-    if (videoId) {
-      extractorArg += `;po_token=${client}.gvs+${poToken},${client}.player+${poToken}`;
-    } else {
-      extractorArg += `;po_token=${client}+${poToken}`;
-    }
-    console.log(`[yt-dlp] Using generated PO token for ${videoId || 'session'}`);
+    extractorArg += `;po_token=${poToken}`;
+    console.log(`[yt-dlp] Using PO_TOKEN from environment`);
   }
 
   args.push('--extractor-args', extractorArg);
@@ -864,12 +688,13 @@ function getProxyEnv() {
   return env;
 }
 
-// yt-dlp with automatic PO token generation
+// yt-dlp with retry logic
 async function getYtDlpFormats(videoId, attempt = 0) {
   const cached = ytdlpCache.get(videoId);
   if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
 
-  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios', 'web'];
+  // Try different clients in order
+  const clients = ['web', 'android', 'ios', 'mweb', 'tv_embedded'];
   const client = clients[attempt % clients.length];
 
   console.log(`[ytdlp] ${videoId} attempt ${attempt + 1} client=${client} cookies=${hasCookies()} proxy=${!!getRandomProxy()}`);
@@ -928,7 +753,7 @@ async function getYtDlpFormats(videoId, attempt = 0) {
 }
 
 async function getYtDlpFormatsWithRetry(videoId) {
-  const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios', 'web'];
+  const clients = ['web', 'android', 'ios', 'mweb', 'tv_embedded'];
   let lastError;
   for (let i = 0; i < clients.length; i++) {
     try {
@@ -976,7 +801,6 @@ function ytDlpAvailableHeights(formats) {
 }
 
 async function decipherUrl(format, info) {
-  // FIX: Check if session.player exists before using
   if (!youtube?.session?.player) {
     throw new Error('YouTube player not initialized');
   }
@@ -996,7 +820,6 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
   };
   if (rangeHeader) headers['range'] = rangeHeader;
 
-  // FIX: Check if http.fetch_function exists
   const fetchFn = youtube?.session?.http?.fetch_function || fetch;
   
   const resp = await fetchFn(fetchUrl, {
@@ -1086,7 +909,6 @@ app.get('/api/search', async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json({ videos: [], searchId: null });
 
-    // FIX: Check if search method exists
     if (typeof youtube.search !== 'function') {
       return res.status(503).json({ error: 'Search not available' });
     }
@@ -1151,7 +973,6 @@ app.get('/api/channel/search', async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json({ channels: [] });
 
-    // FIX: Check if search method exists
     if (typeof youtube.search !== 'function') {
       return res.status(503).json({ error: 'Search not available' });
     }
@@ -1211,7 +1032,7 @@ async function fetchChannelVideos(channelId, limit = 40) {
 
   for (const url of urls) {
     try {
-      const ytdlpArgs = await buildYtDlpArgs('tv_embedded');
+      const ytdlpArgs = await buildYtDlpArgs('web');
 
       const raw = await new Promise((resolve, reject) => {
         const args = [
@@ -1468,7 +1289,7 @@ app.get('/api/video/:videoId/details', async (req, res) => {
   }
 
   try {
-    const ytdlpArgs = await buildYtDlpArgs('tv_embedded', videoId);
+    const ytdlpArgs = await buildYtDlpArgs('web', videoId);
     const commentData = await new Promise((resolve) => {
       const args = [
         '--no-playlist', '--skip-download', '--write-comments', '--quiet', '--no-warnings',
@@ -1796,7 +1617,7 @@ app.get('/api/download/:videoId', async (req, res) => {
 // ─── Trending ────────────────────────────────────────────────────────────────
 
 async function fetchTrendingYtDlp() {
-  const ytdlpArgs = await buildYtDlpArgs('tv_embedded');
+  const ytdlpArgs = await buildYtDlpArgs('web');
   const raw = await new Promise((resolve, reject) => {
     const args = [
       '--flat-playlist', '--no-warnings', '--quiet',
@@ -1839,7 +1660,6 @@ app.get('/api/trending', async (req, res) => {
     let videos = [];
 
     try {
-      // FIX: Check if youtube exists and has getTrending method
       if (youtube && typeof youtube.getTrending === 'function') {
         const results = await youtube.getTrending();
         const items = results.videos || results.items || [];
@@ -1894,7 +1714,7 @@ async function fetchActualShorts() {
     'https://www.youtube.com/feed/trending',
   ];
 
-  const ytdlpArgs = await buildYtDlpArgs('tv_embedded');
+  const ytdlpArgs = await buildYtDlpArgs('web');
 
   for (const src of sources) {
     try {
@@ -1951,7 +1771,6 @@ async function fetchActualShorts() {
 
   if (youtube) {
     try {
-      // FIX: Check if search method exists
       if (typeof youtube.search === 'function') {
         const results = await youtube.search('#shorts', { type: 'video' });
         return (results.videos || [])
@@ -2004,13 +1823,12 @@ app.get('/api/health', (req, res) => {
     youtube: !!youtube && !!youtube.session,
     activeStreams,
     cookies: hasCookies(),
-    poTokenGen: true,
+    poToken: process.env.PO_TOKEN ? 'configured' : 'not configured',
     proxyPool: proxyPool.length,
-    poTokenCache: poTokenCache.size,
     bypass: {
       cookies: hasCookies(),
-      poToken: true,
-      visitorData: true,
+      poToken: !!process.env.PO_TOKEN,
+      visitorData: !!process.env.YOUTUBE_VISITOR_DATA,
       proxies: proxyPool.length > 0,
     }
   });
@@ -2022,7 +1840,7 @@ app.get('*', (req, res) => {
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Bot bypass: cookies=${hasCookies()} po_token_gen=enabled visitor_data=auto proxies=${proxyPool.length}`);
+  console.log(`Bot bypass: cookies=${hasCookies()} po_token=${!!process.env.PO_TOKEN} visitor_data=${!!process.env.YOUTUBE_VISITOR_DATA} proxies=${proxyPool.length}`);
 });
 
 const wss = new WebSocketServer({ server });
