@@ -147,20 +147,14 @@ fetchFreeProxies().catch(() => {});
 setInterval(() => fetchFreeProxies().catch(() => {}), PROXY_REFRESH_INTERVAL);
 
 // ─── DISABLED: AUTOMATIC PO TOKEN GENERATION (YouTube API changed) ───────────
-// The WAA API now returns 400 errors. PO tokens must be obtained manually
-// or through other means. Disabling this feature for now.
 
 const poTokenCache = new Map();
 const PO_TOKEN_TTL = 25 * 60 * 1000;
 
-// Skip BotGuard - it's broken as of 2024
 async function generatePOToken(identifier, isVideoId = false) {
-  // Return null to disable PO token generation
-  // You can manually set PO_TOKEN env var instead
   return process.env.PO_TOKEN || null;
 }
 
-// Generate visitor data if not provided
 function generateVisitorData() {
   const bytes = crypto.randomBytes(16);
   return bytes.toString('base64').replace(/[+/=]/g, '').substring(0, 22);
@@ -174,26 +168,21 @@ Platform.shim.eval = (data, _env) => {
 
 const _nativeFetch = Platform.shim.fetch ?? fetch;
 
-// FIX: Properly handle undefined init and headers
 Platform.shim.fetch = async (input, init = {}) => {
-  // Ensure init is always an object
   if (!init || typeof init !== 'object') {
     init = {};
   }
   
   const url = typeof input === 'string' ? input : input.url;
   
-  // FIX: Ensure headers exists and is an object before iterating
   if (init.headers && typeof init.headers === 'object') {
     const clean = {};
     for (const [k, v] of Object.entries(init.headers)) clean[k] = v;
     init = { ...init, headers: clean };
   } else {
-    // Ensure headers is at least an empty object
     init.headers = {};
   }
 
-  // Only add YouTube headers for YouTube domains
   if (url && (url.includes('youtube.com') || url.includes('googlevideo.com'))) {
     init.headers = {
       ...init.headers,
@@ -205,7 +194,6 @@ Platform.shim.fetch = async (input, init = {}) => {
     };
   }
 
-  // Use proxy for YouTube API calls
   if (url && (url.includes('youtubei.googleapis.com') || url.includes('googlevideo.com'))) {
     const proxy = getRandomProxy();
     if (proxy) {
@@ -256,30 +244,24 @@ async function initYouTube() {
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
 
   try {
-    // FIX: Use WEB client type instead of TV_EMBEDDED (which is broken)
-    // Also remove problematic options that cause "includes" error
     const options = {
-      client_type: ClientType.WEB,  // Changed from TV_EMBEDDED
+      client_type: ClientType.WEB,
       generate_session_locally: true,
       cache: new UniversalCache(false),
       enable_session_cache: false,
     };
 
-    // Only add visitor_data if explicitly provided
     const visitorData = process.env.YOUTUBE_VISITOR_DATA;
     if (visitorData) {
       options.visitor_data = visitorData;
       console.log('[youtubei.js] Using visitor_data:', visitorData.substring(0, 10) + '...');
     }
 
-    // FIX: Wrap in try-catch with better error handling
     try {
       youtube = await Innertube.create(options);
       console.log('>>> [SUCCESS] YouTube API Initialised (WEB client)');
     } catch (createError) {
       console.error('>>> [ERROR] Innertube.create failed:', createError.message);
-      
-      // Try with minimal options as fallback
       console.log('[youtubei.js] Retrying with minimal options...');
       youtube = await Innertube.create({
         client_type: ClientType.WEB,
@@ -288,12 +270,10 @@ async function initYouTube() {
       console.log('>>> [SUCCESS] YouTube API Initialised (fallback)');
     }
 
-    // Validate youtube object
     if (!youtube || typeof youtube !== 'object') {
       throw new Error('Innertube.create returned invalid object');
     }
 
-    // Ensure session exists
     if (!youtube.session) {
       console.warn('[youtubei.js] Warning: session not initialized');
       youtube.session = {
@@ -307,13 +287,11 @@ async function initYouTube() {
     infoCache.clear();
     console.log(`>>> [BYPASS] Cookies: ${hasCookies()}, PO Token: ${process.env.PO_TOKEN ? 'Yes' : 'No'}, Proxies: ${proxyPool.length}`);
     
-    // Refresh every 25 minutes
     refreshTimer = setTimeout(initYouTube, 25 * 60 * 1000);
   } catch (e) {
     console.error('>>> [ERROR] Init Failed:', e.message);
     console.error(e.stack);
     
-    // Ensure youtube is at least a valid object to prevent further crashes
     if (!youtube) {
       youtube = {
         session: {
@@ -326,7 +304,6 @@ async function initYouTube() {
       };
     }
     
-    // Retry in 10 seconds
     setTimeout(initYouTube, 10000);
   }
 }
@@ -437,7 +414,6 @@ setInterval(() => {
   for (const [key, val] of infoCache) {
     if (now - val.ts > CACHE_TTL) infoCache.delete(key);
   }
-  // Clean expired PO tokens
   for (const [key, val] of poTokenCache) {
     if (now - val.ts > PO_TOKEN_TTL) poTokenCache.delete(key);
   }
@@ -654,20 +630,16 @@ function selectBestFormat(formats, qualityLimit = 720, isAudio = false) {
   return selectVideoFormat(formats, qualityLimit);
 }
 
-// Build yt-dlp args - simplified without broken PO token gen
 async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
   const args = [];
 
-  // Cookies
   if (hasCookies()) {
     args.push('--cookies', COOKIES_PATH);
   }
 
-  // Use manual PO_TOKEN from env if available
   const poToken = process.env.PO_TOKEN;
   const visitorData = process.env.YOUTUBE_VISITOR_DATA || generateVisitorData();
   
-  // Build extractor args
   let extractorArg = `youtube:player_client=${client}`;
   extractorArg += `;visitor_data=${visitorData}`;
   
@@ -677,8 +649,6 @@ async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
   }
 
   args.push('--extractor-args', extractorArg);
-
-  // Headers
   args.push('--add-headers', 'Origin:https://www.youtube.com');
   args.push('--add-headers', 'Referer:https://www.youtube.com/');
   args.push('--add-headers', `User-Agent:${getRandomUA()}`);
@@ -687,7 +657,6 @@ async function buildYtDlpArgs(client = 'web', videoId = null, extraArgs = []) {
   return args;
 }
 
-// Get proxy environment for yt-dlp
 function getProxyEnv() {
   const proxy = getRandomProxy();
   const env = { ...process.env, HTTP_USER_AGENT: getRandomUA() };
@@ -698,12 +667,10 @@ function getProxyEnv() {
   return env;
 }
 
-// yt-dlp with retry logic
 async function getYtDlpFormats(videoId, attempt = 0) {
   const cached = ytdlpCache.get(videoId);
   if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
 
-  // Try different clients in order
   const clients = ['web', 'android', 'ios', 'mweb', 'tv_embedded'];
   const client = clients[attempt % clients.length];
 
@@ -1733,9 +1700,7 @@ async function fetchActualShorts() {
           '--flat-playlist', '--no-warnings', '--quiet',
           ...ytdlpArgs,
           '--playlist-items', '1-60',
-          '-JJ', src,
-        ];
-J', src,
+          '-J', src,
         ];
         const proc = spawn(YTDLP, args, { env: getProxyEnv() });
         let out = '';
@@ -1857,4 +1822,5 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
-  ws.on('message', () => ‌‍
+  ws.on('message', () => ws.send(JSON.stringify({ progress: 100 })));
+});
