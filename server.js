@@ -13,8 +13,6 @@ import crypto from 'crypto';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { BG } from 'bgutils-js';
-import { JSDOM } from 'jsdom';
 
 let FFMPEG;
 try {
@@ -168,7 +166,7 @@ function generateVisitorData() {
   return bytes.toString('base64').replace(/[+/=]/g, '').substring(0, 22);
 }
 
-// ─── PLATFORM SHIM WITH PROXY SUPPORT ─────────────────────────────────────────
+// ─── FIXED: Platform Shim with proper undefined handling ─────────────────────
 
 Platform.shim.eval = (data, _env) => {
   return new Function(data.output)();
@@ -176,16 +174,27 @@ Platform.shim.eval = (data, _env) => {
 
 const _nativeFetch = Platform.shim.fetch ?? fetch;
 
+// FIX: Properly handle undefined init and headers
 Platform.shim.fetch = async (input, init = {}) => {
+  // Ensure init is always an object
+  if (!init || typeof init !== 'object') {
+    init = {};
+  }
+  
   const url = typeof input === 'string' ? input : input.url;
   
-  if (init?.headers && typeof init.headers === 'object') {
+  // FIX: Ensure headers exists and is an object before iterating
+  if (init.headers && typeof init.headers === 'object') {
     const clean = {};
     for (const [k, v] of Object.entries(init.headers)) clean[k] = v;
     init = { ...init, headers: clean };
+  } else {
+    // Ensure headers is at least an empty object
+    init.headers = {};
   }
 
-  if (url.includes('youtube.com') || url.includes('googlevideo.com')) {
+  // Only add YouTube headers for YouTube domains
+  if (url && (url.includes('youtube.com') || url.includes('googlevideo.com'))) {
     init.headers = {
       ...init.headers,
       'Accept-Language': 'en-US,en;q=0.9',
@@ -196,7 +205,8 @@ Platform.shim.fetch = async (input, init = {}) => {
     };
   }
 
-  if (url.includes('youtubei.googleapis.com') || url.includes('googlevideo.com')) {
+  // Use proxy for YouTube API calls
+  if (url && (url.includes('youtubei.googleapis.com') || url.includes('googlevideo.com'))) {
     const proxy = getRandomProxy();
     if (proxy) {
       try {
@@ -1723,7 +1733,9 @@ async function fetchActualShorts() {
           '--flat-playlist', '--no-warnings', '--quiet',
           ...ytdlpArgs,
           '--playlist-items', '1-60',
-          '-J', src,
+          '-JJ', src,
+        ];
+J', src,
         ];
         const proc = spawn(YTDLP, args, { env: getProxyEnv() });
         let out = '';
@@ -1845,5 +1857,4 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 
 const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
-  ws.on('message', () => ws.send(JSON.stringify({ progress: 100 })));
-});
+  ws.on('message', () => ‌‍
