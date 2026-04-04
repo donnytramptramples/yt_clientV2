@@ -19,6 +19,8 @@
     "fluent-ffmpeg": "^2.1.2",
     "https-proxy-agent": "^7.0.6",
     "jsdom": "^26.0.0",
+    "puppeteer": "^21.11.0",
+    "socks-proxy-agent": "^8.0.5",
     "ws": "^8.20.0",
     "youtubei.js": "^17.0.1"
   },
@@ -32,5 +34,8 @@
     "react-dom": "^18.2.0",
     "tailwindcss": "^3.4.1",
     "vite": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
