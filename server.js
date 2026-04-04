@@ -391,6 +391,10 @@ let refreshTimer = null;
 const infoCache = new Map();
 const CACHE_TTL = 60 * 60 * 1000;
 
+// FIX: Move trendingCache declaration BEFORE initYouTube
+const trendingCache = { data: null, ts: 0 };
+const TRENDING_TTL = 30 * 60 * 1000;
+
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -426,7 +430,33 @@ async function initYouTube() {
     options.visitor_data = visitorData;
     console.log('[youtubei.js] Using visitor_data:', visitorData.substring(0, 10) + '...');
 
-    youtube = await Innertube.create(options);
+    // FIX: Add null checks and error handling for Innertube.create
+    try {
+      youtube = await Innertube.create(options);
+    } catch (createError) {
+      console.error('>>> [ERROR] Innertube.create failed:', createError.message);
+      // Try with minimal options as fallback
+      youtube = await Innertube.create({
+        client_type: ClientType.WEB,
+        generate_session_locally: true,
+      });
+    }
+
+    // FIX: Validate youtube object before using
+    if (!youtube || typeof youtube !== 'object') {
+      throw new Error('Innertube.create returned invalid object');
+    }
+
+    // FIX: Check if session exists before accessing properties
+    if (!youtube.session) {
+      console.warn('[youtubei.js] Warning: session not initialized, creating minimal session');
+      youtube.session = {
+        player: null,
+        http: {
+          fetch_function: fetch
+        }
+      };
+    }
 
     infoCache.clear();
     console.log('>>> [SUCCESS] YouTube API Initialised (TV_EMBEDDED)');
@@ -435,6 +465,18 @@ async function initYouTube() {
     refreshTimer = setTimeout(initYouTube, 25 * 60 * 1000);
   } catch (e) {
     console.error('>>> [ERROR] Init Failed:', e.message);
+    // FIX: Ensure youtube is at least a valid object to prevent further crashes
+    if (!youtube) {
+      youtube = {
+        session: {
+          player: null,
+          http: { fetch_function: fetch }
+        },
+        getInfo: async () => { throw new Error('YouTube API not initialized'); },
+        search: async () => { throw new Error('YouTube API not initialized'); },
+        getTrending: async () => { throw new Error('YouTube API not initialized'); }
+      };
+    }
     setTimeout(initYouTube, 10000);
   }
 }
@@ -713,6 +755,12 @@ async function getVideoInfo(videoId) {
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.info;
 
   if (!youtube) throw new Error('YouTube API not initialized');
+  
+  // FIX: Check if getInfo exists and is a function
+  if (typeof youtube.getInfo !== 'function') {
+    throw new Error('YouTube API getInfo not available');
+  }
+  
   const info = await youtube.getInfo(videoId);
   if (!info) throw new Error('No video info returned');
 
@@ -928,6 +976,10 @@ function ytDlpAvailableHeights(formats) {
 }
 
 async function decipherUrl(format, info) {
+  // FIX: Check if session.player exists before using
+  if (!youtube?.session?.player) {
+    throw new Error('YouTube player not initialized');
+  }
   const url = await format.decipher(youtube.session.player);
   if (!url) throw new Error('Could not decipher stream URL');
   return `${url}&cpn=${info.cpn}`;
@@ -944,7 +996,10 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
   };
   if (rangeHeader) headers['range'] = rangeHeader;
 
-  const resp = await youtube.session.http.fetch_function(fetchUrl, {
+  // FIX: Check if http.fetch_function exists
+  const fetchFn = youtube?.session?.http?.fetch_function || fetch;
+  
+  const resp = await fetchFn(fetchUrl, {
     method: 'GET', headers, redirect: 'follow', signal,
   });
   if (!resp.ok) throw new Error(`Upstream fetch failed: ${resp.status}`);
@@ -1031,6 +1086,11 @@ app.get('/api/search', async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json({ videos: [], searchId: null });
 
+    // FIX: Check if search method exists
+    if (typeof youtube.search !== 'function') {
+      return res.status(503).json({ error: 'Search not available' });
+    }
+
     const results = await youtube.search(q, { type: 'video' });
     const searchId = crypto.randomBytes(8).toString('hex');
     searchContinuations.set(searchId, results);
@@ -1090,6 +1150,11 @@ app.get('/api/channel/search', async (req, res) => {
     if (!youtube) return res.status(503).json({ error: 'API Initialising...' });
     const { q } = req.query;
     if (!q) return res.json({ channels: [] });
+
+    // FIX: Check if search method exists
+    if (typeof youtube.search !== 'function') {
+      return res.status(503).json({ error: 'Search not available' });
+    }
 
     const results = await youtube.search(q, { type: 'video' });
     const seen = new Set();
@@ -1730,9 +1795,6 @@ app.get('/api/download/:videoId', async (req, res) => {
 
 // ─── Trending ────────────────────────────────────────────────────────────────
 
-const trendingCache = { data: null, ts: 0 };
-const TRENDING_TTL = 30 * 60 * 1000;
-
 async function fetchTrendingYtDlp() {
   const ytdlpArgs = await buildYtDlpArgs('tv_embedded');
   const raw = await new Promise((resolve, reject) => {
@@ -1777,6 +1839,7 @@ app.get('/api/trending', async (req, res) => {
     let videos = [];
 
     try {
+      // FIX: Check if youtube exists and has getTrending method
       if (youtube && typeof youtube.getTrending === 'function') {
         const results = await youtube.getTrending();
         const items = results.videos || results.items || [];
@@ -1888,22 +1951,25 @@ async function fetchActualShorts() {
 
   if (youtube) {
     try {
-      const results = await youtube.search('#shorts', { type: 'video' });
-      return (results.videos || [])
-        .filter(v => v.id)
-        .slice(0, 30)
-        .map(v => ({
-          id: v.id,
-          title: v.title?.text || 'Short',
-          thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-          duration: v.duration?.text || '',
-          durationSecs: 0,
-          views: v.view_count?.text || '',
-          channel: v.author?.name || '',
-          channelId: v.author?.id || '',
-          channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-          isShort: true,
-        }));
+      // FIX: Check if search method exists
+      if (typeof youtube.search === 'function') {
+        const results = await youtube.search('#shorts', { type: 'video' });
+        return (results.videos || [])
+          .filter(v => v.id)
+          .slice(0, 30)
+          .map(v => ({
+            id: v.id,
+            title: v.title?.text || 'Short',
+            thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+            duration: v.duration?.text || '',
+            durationSecs: 0,
+            views: v.view_count?.text || '',
+            channel: v.author?.name || '',
+            channelId: v.author?.id || '',
+            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            isShort: true,
+          }));
+      }
     } catch (e) {
       console.warn('[shorts] search fallback failed:', e.message);
     }
@@ -1935,7 +2001,7 @@ app.get('/api/shorts', async (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    youtube: !!youtube,
+    youtube: !!youtube && !!youtube.session,
     activeStreams,
     cookies: hasCookies(),
     poTokenGen: true,
