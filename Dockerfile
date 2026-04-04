@@ -7,10 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
-    build-essential \        # <-- ADD THIS: includes make, gcc, g++
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -sSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
+# Download yt-dlp
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux \
     -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp
 
@@ -22,6 +23,7 @@ RUN npm ci --include=dev
 COPY . .
 RUN npm run build
 
+# Remove devDependencies for a smaller image
 RUN npm prune --production
 
 EXPOSE 8080
