@@ -151,11 +151,13 @@ export default function ShortsPage({ onVideoSelect, onChannelSelect }) {
   const containerRef = useRef(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
 
-  const load = () => {
+  const load = (force = false) => {
     setLoading(true);
     setError('');
     setCurrentIdx(0);
-    fetch('/api/shorts')
+    setShorts([]);
+    const url = force ? `/api/shorts?force=true&_=${Date.now()}` : '/api/shorts';
+    fetch(url)
       .then(r => r.json())
       .then(data => {
         if (data.error && !data.shorts?.length) throw new Error(data.error);
@@ -217,7 +219,7 @@ export default function ShortsPage({ onVideoSelect, onChannelSelect }) {
     return (
       <div className="flex flex-col items-center justify-center gap-4" style={{ height: 'calc(100vh - 80px)' }}>
         <p className="text-[var(--text-secondary)] text-center">{error || 'No Shorts available right now'}</p>
-        <button onClick={load} className="breeze-btn flex items-center gap-2">
+        <button onClick={() => load(true)} className="breeze-btn flex items-center gap-2">
           <RefreshCw size={14} />
           Try Again
         </button>
@@ -320,7 +322,7 @@ export default function ShortsPage({ onVideoSelect, onChannelSelect }) {
 
       {/* Refresh button */}
       <button
-        onClick={load}
+        onClick={() => load(true)}
         className="absolute top-0 right-4 md:right-8 flex items-center gap-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
       >
         <RefreshCw size={12} />

@@ -5,6 +5,25 @@ import {
   Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp, Bookmark, BookmarkCheck
 } from 'lucide-react';
 
+// sessionStorage cache — auto-cleared when the tab closes
+const SS_TTL = 30 * 60 * 1000; // 30 minutes
+
+function ssGet(key) {
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return null;
+    const { data, exp } = JSON.parse(raw);
+    if (Date.now() > exp) { sessionStorage.removeItem(key); return null; }
+    return data;
+  } catch { return null; }
+}
+
+function ssSet(key, data) {
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ data, exp: Date.now() + SS_TTL }));
+  } catch {}
+}
+
 function formatTime(secs) {
   const s = Math.floor(secs || 0);
   const h = Math.floor(s / 3600);
@@ -60,16 +79,29 @@ function parseVTT(text) {
 function SubtitleOverlay({ cue, currentTime, size, pos }) {
   if (!cue) return null;
 
-  const posStyle = {
-    bottom: { bottom: '68px', top: 'auto' },
-    center: { top: '50%', transform: 'translateX(-50%) translateY(-50%)', bottom: 'auto' },
-    top: { top: '12px', bottom: 'auto' },
-  }[pos] || { bottom: '68px' };
+  const baseStyle = {
+    left: '50%',
+    maxWidth: '90%',
+    textAlign: 'center'
+  };
+
+  let posStyle;
+  switch (pos) {
+    case 'center':
+      posStyle = { top: '50%', transform: 'translateX(-50%) translateY(-50%)', bottom: 'auto' };
+      break;
+    case 'top':
+      posStyle = { top: '12px', bottom: 'auto', transform: 'translateX(-50%)' };
+      break;
+    case 'bottom':
+    default:
+      posStyle = { bottom: '68px', top: 'auto', transform: 'translateX(-50%)' };
+  }
 
   return (
     <div
       className="absolute left-1/2 pointer-events-none text-center"
-      style={{ left: '50%', transform: pos === 'center' ? 'translateX(-50%) translateY(-50%)' : 'translateX(-50%)', ...posStyle, maxWidth: '90%' }}
+      style={{ ...baseStyle, ...posStyle }}
     >
       <span
         className="inline-block px-3 py-1 rounded"
@@ -81,7 +113,7 @@ function SubtitleOverlay({ cue, currentTime, size, pos }) {
             const active = currentTime >= word.start && currentTime < nextStart;
             return (
               <span key={i} style={{ color: active ? '#fff' : 'rgba(255,255,255,0.6)', fontWeight: active ? 700 : 400, transition: 'color 0.1s' }}>
-                {word.text}
+                {word.text}{' '}
               </span>
             );
           })
@@ -118,67 +150,24 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
   const [selBitrate, setSelBitrate] = useState('320k');
   const [selCompression, setSelCompression] = useState('5');
   const [downloading, setDownloading] = useState(false);
-  const [progress, setProgress] = useState(-1);
 
   const fmt = FORMAT_OPTIONS.find(f => f.value === selFormat);
 
-  const handleDownload = async () => {
+  const handleDownload = () => {
+    let url = `/api/download/${video.id}?format=${selFormat}&title=${encodeURIComponent(video.title || 'video')}`;
+    if (fmt?.hasQuality) url += `&quality=${selQuality}`;
+    if (fmt?.hasBitrate) url += `&bitrate=${selBitrate}`;
+    if (fmt?.hasCompression) url += `&compression=${selCompression}`;
+
+    const safeTitle = (video.title || 'video').replace(/[<>:"/\\|?*]/g, '');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${safeTitle}.${selFormat}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     setDownloading(true);
-    setProgress(0);
-    try {
-      let url = `/api/download/${video.id}?format=${selFormat}&title=${encodeURIComponent(video.title || 'video')}`;
-      if (fmt?.hasQuality) url += `&quality=${selQuality}`;
-      if (fmt?.hasBitrate) url += `&bitrate=${selBitrate}`;
-      if (fmt?.hasCompression) url += `&compression=${selCompression}`;
-
-      const response = await fetch(url);
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({ error: `Server error ${response.status}` }));
-        throw new Error(err.error || `Server error ${response.status}`);
-      }
-
-      const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
-      const cd = response.headers.get('content-disposition') || '';
-      const nameMatch = cd.match(/filename="([^"]+)"/);
-      const filename = nameMatch ? nameMatch[1] : `${(video.title || 'video').replace(/[<>:"/\\|?*]/g, '')}.${selFormat}`;
-
-      const reader = response.body.getReader();
-      const chunks = [];
-      let received = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (contentLength > 0) {
-          setProgress(Math.min(99, Math.round((received / contentLength) * 100)));
-        } else {
-          setProgress(101);
-        }
-      }
-
-      setProgress(100);
-
-      const mimeTypes = { mp4: 'video/mp4', mp3: 'audio/mpeg', flac: 'audio/flac', opus: 'audio/ogg', ogg: 'audio/ogg', m4a: 'audio/mp4' };
-      const blob = new Blob(chunks, { type: mimeTypes[selFormat] || 'application/octet-stream' });
-      if (blob.size === 0) throw new Error('Downloaded file is empty');
-
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 15000);
-      onClose();
-    } catch (err) {
-      alert(`Download failed: ${err.message}`);
-    } finally {
-      setDownloading(false);
-      setTimeout(() => setProgress(-1), 2000);
-    }
+    setTimeout(() => { setDownloading(false); onClose(); }, 3000);
   };
 
   return (
@@ -268,11 +257,7 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
         className="w-full flex items-center justify-center gap-2 py-2 rounded bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-all"
       >
         {downloading ? (
-          progress === 101
-            ? <><Loader2 size={14} className="animate-spin" /> Processing…</>
-            : progress >= 0 && progress < 100
-              ? <><Loader2 size={14} className="animate-spin" /> {progress}%</>
-              : <Loader2 size={14} className="animate-spin" />
+          <><Loader2 size={14} className="animate-spin" /> Starting…</>
         ) : (
           <><Download size={14} /> Download {selFormat.toUpperCase()}</>
         )}
@@ -336,11 +321,101 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   const [isSaved, setIsSaved] = useState(false);
   const [saveLoading, setSaveLoading] = useState(false);
 
+  // Resume prompt
+  const [resumeAt, setResumeAt] = useState(null);
+
+  // CSS-based fullscreen fallback (when native fullscreen is unavailable, e.g. in iframes)
+  const [cssFull, setCssFull] = useState(false);
+
+  // Skip indicator: { side: 'left'|'right', key: number }
+  const [skipIndicator, setSkipIndicator] = useState(null);
+  const skipIndicatorTimer = useRef(null);
+
+  // Double-tap tracking for touch seek
+  const lastTapRef = useRef({ time: 0, side: null });
+
   // Proxy seeking — all seeking goes through proxySeekRef; no native seeking for proxy streams
   const [proxySeek, setProxySeek] = useState(0);
   const proxySeekRef = useRef(0);
   const seekReloadRef = useRef(false);
   const wasPlayingRef = useRef(false);
+
+  // Define ALL callbacks first before using them in effects
+
+  const showControls = useCallback(() => {
+    setControlsVisible(true);
+    clearTimeout(hideControlsTimer.current);
+    if (playing) hideControlsTimer.current = setTimeout(() => setControlsVisible(false), 3000);
+  }, [playing]);
+
+  const showSkip = useCallback((side) => {
+    clearTimeout(skipIndicatorTimer.current);
+    setSkipIndicator({ side, key: Date.now() });
+    skipIndicatorTimer.current = setTimeout(() => setSkipIndicator(null), 700);
+  }, []);
+
+  const seekTo = useCallback((targetTime) => {
+    const v = videoRef.current;
+    if (!v) return;
+
+    const clamped = Math.max(0, Math.min(duration > 0 ? duration - 1 : 1e9, targetTime));
+    wasPlayingRef.current = !v.paused;
+
+    const currentProxyStart = proxySeekRef.current;
+
+    // Check every buffered range the element knows about (not just the last one),
+    // so that a seek to any already-downloaded position works natively without
+    // reloading the proxy stream — this covers both forward and backward seeks.
+    let isBuffered = false;
+    for (let i = 0; i < v.buffered.length; i++) {
+      const lo = currentProxyStart + v.buffered.start(i);
+      const hi = currentProxyStart + v.buffered.end(i);
+      if (clamped >= lo && clamped <= hi) { isBuffered = true; break; }
+    }
+
+    if (isBuffered && clamped >= currentProxyStart) {
+      // Native seek — instant, no server round-trip
+      v.currentTime = clamped - currentProxyStart;
+      setCurrentTime(clamped);
+      return;
+    }
+
+    // Target is outside any buffered range or before the proxy start —
+    // reload the proxy stream from the target position.
+    seekReloadRef.current = true;
+    setCurrentTime(clamped);
+    const newSeek = Math.floor(clamped);
+    proxySeekRef.current = newSeek;
+    setProxySeek(newSeek);
+  }, [duration]);
+
+  const changeQuality = useCallback((q) => {
+    const v = videoRef.current;
+    if (!v || q === quality) return;
+    const absoluteTime = Math.floor(proxySeekRef.current + (v.currentTime || 0));
+    wasPlayingRef.current = !v.paused;
+    // Set proxy to current position so new stream starts from here
+    proxySeekRef.current = absoluteTime;
+    setProxySeek(absoluteTime);
+    seekReloadRef.current = true;
+    setIsLoading(true);
+    setQuality(q);
+    setShowSettings(false);
+  }, [quality]);
+
+  const getProgressRatio = useCallback((e) => {
+    const rect = progressRef.current.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  }, []);
+
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => {});
+    else v.pause();
+  }, []);
+
+  // Now define effects that use the callbacks above
 
   useEffect(() => {
     setFormatsLoading(true);
@@ -361,35 +436,66 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     seekReloadRef.current = false;
     wasPlayingRef.current = false;
 
-    fetch(`/api/formats/${video.id}`)
-      .then(r => r.json())
-      .then(data => {
-        const heights = data.availableHeights || [];
-        setAvailableHeights(heights);
-        const preferred = [720, 1080, 480, 360, 240, 144];
-        const def = preferred.find(p => heights.includes(p)) || heights[0] || 360;
-        setQuality(String(def));
-      })
-      .catch(() => { setAvailableHeights([360]); setQuality('360'); })
-      .finally(() => setFormatsLoading(false));
+    // Formats — check sessionStorage first
+    const cachedFormats = ssGet(`formats:${video.id}`);
+    if (cachedFormats) {
+      const heights = cachedFormats.availableHeights || [];
+      setAvailableHeights(heights);
+      const preferred = [720, 1080, 480, 360, 240, 144];
+      const def = preferred.find(p => heights.includes(p)) || heights[0] || 360;
+      setQuality(String(def));
+      setFormatsLoading(false);
+    } else {
+      fetch(`/api/formats/${video.id}`)
+        .then(r => r.json())
+        .then(data => {
+          const heights = data.availableHeights || [];
+          setAvailableHeights(heights);
+          const preferred = [720, 1080, 480, 360, 240, 144];
+          const def = preferred.find(p => heights.includes(p)) || heights[0] || 360;
+          setQuality(String(def));
+          ssSet(`formats:${video.id}`, data);
+        })
+        .catch(() => { setAvailableHeights([360]); setQuality('360'); })
+        .finally(() => setFormatsLoading(false));
+    }
 
-    fetch(`/api/info/${video.id}`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.duration) { apiDuration.current = data.duration; setDuration(data.duration); }
-      })
-      .catch(() => {});
+    // Info (duration) — check sessionStorage first
+    const cachedInfo = ssGet(`info:${video.id}`);
+    if (cachedInfo) {
+      if (cachedInfo.duration) { apiDuration.current = cachedInfo.duration; setDuration(cachedInfo.duration); }
+    } else {
+      fetch(`/api/info/${video.id}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.duration) { apiDuration.current = data.duration; setDuration(data.duration); }
+          ssSet(`info:${video.id}`, data);
+        })
+        .catch(() => {});
+    }
 
-    fetch(`/api/subtitles/${video.id}/list`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.subtitles && data.subtitles.length > 0) {
-          setAvailableSubtitles(data.subtitles);
-          const enSub = data.subtitles.find(s => s.lang === 'en') || data.subtitles[0];
-          setCurrentSubtitleLang(enSub.lang);
-        }
-      })
-      .catch(() => {});
+    // Subtitles list — check sessionStorage first
+    const cachedSubs = ssGet(`subs:${video.id}`);
+    if (cachedSubs) {
+      if (cachedSubs.length > 0) {
+        setAvailableSubtitles(cachedSubs);
+        const enSub = cachedSubs.find(s => s.lang === 'en') || cachedSubs[0];
+        setCurrentSubtitleLang(enSub.lang);
+      }
+    } else {
+      fetch(`/api/subtitles/${video.id}/list`)
+        .then(r => r.json())
+        .then(data => {
+          const subs = data.subtitles || [];
+          if (subs.length > 0) {
+            setAvailableSubtitles(subs);
+            const enSub = subs.find(s => s.lang === 'en') || subs[0];
+            setCurrentSubtitleLang(enSub.lang);
+          }
+          ssSet(`subs:${video.id}`, subs);
+        })
+        .catch(() => {});
+    }
 
     setDetailsLoading(true);
     fetch(`/api/video/${video.id}/details`)
@@ -438,6 +544,23 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     const cue = subtitleCues.find(c => currentTime >= c.start && currentTime <= c.end) || null;
     setCurrentCue(cue);
   }, [currentTime, subtitleCues, subtitlesEnabled]);
+
+  // Check for saved resume position when video changes
+  useEffect(() => {
+    const saved = ssGet(`pos:${video.id}`);
+    if (saved && saved > 5) setResumeAt(saved);
+    else setResumeAt(null);
+  }, [video.id]);
+
+  // Save playback position every 5 seconds
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (currentTime > 5 && duration > 0 && currentTime < duration - 5) {
+        ssSet(`pos:${video.id}`, currentTime);
+      }
+    }, 5000);
+    return () => clearInterval(id);
+  }, [video.id, currentTime, duration]);
 
   const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
 
@@ -551,73 +674,40 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
 
   useEffect(() => {
-    const onChange = () => setFullscreen(!!document.fullscreenElement);
+    const onChange = () => {
+      const isFs = !!document.fullscreenElement;
+      setFullscreen(isFs);
+      if (!isFs) setCssFull(false); // sync CSS fallback when native exits
+    };
     document.addEventListener('fullscreenchange', onChange);
     return () => document.removeEventListener('fullscreenchange', onChange);
   }, []);
 
-  const showControls = useCallback(() => {
-    setControlsVisible(true);
-    clearTimeout(hideControlsTimer.current);
-    if (playing) hideControlsTimer.current = setTimeout(() => setControlsVisible(false), 3000);
-  }, [playing]);
+  // Keyboard: Escape exits CSS fullscreen; ArrowLeft/Right seek ±10 s
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && cssFull) { setCssFull(false); setFullscreen(false); return; }
+      // Don't fire when focus is inside an input / textarea
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        seekTo(currentTime - 10);
+        showSkip('left');
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        seekTo(currentTime + 10);
+        showSkip('right');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [cssFull, currentTime, seekTo, showSkip]);
 
   useEffect(() => {
     if (!playing) setControlsVisible(true);
     else hideControlsTimer.current = setTimeout(() => setControlsVisible(false), 3000);
     return () => clearTimeout(hideControlsTimer.current);
   }, [playing]);
-
-  // FIXED: seekTo uses proxy seek exclusively. Only falls back to native seek
-  // if the target is within the already-buffered range (instant, no reload).
-  const seekTo = useCallback((targetTime) => {
-    const v = videoRef.current;
-    if (!v) return;
-
-    const clamped = Math.max(0, Math.min(duration > 0 ? duration - 1 : 1e9, targetTime));
-    wasPlayingRef.current = !v.paused;
-
-    // Check if target is already buffered (no need to reload)
-    const currentProxyStart = proxySeekRef.current;
-    const bufferedMax = v.buffered.length > 0
-      ? currentProxyStart + v.buffered.end(v.buffered.length - 1)
-      : currentProxyStart;
-
-    if (clamped >= currentProxyStart && clamped <= bufferedMax) {
-      // Native seek within buffered range — fast and no reload
-      v.currentTime = clamped - currentProxyStart;
-      setCurrentTime(clamped);
-      return;
-    }
-
-    // Outside buffered range — reload stream at new position
-    seekReloadRef.current = true;
-    setCurrentTime(clamped);
-    const newSeek = Math.floor(clamped);
-    proxySeekRef.current = newSeek;
-    setProxySeek(newSeek);
-  }, [duration]);
-
-  // FIXED: changeQuality sets proxySeek directly to current absolute position
-  // so the new stream starts from exactly where we are — no native seek needed.
-  const changeQuality = useCallback((q) => {
-    const v = videoRef.current;
-    if (!v || q === quality) return;
-    const absoluteTime = Math.floor(proxySeekRef.current + (v.currentTime || 0));
-    wasPlayingRef.current = !v.paused;
-    // Set proxy to current position so new stream starts from here
-    proxySeekRef.current = absoluteTime;
-    setProxySeek(absoluteTime);
-    seekReloadRef.current = true;
-    setIsLoading(true);
-    setQuality(q);
-    setShowSettings(false);
-  }, [quality]);
-
-  const getProgressRatio = useCallback((e) => {
-    const rect = progressRef.current.getBoundingClientRect();
-    return Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  }, []);
 
   const onProgressMouseDown = (e) => {
     e.preventDefault();
@@ -635,13 +725,6 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [draggingProgress, duration, seekTo, getProgressRatio]);
 
-  const togglePlay = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (v.paused) v.play().catch(() => {});
-    else v.pause();
-  };
-
   const toggleMute = () => { const v = videoRef.current; v.muted = !muted; setMuted(!muted); };
 
   const setVolumeVal = (val) => {
@@ -651,9 +734,53 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
   };
 
   const toggleFullscreen = () => {
-    if (!document.fullscreenElement) containerRef.current.requestFullscreen();
-    else document.exitFullscreen();
+    if (fullscreen || cssFull) {
+      // Exit fullscreen
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      } else {
+        setCssFull(false);
+        setFullscreen(false);
+      }
+    } else {
+      // Try native fullscreen first, fall back to CSS
+      if (containerRef.current?.requestFullscreen) {
+        containerRef.current.requestFullscreen().catch(() => {
+          setCssFull(true);
+          setFullscreen(true);
+        });
+      } else {
+        setCssFull(true);
+        setFullscreen(true);
+      }
+    }
   };
+
+  // Double-tap left/right to seek ±10 s; single tap toggles play (debounced).
+  const singleTapTimer = useRef(null);
+  const handleTouchEnd = useCallback((e) => {
+    if (e.target.closest('.video-controls-layer')) return;
+    const touch = e.changedTouches[0];
+    if (!touch || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const side = touch.clientX < rect.left + rect.width / 2 ? 'left' : 'right';
+    const now = Date.now();
+    const last = lastTapRef.current;
+
+    if (now - last.time < 300 && last.side === side) {
+      clearTimeout(singleTapTimer.current);
+      e.preventDefault();
+      seekTo(currentTime + (side === 'left' ? -10 : 10));
+      showSkip(side);
+      showControls();
+      lastTapRef.current = { time: 0, side: null };
+    } else {
+      lastTapRef.current = { time: now, side };
+      clearTimeout(singleTapTimer.current);
+      singleTapTimer.current = setTimeout(() => { togglePlay(); showControls(); }, 220);
+      e.preventDefault();
+    }
+  }, [currentTime, seekTo, showSkip, showControls, togglePlay]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
@@ -669,13 +796,31 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
         Back to results
       </button>
 
+      {/* Resume prompt */}
+      {resumeAt && (
+        <div className="mb-3 flex items-center gap-3 px-4 py-2 rounded-lg bg-[var(--bg-secondary)] border border-[var(--border)] text-sm">
+          <span className="text-[var(--text-secondary)]">Resume from <strong className="text-[var(--text-primary)]">{formatTime(resumeAt)}</strong>?</span>
+          <button
+            className="px-3 py-1 rounded bg-[var(--accent)] text-white text-xs font-semibold hover:opacity-90"
+            onClick={() => { seekTo(resumeAt); setResumeAt(null); }}
+          >Resume</button>
+          <button
+            className="px-3 py-1 rounded bg-[var(--border)] text-[var(--text-secondary)] text-xs hover:bg-[var(--bg-primary)]"
+            onClick={() => { sessionStorage.removeItem(`pos:${video.id}`); setResumeAt(null); }}
+          >Start over</button>
+        </div>
+      )}
+
       {/* Video container */}
       <div
         ref={containerRef}
-        className="video-player-container"
+        className={`video-player-container${cssFull ? ' css-fullscreen' : ''}`}
         onMouseMove={showControls}
         onClick={() => { togglePlay(); showControls(); }}
         onDoubleClick={toggleFullscreen}
+        onTouchEnd={handleTouchEnd}
+        onKeyDown={(e) => { if (e.key === 'Escape' && cssFull) { setCssFull(false); setFullscreen(false); } }}
+        tabIndex={-1}
       >
         {proxyUrl && (
           <video
@@ -714,9 +859,30 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
           </div>
         )}
 
+        {/* Double-tap / arrow-key skip indicator */}
+        {skipIndicator && (
+          <div
+            key={skipIndicator.key}
+            className={`absolute inset-y-0 flex items-center justify-center pointer-events-none
+              ${skipIndicator.side === 'left' ? 'left-0 w-1/3' : 'right-0 w-1/3'}`}
+          >
+            <div className="flex flex-col items-center gap-1 animate-skip-fade">
+              <div className="rounded-full bg-white/20 backdrop-blur-sm p-4">
+                {skipIndicator.side === 'left'
+                  ? <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+                  : <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M6 18l8.5-6L6 6v12zm2-8.14L11.03 12 8 14.14V9.86zM16 6h2v12h-2z"/></svg>
+                }
+              </div>
+              <span className="text-white text-sm font-semibold drop-shadow">
+                {skipIndicator.side === 'left' ? '-10s' : '+10s'}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* Controls */}
         <div
-          className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
+          className={`video-controls-layer absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
           style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 40%)' }}
           onClick={e => e.stopPropagation()}
         >

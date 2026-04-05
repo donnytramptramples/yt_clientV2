@@ -6,6 +6,9 @@ if [ -n "$NODE_PATH" ]; then
 fi
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
 
+# Ensure native modules are compiled for the current Node.js version
+npm_config_build_from_source=true npm rebuild better-sqlite3 --silent 2>/dev/null || true
+
 # Start the backend API on port 10000 (vite proxies to this port)
 PORT=10000 node server.js &
 BACKEND_PID=$!

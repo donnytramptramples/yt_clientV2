@@ -150,12 +150,14 @@ body {
   aspect-ratio: auto;
 }
 
-/* Portrait Mode - Center Landscape Video */
+/* Portrait Mode - Center Landscape Video (native fullscreen) */
 @media (orientation: portrait) {
   .video-player-container:fullscreen,
   .video-player-container:-webkit-full-screen,
   .video-player-container:-moz-full-screen {
     flex-direction: column;
+    align-items: center;
+    justify-content: center;
   }
 
   .video-player-container:fullscreen .video-element,
@@ -163,7 +165,38 @@ body {
   .video-player-container:-moz-full-screen .video-element {
     width: 100%;
     height: auto;
-    max-height: 100vh;
+    max-width: 100vw;
+    max-height: 56.25vw; /* 16:9 constrained to screen width */
+    aspect-ratio: 16 / 9;
+  }
+}
+
+/* CSS Fullscreen Fallback (used when native fullscreen is blocked, e.g. in iframes) */
+.video-player-container.css-fullscreen {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 9999 !important;
+  width: 100vw !important;
+  height: 100dvh !important;
+  border-radius: 0 !important;
+  overflow: hidden !important;
+  background: #000 !important;
+}
+
+/* Fill the entire container — override the aspect-ratio trick */
+.video-player-container.css-fullscreen .video-element {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  aspect-ratio: unset !important;
+  object-fit: contain !important;
+}
+
+/* Portrait phone + CSS fullscreen: still contain, don't stretch */
+@media (orientation: portrait) {
+  .video-player-container.css-fullscreen .video-element {
+    object-fit: contain !important;
   }
 }
 
@@ -193,4 +226,15 @@ video::cue {
   0% { width: 0%; margin-left: 0; }
   50% { width: 70%; margin-left: 15%; }
   100% { width: 0%; margin-left: 100%; }
+}
+
+@keyframes skip-fade {
+  0%   { opacity: 0; transform: scale(0.8); }
+  15%  { opacity: 1; transform: scale(1); }
+  70%  { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(0.9); }
+}
+
+.animate-skip-fade {
+  animation: skip-fade 0.7s ease forwards;
 }
