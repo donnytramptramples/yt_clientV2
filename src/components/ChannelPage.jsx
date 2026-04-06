@@ -1,14 +1,16 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { ArrowLeft, Loader2, Users, SortAsc, ChevronDown, Search, X } from 'lucide-react';
 import VideoCard from './VideoCard';
 
-const PAGE_SIZE = 12;
+const SERVER_PAGE_SIZE = 60;
 
 export default function ChannelPage({ channelId, onBack, onVideoSelect, user, onSubscribeChange }) {
   const [channel, setChannel] = useState(null);
   const [allVideos, setAllVideos] = useState([]);
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const [hasMore, setHasMore] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   const [sort, setSort] = useState('newest');
   const [subscribed, setSubscribed] = useState(false);
@@ -16,28 +18,60 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   const [retryKey, setRetryKey] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
 
+  const fetchPage = useCallback(async (channelId, sort, page) => {
+    const r = await fetch(`/api/channel/${channelId}/videos?sort=${sort}&page=${page}&pageSize=${SERVER_PAGE_SIZE}`);
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      throw new Error(text.startsWith('<') ? `Server error ${r.status}` : text || `Server error ${r.status}`);
+    }
+    return r.json();
+  }, []);
+
+  // Initial load: reset everything and fetch page 1
   useEffect(() => {
     if (!channelId) return;
     setLoading(true);
     setError('');
-    setVisibleCount(PAGE_SIZE);
+    setAllVideos([]);
+    setCurrentPage(1);
+    setHasMore(false);
     setSearchQuery('');
-    fetch(`/api/channel/${channelId}/videos?sort=${sort}`)
-      .then(async r => {
-        if (!r.ok) {
-          const text = await r.text().catch(() => '');
-          throw new Error(text.startsWith('<') ? `Server error ${r.status}` : text || `Server error ${r.status}`);
-        }
-        return r.json();
-      })
+
+    fetchPage(channelId, sort, 1)
       .then(data => {
         if (data.error) { setError(data.error); return; }
         setChannel(data.channel || null);
         setAllVideos(data.videos || []);
+        setHasMore(data.hasMore ?? false);
+        setCurrentPage(1);
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
   }, [channelId, sort, retryKey]);
+
+  const handleLoadMore = async () => {
+    if (loadingMore || !hasMore) return;
+    setLoadingMore(true);
+    try {
+      const nextPage = currentPage + 1;
+      const data = await fetchPage(channelId, sort, nextPage);
+      if (data.videos?.length > 0) {
+        setAllVideos(prev => {
+          const existingIds = new Set(prev.map(v => v.id));
+          const newVids = data.videos.filter(v => !existingIds.has(v.id));
+          return [...prev, ...newVids];
+        });
+        setCurrentPage(nextPage);
+        setHasMore(data.hasMore ?? false);
+      } else {
+        setHasMore(false);
+      }
+    } catch (e) {
+      console.error('Load more error:', e.message);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   useEffect(() => {
     if (!user || !channelId) return;
@@ -72,15 +106,16 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     finally { setSubLoading(false); }
   };
 
-  // Filter videos by search query (case-insensitive title match)
+  // Client-side filter for in-channel search (over already-fetched videos)
   const filteredVideos = useMemo(() => {
     if (!searchQuery.trim()) return allVideos;
     const q = searchQuery.trim().toLowerCase();
     return allVideos.filter(v => v.title?.toLowerCase().includes(q));
   }, [allVideos, searchQuery]);
 
-  const videos = filteredVideos.slice(0, visibleCount);
-  const hasMore = visibleCount < filteredVideos.length;
+  const countLabel = searchQuery
+    ? `${filteredVideos.length} results`
+    : `${allVideos.length}${hasMore ? '+' : ''} Videos`;
 
   return (
     <div className="max-w-6xl mx-auto">
@@ -140,9 +175,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
 
           {/* Controls row: count + search + sort */}
           <div className="flex flex-wrap items-center gap-3 mb-4">
-            <h2 className="text-lg font-semibold flex-shrink-0">
-              {searchQuery ? `${filteredVideos.length} results` : `${allVideos.length} Videos`}
-            </h2>
+            <h2 className="text-lg font-semibold flex-shrink-0">{countLabel}</h2>
 
             {/* Video search within channel */}
             <div className="flex-1 min-w-[180px] max-w-xs relative">
@@ -150,13 +183,13 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
               <input
                 type="text"
                 value={searchQuery}
-                onChange={e => { setSearchQuery(e.target.value); setVisibleCount(PAGE_SIZE); }}
+                onChange={e => setSearchQuery(e.target.value)}
                 placeholder="Search videos…"
                 className="w-full breeze-input pl-8 pr-8 text-sm py-1.5"
               />
               {searchQuery && (
                 <button
-                  onClick={() => { setSearchQuery(''); setVisibleCount(PAGE_SIZE); }}
+                  onClick={() => setSearchQuery('')}
                   className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                 >
                   <X size={13} />
@@ -178,7 +211,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
             </div>
           </div>
 
-          {videos.length === 0 ? (
+          {filteredVideos.length === 0 ? (
             <div className="flex items-center justify-center h-40">
               <p className="text-[var(--text-secondary)]">
                 {searchQuery ? `No videos match "${searchQuery}"` : 'No videos found for this channel.'}
@@ -187,21 +220,33 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
           ) : (
             <>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {videos.map(video => (
+                {filteredVideos.map(video => (
                   <VideoCard key={video.id} video={video} onClick={() => onVideoSelect(video)} onChannelClick={() => {}} />
                 ))}
               </div>
 
-              {hasMore && (
+              {/* Load more — only show when not searching (search filters already-fetched videos) */}
+              {!searchQuery && hasMore && (
                 <div className="flex justify-center mt-8">
                   <button
-                    onClick={() => setVisibleCount(c => c + PAGE_SIZE)}
-                    className="flex items-center gap-2 px-6 py-2.5 rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] hover:bg-[var(--border)] transition-colors text-sm font-medium"
+                    onClick={handleLoadMore}
+                    disabled={loadingMore}
+                    className="flex items-center gap-2 px-6 py-2.5 rounded-full bg-[var(--bg-secondary)] border border-[var(--border)] hover:bg-[var(--border)] transition-colors text-sm font-medium disabled:opacity-60"
                   >
-                    <ChevronDown size={16} />
-                    Load More ({filteredVideos.length - visibleCount} remaining)
+                    {loadingMore ? (
+                      <Loader2 size={16} className="animate-spin" />
+                    ) : (
+                      <ChevronDown size={16} />
+                    )}
+                    {loadingMore ? 'Loading…' : `Load More Videos`}
                   </button>
                 </div>
+              )}
+
+              {!searchQuery && !hasMore && allVideos.length > 0 && (
+                <p className="text-center text-[var(--text-secondary)] text-sm mt-8">
+                  All {allVideos.length} videos loaded
+                </p>
               )}
             </>
           )}

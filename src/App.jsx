@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Sun, Moon, Rss, Search, LogOut, User, Zap, TrendingUp, Bookmark } from 'lucide-react';
+import { Sun, Moon, Rss, Search, LogOut, User, Zap, Bookmark, Sliders } from 'lucide-react';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
 import VideoPlayer from './components/VideoPlayer';
@@ -8,6 +8,10 @@ import ChannelPage from './components/ChannelPage';
 import FeedPage from './components/FeedPage';
 import ShortsPage from './components/ShortsPage';
 import SavedPage from './components/SavedPage';
+import AdminPage from './components/AdminPage';
+import FeedSettingsModal from './components/FeedSettingsModal';
+
+const isAdminPath = window.location.pathname === '/admin';
 
 function App() {
   const [darkMode, setDarkMode] = useState(true);
@@ -15,8 +19,9 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedVideo, setSelectedVideo] = useState(null);
   const [selectedChannel, setSelectedChannel] = useState(null);
-  const [view, setView] = useState('feed'); // feed | search | shorts | saved
+  const [view, setView] = useState('feed');
   const [channelRefreshKey, setChannelRefreshKey] = useState(0);
+  const [showFeedSettings, setShowFeedSettings] = useState(false);
 
   useEffect(() => {
     if (darkMode) document.documentElement.classList.add('dark');
@@ -24,11 +29,20 @@ function App() {
   }, [darkMode]);
 
   useEffect(() => {
+    if (isAdminPath) return;
     fetch('/api/auth/me', { credentials: 'include' })
       .then(r => r.ok ? r.json() : null)
       .then(data => setUser(data?.user || null))
       .catch(() => setUser(null));
   }, []);
+
+  if (isAdminPath) {
+    return (
+      <div className={darkMode ? 'dark' : ''}>
+        <AdminPage />
+      </div>
+    );
+  }
 
   const handleLogout = async () => {
     await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
@@ -92,7 +106,6 @@ function App() {
         <div className="flex items-center gap-3 max-w-6xl mx-auto w-full">
           {isMain && (
             <>
-              {/* Feed */}
               <button
                 onClick={() => goToView('feed')}
                 className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'feed' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
@@ -101,7 +114,6 @@ function App() {
                 <Rss size={18} />
               </button>
 
-              {/* Shorts */}
               <button
                 onClick={() => goToView('shorts')}
                 className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'shorts' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
@@ -110,13 +122,20 @@ function App() {
                 <Zap size={18} />
               </button>
 
-              {/* Saved Videos */}
               <button
                 onClick={() => goToView('saved')}
                 className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'saved' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
                 title="Saved Videos"
               >
                 <Bookmark size={18} />
+              </button>
+
+              <button
+                onClick={() => setShowFeedSettings(true)}
+                className="p-2 rounded transition-colors flex-shrink-0 hover:bg-[var(--bg-primary)] hover:text-[var(--accent)]"
+                title="Settings"
+              >
+                <Sliders size={18} />
               </button>
             </>
           )}
@@ -151,12 +170,12 @@ function App() {
         </div>
       </header>
 
-      {/* Shorts gets no padding so it can fill the full available height */}
       <main className={`flex-1 overflow-y-auto ${isShorts ? '' : 'p-4 md:p-6'}`}>
         <div className={isShorts ? 'h-full' : 'max-w-6xl mx-auto'}>
           {selectedVideo ? (
             <VideoPlayer
               video={selectedVideo}
+              user={user}
               onBack={handleBack}
               onChannelSelect={handleChannelSelect}
             />
@@ -194,6 +213,15 @@ function App() {
           )}
         </div>
       </main>
+
+      {showFeedSettings && (
+        <FeedSettingsModal
+          onClose={() => setShowFeedSettings(false)}
+          onSaved={() => {}}
+          user={user}
+          onLogout={handleLogout}
+        />
+      )}
     </div>
   );
 }

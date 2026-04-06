@@ -266,7 +266,7 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
   );
 }
 
-export default function VideoPlayer({ video, onBack, onChannelSelect }) {
+export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
   const progressRef = useRef(null);
@@ -561,6 +561,25 @@ export default function VideoPlayer({ video, onBack, onChannelSelect }) {
     }, 5000);
     return () => clearInterval(id);
   }, [video.id, currentTime, duration]);
+
+  // Record watch history when video loads (user is watching)
+  useEffect(() => {
+    if (!video?.id || !video?.title || !user) return;
+    const timer = setTimeout(() => {
+      fetch(`/api/watch/${video.id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          title: video.title,
+          channel: video.channel || '',
+          channelId: video.channelId || '',
+          thumbnail: video.thumbnail || '',
+        }),
+      }).catch(() => {});
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [video.id]);
 
   const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
 

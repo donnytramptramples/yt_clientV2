@@ -9,26 +9,36 @@ A high-performance YouTube client with proxied streaming, downloads, subtitles, 
 - `yt-dlp` for format extraction with multi-client fallback (tv_embedded → android_vr → mweb → android → ios)
 - `ffmpeg` for real-time muxing of separate video+audio streams and audio format transcoding
 - SQLite via `better-sqlite3`:
-  - `data/auth.db` — users + sessions (30-day cookie tokens, hashed passwords via bcryptjs)
+  - `data/auth.db` — users + sessions + admin_config + admin_settings + admin_sessions + watch_history + user_preferences
   - `data/subscriptions.db` — channel subscriptions per user
+  - `data/saved.db` — saved/bookmarked videos
 - Custom cookie-based auth (no express-session needed)
+- Admin panel at `/admin` (secret page, bcrypt-hashed password, set once)
 
 **Frontend** (`src/`) — React + Vite + TailwindCSS on port 5000 (dev):
 - Proxies `/api/*` to backend at port 10000
 
 ## Key Features
 
-1. **Auth** — Login/signup on first visit, 30-day persistent sessions, stored in SQLite
+1. **Auth** — Login/signup on first visit, 30-day persistent sessions, stored in SQLite. Admin can set max account/connection limits.
 2. **Search** — Video + channel search with Load More pagination
-3. **Feed (YT-like algorithm)** — Mixes subscription content (high weight, 65% recency + 20% popularity + 10% diversity + 5% random) with trending recommendations (lower weight). Falls back to full trending feed when no subscriptions.
+3. **Feed (YT-like algorithm)** — Mixes subscription content with trending. User-configurable via Feed Settings (slider for subscription weight, trending weight, toggle trending). Algorithm scores use recency + popularity + randomness. Weights from user_preferences table.
 4. **Subscriptions** — Subscribe/unsubscribe from channel pages
-5. **Channel Pages** — Search for channels, view all videos, sort by newest/oldest/popular. Handles UC..., @handle, and plain handle formats.
-6. **Video Playback** — Custom proxy player with quality switching, speed control
-7. **Subtitles** — Custom VTT renderer with word-level karaoke highlighting (YouTube `<c>` tags); simple toggle button; size-adjustable (12–36px); position top/center/bottom; auto-translate via Google Translate unofficial API
-8. **Description + Comments** — Expandable below the video player; comments via yt-dlp `--write-comments` (top sort)
-9. **Downloads** — MP4, MP3, FLAC, Opus, Ogg; fixed FFmpeg pipeline for all audio formats; FLAC uses `compression_level 5` (no erroneous bitrate arg); Opus uses `libopus`; proper protocol whitelist and `-vn` flag
-10. **Shorts** — Dedicated Shorts section with vertical thumbnail grid; fetches from YouTube Shorts page via yt-dlp, falls back to #shorts search
-11. **Seeking** — Proxy seek (`?t=`) for muxed/adaptive streams; `proxySeekRef` tracks offset so currentTime display is always correct; quality changes reset proxy offset properly; duration stays accurate after seeks
+5. **Channel Pages** — Search for channels, view all videos, sort by newest/oldest/popular.
+6. **Video Playback** — Custom proxy player with quality switching, speed control, double-tap seek (±10s), arrow key seek, A/V sync fix (`-avoid_negative_ts make_zero`)
+7. **Watch History** — Auto-recorded after 5s of watching; powers the admin analytics view
+8. **Subtitles** — Custom VTT renderer with word-level karaoke highlighting; auto-translate
+9. **Description + Comments** — Expandable below player
+10. **Downloads** — MP4, MP3, FLAC, Opus, Ogg
+11. **Shorts** — Vertical TikTok-style player; multiple source fallbacks
+12. **Admin Panel** (`/admin`) — Secret page; password set once and cannot be changed; bcrypt-hashed in admin_config; shows total/connected users, per-user watch history, account limits, delete accounts, reset passwords
+
+## Admin Panel
+
+Access at `/admin`. Not linked from any UI.
+- First visit: setup page to set an admin password (one-time, permanent, cannot be changed)
+- Login: username "admin" + chosen password, 4-hour session cookie
+- Dashboard: user list with online status, watch history per user, settings for max accounts/connections, delete users, reset passwords
 
 ## File Structure
 

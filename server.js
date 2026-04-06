@@ -172,9 +172,50 @@ authDb.exec(`
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
+    last_seen INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+  CREATE TABLE IF NOT EXISTS admin_config (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    password_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS admin_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    max_accounts INTEGER DEFAULT 1000,
+    max_connections INTEGER DEFAULT 500
+  );
+  INSERT OR IGNORE INTO admin_settings (id, max_accounts, max_connections) VALUES (1, 1000, 500);
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    token TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS watch_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    channel TEXT DEFAULT '',
+    channel_id TEXT DEFAULT '',
+    thumbnail TEXT DEFAULT '',
+    watched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS user_preferences (
+    user_id INTEGER PRIMARY KEY,
+    subscriptions_weight REAL DEFAULT 1.0,
+    trending_weight REAL DEFAULT 0.5,
+    show_trending INTEGER DEFAULT 1,
+    preferred_categories TEXT DEFAULT '{}',
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
 `);
+
+// Migrations
+try { authDb.exec('ALTER TABLE sessions ADD COLUMN last_seen INTEGER DEFAULT 0'); } catch {}
+try { authDb.exec('ALTER TABLE user_preferences ADD COLUMN use_algorithm INTEGER DEFAULT 1'); } catch {}
 
 const subsDb = new Database(path.join(DATA_DIR, 'subscriptions.db'));
 subsDb.pragma('journal_mode = WAL');
@@ -233,6 +274,31 @@ function requireAuth(req, res, next) {
   const user = getSessionUser(token);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
   req.user = user;
+  // Update last_seen
+  authDb.prepare('UPDATE sessions SET last_seen = ? WHERE token = ?').run(Date.now(), token);
+  next();
+}
+
+// ─── Admin auth helpers ───────────────────────────────────────────────────────
+
+function isAdminSetup() {
+  return !!authDb.prepare('SELECT id FROM admin_config WHERE id = 1').get();
+}
+
+function getAdminSession(token) {
+  if (!token) return null;
+  const sess = authDb.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token);
+  if (!sess || Date.now() > sess.expires_at) {
+    if (sess) authDb.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
+    return null;
+  }
+  return { admin: true };
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.cookies?.admin_token;
+  const session = getAdminSession(token);
+  if (!session) return res.status(401).json({ error: 'Admin not authenticated' });
   next();
 }
 
@@ -271,6 +337,15 @@ app.post('/api/auth/register', async (req, res) => {
     if (!username || !email || !password) return res.status(400).json({ error: 'All fields required' });
     if (username.length < 3) return res.status(400).json({ error: 'Username must be at least 3 characters' });
     if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    // Check max accounts limit
+    const settings = authDb.prepare('SELECT max_accounts FROM admin_settings WHERE id = 1').get();
+    if (settings) {
+      const userCount = authDb.prepare('SELECT COUNT(*) as cnt FROM users').get();
+      if (userCount.cnt >= settings.max_accounts) {
+        return res.status(403).json({ error: 'Registration is currently closed (account limit reached)' });
+      }
+    }
 
     const hash = await bcrypt.hash(password, 10);
     const stmt = authDb.prepare('INSERT INTO users (username, email, password_hash) VALUES (?,?,?)');
@@ -333,6 +408,265 @@ app.get('/api/auth/me', (req, res) => {
   const user = getSessionUser(token);
   if (!user) return res.status(401).json({ error: 'Not authenticated' });
   res.json({ user });
+});
+
+// ─── Admin endpoints ─────────────────────────────────────────────────────────
+
+app.get('/api/admin/status', (req, res) => {
+  res.json({ setup: isAdminSetup() });
+});
+
+app.post('/api/admin/setup', async (req, res) => {
+  try {
+    if (isAdminSetup()) return res.status(409).json({ error: 'Admin password already set. Cannot change.' });
+    const { password } = req.body;
+    if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    const hash = await bcrypt.hash(password, 12);
+    authDb.prepare('INSERT INTO admin_config (id, password_hash) VALUES (1, ?)').run(hash);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    if (!isAdminSetup()) return res.status(403).json({ error: 'Admin not set up yet' });
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Password required' });
+    const config = authDb.prepare('SELECT password_hash FROM admin_config WHERE id = 1').get();
+    const ok = await bcrypt.compare(password, config.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid password' });
+    const token = crypto.randomBytes(32).toString('hex');
+    const now = Date.now();
+    authDb.prepare('INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?,?,?)').run(token, now, now + 4 * 60 * 60 * 1000);
+    res.cookie('admin_token', token, { httpOnly: true, maxAge: 4 * 60 * 60 * 1000, sameSite: 'lax', path: '/' });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/logout', requireAdmin, (req, res) => {
+  const token = req.cookies?.admin_token;
+  if (token) authDb.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
+  res.clearCookie('admin_token', { path: '/' });
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/check', requireAdmin, (req, res) => {
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  try {
+    const users = authDb.prepare(`
+      SELECT u.id, u.username, u.email, u.created_at,
+        (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ?) as active_sessions,
+        (SELECT MAX(s.last_seen) FROM sessions s WHERE s.user_id = u.id) as last_seen,
+        (SELECT COUNT(*) FROM watch_history wh WHERE wh.user_id = u.id) as watch_count
+      FROM users u ORDER BY u.created_at DESC
+    `).all(Date.now());
+
+    // Attach subscription count from subsDb
+    const subCounts = subsDb.prepare(`
+      SELECT user_id, COUNT(*) as sub_count FROM subscriptions GROUP BY user_id
+    `).all();
+    const subMap = {};
+    for (const row of subCounts) subMap[row.user_id] = row.sub_count;
+    for (const u of users) u.sub_count = subMap[u.id] || 0;
+
+    const totalUsers = users.length;
+    const now = Date.now();
+    const recentThreshold = now - 15 * 60 * 1000;
+    const connectedUsers = users.filter(u => u.last_seen && u.last_seen > recentThreshold).length;
+
+    const settings = authDb.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
+
+    res.json({ users, totalUsers, connectedUsers, settings });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
+  try {
+    const { id } = req.params;
+    authDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    authDb.prepare('DELETE FROM watch_history WHERE user_id = ?').run(id);
+    authDb.prepare('DELETE FROM user_preferences WHERE user_id = ?').run(id);
+    subsDb.prepare('DELETE FROM subscriptions WHERE user_id = ?').run(id);
+    savedDb.prepare('DELETE FROM saved_videos WHERE user_id = ?').run(id);
+    authDb.prepare('DELETE FROM users WHERE id = ?').run(id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/admin/users/:id/reset-password', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const hash = await bcrypt.hash(password, 10);
+    authDb.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+    authDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/users/:id/watch-history', requireAdmin, (req, res) => {
+  try {
+    const { id } = req.params;
+    const history = authDb.prepare(`
+      SELECT * FROM watch_history WHERE user_id = ? ORDER BY watched_at DESC LIMIT 100
+    `).all(id);
+    const user = authDb.prepare('SELECT id, username, email FROM users WHERE id = ?').get(id);
+    res.json({ user, history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/admin/settings', requireAdmin, (req, res) => {
+  const settings = authDb.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
+  res.json({ settings });
+});
+
+app.post('/api/admin/settings', requireAdmin, (req, res) => {
+  try {
+    const { max_accounts, max_connections } = req.body;
+    if (max_accounts !== undefined) {
+      authDb.prepare('UPDATE admin_settings SET max_accounts = ? WHERE id = 1').run(parseInt(max_accounts));
+    }
+    if (max_connections !== undefined) {
+      authDb.prepare('UPDATE admin_settings SET max_connections = ? WHERE id = 1').run(parseInt(max_connections));
+    }
+    const settings = authDb.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
+    res.json({ settings });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Watch history (user-facing) ─────────────────────────────────────────────
+
+app.post('/api/watch/:videoId', requireAuth, (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { title, channel, channelId, thumbnail } = req.body;
+    if (!title) return res.status(400).json({ error: 'title required' });
+    // Keep only last 200 history entries per user
+    const count = authDb.prepare('SELECT COUNT(*) as cnt FROM watch_history WHERE user_id = ?').get(req.user.id);
+    if (count.cnt >= 200) {
+      authDb.prepare('DELETE FROM watch_history WHERE user_id = ? AND id = (SELECT MIN(id) FROM watch_history WHERE user_id = ?)').run(req.user.id, req.user.id);
+    }
+    // Check if already watched recently (last 30 min), don't duplicate
+    const recent = authDb.prepare(`SELECT id FROM watch_history WHERE user_id = ? AND video_id = ? AND watched_at > datetime('now', '-30 minutes')`).get(req.user.id, videoId);
+    if (!recent) {
+      authDb.prepare('INSERT INTO watch_history (user_id, video_id, title, channel, channel_id, thumbnail) VALUES (?,?,?,?,?,?)').run(req.user.id, videoId, title, channel || '', channelId || '', thumbnail || '');
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/watch/history', requireAuth, (req, res) => {
+  try {
+    const history = authDb.prepare('SELECT * FROM watch_history WHERE user_id = ? ORDER BY watched_at DESC LIMIT 50').all(req.user.id);
+    res.json({ history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── User preferences (feed settings) ────────────────────────────────────────
+
+app.get('/api/preferences', requireAuth, (req, res) => {
+  try {
+    let prefs = authDb.prepare('SELECT * FROM user_preferences WHERE user_id = ?').get(req.user.id);
+    if (!prefs) {
+      prefs = { user_id: req.user.id, subscriptions_weight: 1.0, trending_weight: 0.5, show_trending: 1, use_algorithm: 1, preferred_categories: '{}' };
+    }
+    res.json({ preferences: { ...prefs, preferred_categories: JSON.parse(prefs.preferred_categories || '{}') } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/preferences', requireAuth, (req, res) => {
+  try {
+    const { subscriptions_weight, trending_weight, show_trending, use_algorithm, preferred_categories } = req.body;
+    const existing = authDb.prepare('SELECT user_id FROM user_preferences WHERE user_id = ?').get(req.user.id);
+    if (existing) {
+      authDb.prepare(`UPDATE user_preferences SET 
+        subscriptions_weight = COALESCE(?, subscriptions_weight),
+        trending_weight = COALESCE(?, trending_weight),
+        show_trending = COALESCE(?, show_trending),
+        use_algorithm = COALESCE(?, use_algorithm),
+        preferred_categories = COALESCE(?, preferred_categories),
+        updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?`).run(
+        subscriptions_weight ?? null,
+        trending_weight ?? null,
+        show_trending !== undefined ? (show_trending ? 1 : 0) : null,
+        use_algorithm !== undefined ? (use_algorithm ? 1 : 0) : null,
+        preferred_categories !== undefined ? JSON.stringify(preferred_categories) : null,
+        req.user.id
+      );
+    } else {
+      authDb.prepare(`INSERT INTO user_preferences (user_id, subscriptions_weight, trending_weight, show_trending, use_algorithm, preferred_categories) VALUES (?,?,?,?,?,?)`).run(
+        req.user.id,
+        subscriptions_weight ?? 1.0,
+        trending_weight ?? 0.5,
+        show_trending !== undefined ? (show_trending ? 1 : 0) : 1,
+        use_algorithm !== undefined ? (use_algorithm ? 1 : 0) : 1,
+        preferred_categories !== undefined ? JSON.stringify(preferred_categories) : '{}'
+      );
+    }
+    let prefs = authDb.prepare('SELECT * FROM user_preferences WHERE user_id = ?').get(req.user.id);
+    res.json({ preferences: { ...prefs, preferred_categories: JSON.parse(prefs.preferred_categories || '{}') } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    const user = authDb.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const match = await bcrypt.compare(currentPassword || '', user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    authDb.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/auth/delete-account', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    const user = authDb.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
+    const match = await bcrypt.compare(password || '', user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Incorrect password' });
+    authDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.user.id);
+    authDb.prepare('DELETE FROM watch_history WHERE user_id = ?').run(req.user.id);
+    authDb.prepare('DELETE FROM user_preferences WHERE user_id = ?').run(req.user.id);
+    subsDb.prepare('DELETE FROM subscriptions WHERE user_id = ?').run(req.user.id);
+    try { savedDb.prepare('DELETE FROM saved_videos WHERE user_id = ?').run(req.user.id); } catch {}
+    authDb.prepare('DELETE FROM users WHERE id = ?').run(req.user.id);
+    res.clearCookie('session');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ─── Subscription endpoints ──────────────────────────────────────────────────
@@ -696,6 +1030,11 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHe
     args.push('-c:v', 'copy');
     args.push('-c:a', 'copy');
 
+    // A/V SYNC FIX: Normalize timestamps so both streams start at 0
+    // This compensates for video keyframe alignment offset vs audio seek precision
+    args.push('-avoid_negative_ts', 'make_zero');
+    args.push('-max_muxing_queue_size', '4096');
+
     // CRITICAL FIX: Use fragmented MP4 for pipe output - works for both streaming AND downloads
     // frag_keyframe = fragment at keyframes (required for streaming)
     // empty_moov = empty moov atom at start (allows pipe output without seeking)
@@ -869,8 +1208,10 @@ const channelCache = new Map();
 const CHANNEL_TTL = 10 * 60 * 1000;
 
 // FIXED: Correct URL logic for UC IDs vs @ handles vs plain names
-async function fetchChannelVideos(channelId, limit = 40) {
-  const cacheKey = `ch:${channelId}:${limit}`;
+async function fetchChannelVideos(channelId, page = 1, pageSize = 60) {
+  const start = (page - 1) * pageSize + 1;
+  const end = page * pageSize;
+  const cacheKey = `ch:${channelId}:${start}-${end}`;
   const cached = channelCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < CHANNEL_TTL) return cached;
 
@@ -903,7 +1244,7 @@ async function fetchChannelVideos(channelId, limit = 40) {
         const args = [
           '--flat-playlist', '--no-warnings', '--quiet',
           ...ytdlpArgs,
-          '--playlist-items', `1-${limit}`,
+          '--playlist-items', `${start}-${end}`,
           '-J', url,
         ];
         const proc = spawn(YTDLP, args, {
@@ -954,7 +1295,7 @@ async function fetchChannelVideos(channelId, limit = 40) {
     channelAvatar: channelMeta.avatar || '',
   })).filter(v => v.id);
 
-  const result = { videos, channel: channelMeta, ts: Date.now() };
+  const result = { videos, channel: channelMeta, hasMore: entries.length >= pageSize, ts: Date.now() };
   channelCache.set(cacheKey, result);
   return result;
 }
@@ -983,9 +1324,11 @@ function formatUploadDate(d) {
 app.get('/api/channel/:channelId/videos', async (req, res) => {
   try {
     const { channelId } = req.params;
-    const { sort = 'newest' } = req.query;
+    const { sort = 'newest', page = '1', pageSize = '60' } = req.query;
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const pageSizeNum = Math.min(200, Math.max(10, parseInt(pageSize) || 60));
 
-    const data = await fetchChannelVideos(channelId, 60);
+    const data = await fetchChannelVideos(channelId, pageNum, pageSizeNum);
     let videos = [...data.videos];
 
     if (sort === 'oldest') videos = videos.reverse();
@@ -997,7 +1340,7 @@ app.get('/api/channel/:channelId/videos', async (req, res) => {
       });
     }
 
-    res.json({ videos, channel: data.channel });
+    res.json({ videos, channel: data.channel, hasMore: data.hasMore, page: pageNum });
   } catch (e) {
     console.error('[channel/videos] error:', e.message);
     res.status(500).json({ error: e.message });
@@ -1034,10 +1377,19 @@ app.get('/api/feed', requireAuth, async (req, res) => {
     const subs = subsDb.prepare('SELECT * FROM subscriptions WHERE user_id = ?').all(req.user.id);
     const allVideos = [];
 
+    // Load user preferences
+    let prefs = authDb.prepare('SELECT * FROM user_preferences WHERE user_id = ?').get(req.user.id);
+    if (!prefs) prefs = { subscriptions_weight: 1.0, trending_weight: 0.5, show_trending: 1, use_algorithm: 1 };
+
+    const useAlgorithm = prefs.use_algorithm !== 0;
+    const subWeight = Math.max(0, Math.min(2, prefs.subscriptions_weight ?? 1.0));
+    const trendWeight = Math.max(0, Math.min(2, prefs.trending_weight ?? 0.5));
+    const showTrending = prefs.show_trending !== 0;
+
     // ── Subscription videos ───────────────────────────────────────────────────
     if (subs.length > 0) {
       const channelResults = await Promise.allSettled(
-        subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 15))
+        subs.slice(0, 12).map(sub => fetchChannelVideos(sub.channel_id, 1, 15))
       );
       for (let i = 0; i < channelResults.length; i++) {
         const result = channelResults[i];
@@ -1048,35 +1400,37 @@ app.get('/api/feed', requireAuth, async (req, res) => {
           const popularity = getFeedPopularityScore(v.views);
           const channelBoost = (subs.length - i) / Math.max(subs.length, 1) * 0.1;
           const random = Math.random() * 0.05;
-          const score = 0.4 + recency * 0.65 + popularity * 0.2 + channelBoost + random;
+          const score = subWeight * (0.4 + recency * 0.65 + popularity * 0.2 + channelBoost + random);
           allVideos.push({ ...v, channel: v.channel || sub.channel_name, channelId: v.channelId || sub.channel_id, channelAvatar: v.channelAvatar || sub.channel_avatar || '', _score: score, _src: 'subscription' });
         }
       }
     }
 
     // ── Trending videos ───────────────────────────────────────────────────────
-    let trendingVideos = [];
-    try {
-      if (trendingCache.data && Date.now() - trendingCache.ts < TRENDING_TTL) {
-        trendingVideos = trendingCache.data.videos || [];
-      } else {
-        // Fetch fresh trending
-        const raw = await fetchTrendingYtDlp();
-        trendingVideos = raw;
+    if (showTrending) {
+      let trendingVideos = [];
+      try {
+        if (trendingCache.data && Date.now() - trendingCache.ts < TRENDING_TTL) {
+          trendingVideos = trendingCache.data.videos || [];
+        } else {
+          const raw = await fetchTrendingYtDlp();
+          trendingVideos = raw;
+          trendingCache.data = { videos: raw };
+          trendingCache.ts = Date.now();
+        }
+      } catch (e) {
+        console.warn('[feed] trending fetch failed:', e.message);
       }
-    } catch (e) {
-      console.warn('[feed] trending fetch failed:', e.message);
-    }
 
-    const subChannelIds = new Set(subs.map(s => s.channel_id));
-    for (const v of trendingVideos) {
-      const popularity = getFeedPopularityScore(v.views);
-      const recency = getFeedRecencyScore(v.published);
-      const isSub = subChannelIds.has(v.channelId);
-      const random = Math.random() * 0.08;
-      // Non-subscribers still see trending content — just with a lower base score
-      const score = (isSub ? 0.3 : 0.05) + recency * 0.4 + popularity * 0.35 + random;
-      allVideos.push({ ...v, _score: score, _src: 'trending' });
+      const subChannelIds = new Set(subs.map(s => s.channel_id));
+      for (const v of trendingVideos) {
+        const popularity = getFeedPopularityScore(v.views);
+        const recency = getFeedRecencyScore(v.published);
+        const isSub = subChannelIds.has(v.channelId);
+        const random = Math.random() * 0.08;
+        const score = trendWeight * ((isSub ? 0.3 : 0.05) + recency * 0.4 + popularity * 0.35 + random);
+        allVideos.push({ ...v, _score: score, _src: 'trending' });
+      }
     }
 
     // Deduplicate by video ID, keeping highest score
@@ -1085,10 +1439,21 @@ app.get('/api/feed', requireAuth, async (req, res) => {
       if (!seen.has(v.id) || seen.get(v.id)._score < v._score) seen.set(v.id, v);
     }
 
-    const videos = [...seen.values()]
-      .sort((a, b) => b._score - a._score)
-      .slice(0, 60)
-      .map(({ _score, _src, ...v }) => v);
+    let videos;
+    if (useAlgorithm) {
+      // Sort by algorithm score
+      videos = [...seen.values()]
+        .sort((a, b) => b._score - a._score)
+        .slice(0, 60)
+        .map(({ _score, _src, ...v }) => v);
+    } else {
+      // Algorithm off: chronological subscription content only
+      videos = [...seen.values()]
+        .filter(v => v._src === 'subscription')
+        .sort((a, b) => getFeedRecencyScore(b.published) - getFeedRecencyScore(a.published))
+        .slice(0, 60)
+        .map(({ _score, _src, ...v }) => v);
+    }
 
     res.json({ videos });
   } catch (e) {
@@ -1925,39 +2290,72 @@ const trendingCache = { data: null, ts: 0 };
 const TRENDING_TTL = 30 * 60 * 1000;
 
 async function fetchTrendingYtDlp() {
-  const ytdlpArgs = buildYtDlpArgs('tv_embedded');
-  const raw = await new Promise((resolve, reject) => {
-    const args = [
-      '--flat-playlist', '--no-warnings', '--quiet',
-      ...ytdlpArgs,
-      '--playlist-items', '1-40',
-      '-J', 'https://www.youtube.com/feed/trending',
-    ];
-    const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
-    let out = '';
-    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
-    proc.stdout.on('data', d => { out += d; });
-    proc.stderr.on('data', () => {});
-    proc.on('close', code => {
-      clearTimeout(timer);
-      if (code !== 0) return reject(new Error(`exit ${code}`));
-      try { resolve(JSON.parse(out)); } catch { reject(new Error('parse failed')); }
-    });
-    proc.on('error', e => { clearTimeout(timer); reject(e); });
-  });
+  // Primary: use youtubei.js search (YouTube's trending feed URL is blocked for bots)
+  if (youtube) {
+    try {
+      const results = await youtube.search('trending');
+      const vids = (results.videos || []).slice(0, 40).map(v => ({
+        id: v.id,
+        title: v.title?.text || v.title || 'Video',
+        thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+        duration: v.duration?.text || v.duration || '',
+        views: v.view_count?.text || v.short_view_count?.text || '',
+        channel: v.author?.name || v.channel?.name || '',
+        channelId: v.author?.id || v.channel?.id || '',
+        channelAvatar: v.author?.best_thumbnail?.url || v.author?.thumbnails?.[0]?.url || '',
+        published: v.published?.text || '',
+      })).filter(v => v.id);
+      if (vids.length > 0) {
+        console.log(`[trending] got ${vids.length} videos via search`);
+        return vids;
+      }
+    } catch (e) {
+      console.warn('[trending] youtube.search failed:', e.message);
+    }
+  }
 
-  return (raw.entries || []).map(v => ({
-    id: v.id,
-    title: v.title || 'Video',
-    thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-    duration: v.duration ? formatSecondsToTime(v.duration) : '',
-    views: v.view_count ? formatViewCount(v.view_count) : '',
-    channel: v.uploader || v.channel || '',
-    channelId: v.uploader_id || v.channel_id || '',
-    channelAvatar: '',
-    published: v.upload_date ? formatUploadDate(v.upload_date) : '',
-  })).filter(v => v.id);
+  // Fallback: yt-dlp search syntax (ytsearch doesn't hit the blocked trending URL)
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      const args = [
+        '--flat-playlist', '--no-warnings', '--quiet',
+        ...buildYtDlpArgs('web'),
+        '--playlist-items', '1-40',
+        '-J', 'ytsearch40:trending',
+      ];
+      const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+      let out = '';
+      const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 30000);
+      proc.stdout.on('data', d => { out += d; });
+      proc.stderr.on('data', () => {});
+      proc.on('close', code => {
+        clearTimeout(timer);
+        if (code !== 0) return reject(new Error(`exit ${code}`));
+        try { resolve(JSON.parse(out)); } catch { reject(new Error('parse failed')); }
+      });
+      proc.on('error', e => { clearTimeout(timer); reject(e); });
+    });
+    const entries = raw.entries || [];
+    if (entries.length > 0) {
+      return entries.map(v => ({
+        id: v.id,
+        title: v.title || 'Video',
+        thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+        duration: v.duration ? formatSecondsToTime(v.duration) : '',
+        views: v.view_count ? formatViewCount(v.view_count) : '',
+        channel: v.uploader || v.channel || '',
+        channelId: v.uploader_id || v.channel_id || '',
+        channelAvatar: '',
+        published: v.upload_date ? formatUploadDate(v.upload_date) : '',
+      })).filter(v => v.id);
+    }
+  } catch (e) {
+    console.warn('[trending] yt-dlp search fallback failed:', e.message);
+  }
+
+  throw new Error('All trending sources failed');
 }
+
 
 app.get('/api/trending', async (req, res) => {
   try {
