@@ -738,7 +738,7 @@ function broadcastWatchingToAdmins() {
 }
 
 app.post('/api/watching', requireAuth, (req, res) => {
-  const { videoId, title, thumbnail, position } = req.body;
+  const { videoId, title, thumbnail, position, paused, speed, quality, subtitleLang, subtitlesOn } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
   watchingNow.set(req.user.id, {
     userId: req.user.id,
@@ -747,6 +747,11 @@ app.post('/api/watching', requireAuth, (req, res) => {
     title: title || '',
     thumbnail: thumbnail || '',
     position: parseFloat(position) || 0,
+    paused: !!paused,
+    speed: parseFloat(speed) || 1,
+    quality: quality || null,
+    subtitleLang: subtitleLang || null,
+    subtitlesOn: !!subtitlesOn,
     updatedAt: Date.now(),
   });
   broadcastWatchingToAdmins();
@@ -1568,7 +1573,9 @@ async function fetchChannelVideos(channelId, page = 1, pageSize = 60) {
         proc.on('close', code => {
           clearTimeout(timer);
           if (code !== 0) return reject(new Error(`yt-dlp exit ${code}: ${err.substring(0, 200)}`));
-          try { resolve(JSON.parse(out)); } catch { reject(new Error('JSON parse failed')); }
+          const trimmed = out.trimStart();
+          if (trimmed.startsWith('<')) return reject(new Error('yt-dlp returned HTML instead of JSON (channel may be restricted)'));
+          try { resolve(JSON.parse(trimmed)); } catch { reject(new Error('JSON parse failed')); }
         });
         proc.on('error', e => { clearTimeout(timer); reject(e); });
       });
@@ -2770,19 +2777,61 @@ app.get('/api/trending', async (req, res) => {
 const shortsCache = { data: null, ts: 0 };
 const SHORTS_TTL = 20 * 60 * 1000;
 
+function isActualShort(v) {
+  // A video is considered a short if it has a duration <= 62s OR if the URL contains /shorts/
+  if (v.duration && v.duration > 62) return false;
+  if (v.webpage_url && v.webpage_url.includes('/shorts/')) return true;
+  if (v.url && v.url.includes('/shorts/')) return true;
+  if (v.duration && v.duration <= 62) return true;
+  // No duration info — accept it only from shorts-specific sources
+  return false;
+}
+
 async function fetchActualShorts(offset = 0) {
-  // Try multiple Shorts sources in priority order
+  // ── 1. Try innertube hashtag API (most reliable for actual shorts) ───────
+  if (youtube) {
+    try {
+      const hashtag = await youtube.getHashtag('shorts');
+      const videos = hashtag?.videos || hashtag?.contents || [];
+      const shorts = videos
+        .filter(v => v.id || v.video_id)
+        .map(v => {
+          const id = v.id || v.video_id || v.videoId;
+          const durSecs = v.duration?.seconds ?? v.duration ?? 0;
+          return {
+            id,
+            title: v.title?.text || v.title || 'Short',
+            thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+            duration: durSecs ? formatSecondsToTime(durSecs) : '',
+            durationSecs: durSecs,
+            views: v.view_count?.text || v.views?.text || '',
+            channel: v.author?.name || v.channel?.name || '',
+            channelId: v.author?.id || v.channel?.id || '',
+            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            isShort: true,
+          };
+        })
+        .filter(v => v.id && (!v.durationSecs || v.durationSecs <= 62))
+        .slice(0, 30);
+
+      if (shorts.length >= 5) {
+        console.log(`[shorts] Got ${shorts.length} shorts via innertube hashtag`);
+        return shorts;
+      }
+    } catch (e) {
+      console.warn('[shorts] innertube hashtag failed:', e.message);
+    }
+  }
+
+  // ── 2. yt-dlp from the /shorts/ page ─────────────────────────────────────
+  const ytdlpArgs = buildYtDlpArgs('tv_embedded');
+  const start = offset + 1;
+  const end = offset + 60;
+
   const sources = [
     'https://www.youtube.com/shorts/',
     'https://www.youtube.com/hashtag/shorts',
-    'https://www.youtube.com/feed/trending',
   ];
-
-  const ytdlpArgs = buildYtDlpArgs('tv_embedded');
-
-  // Randomise which slice of the playlist we pull so each refresh feels fresh
-  const start = offset + 1;
-  const end = offset + 60;
 
   for (const src of sources) {
     try {
@@ -2807,15 +2856,9 @@ async function fetchActualShorts(offset = 0) {
       });
 
       const entries = (raw.entries || []).filter(v => v.id);
-
-      // Filter to actual Shorts: duration <= 62 seconds (allow slight buffer)
-      // If no duration available, include videos from /shorts/ source (they're all shorts)
-      const isShortsSrc = src.includes('/shorts/') || src.includes('hashtag/shorts');
+      // From /shorts/ page: all entries are actual shorts; also enforce duration when available
       const shorts = entries
-        .filter(v => {
-          if (isShortsSrc) return true; // /shorts/ only contains shorts
-          return v.duration && v.duration <= 62;
-        })
+        .filter(v => !v.duration || v.duration <= 62)
         .slice(0, 30)
         .map(v => ({
           id: v.id,
@@ -2839,25 +2882,29 @@ async function fetchActualShorts(offset = 0) {
     }
   }
 
-  // Final fallback: search #shorts via youtubei.js and filter by short duration
+  // ── 3. Final fallback: search #shorts via innertube ───────────────────────
   if (youtube) {
     try {
       const results = await youtube.search('#shorts', { type: 'video' });
       return (results.videos || [])
         .filter(v => v.id)
-        .slice(0, 30)
-        .map(v => ({
-          id: v.id,
-          title: v.title?.text || 'Short',
-          thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-          duration: v.duration?.text || '',
-          durationSecs: 0,
-          views: v.view_count?.text || '',
-          channel: v.author?.name || '',
-          channelId: v.author?.id || '',
-          channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-          isShort: true,
-        }));
+        .map(v => {
+          const durSecs = v.duration?.seconds ?? 0;
+          return {
+            id: v.id,
+            title: v.title?.text || 'Short',
+            thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+            duration: v.duration?.text || '',
+            durationSecs: durSecs,
+            views: v.view_count?.text || '',
+            channel: v.author?.name || '',
+            channelId: v.author?.id || '',
+            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            isShort: true,
+          };
+        })
+        .filter(v => !v.durationSecs || v.durationSecs <= 62)
+        .slice(0, 30);
     } catch (e) {
       console.warn('[shorts] search fallback failed:', e.message);
     }
@@ -2890,6 +2937,84 @@ app.get('/api/shorts', async (req, res) => {
   }
 });
 
+// ─── Personalized Shorts (based on watch history) ────────────────────────────
+
+app.get('/api/shorts/personalized', requireAuth, async (req, res) => {
+  try {
+    // Get recent channel IDs from watch history (last 30 entries, distinct channels)
+    const historyRows = authDb.prepare(
+      'SELECT DISTINCT channel_id FROM watch_history WHERE user_id = ? AND channel_id != "" ORDER BY watched_at DESC LIMIT 30'
+    ).all(req.user.id);
+
+    const channelIds = historyRows.map(r => r.channel_id).filter(Boolean);
+
+    if (channelIds.length === 0) {
+      return res.status(200).json({ shorts: [] });
+    }
+
+    const ytdlpArgs = buildYtDlpArgs('tv_embedded');
+    const results = [];
+
+    // Pick up to 6 channels, shuffle for variety
+    const shuffled = channelIds.sort(() => Math.random() - 0.5).slice(0, 6);
+
+    await Promise.allSettled(shuffled.map(async (channelId) => {
+      try {
+        const channelUrl = /^UC[a-zA-Z0-9_\-]{10,}$/.test(channelId)
+          ? `https://www.youtube.com/channel/${channelId}/shorts`
+          : `https://www.youtube.com/${channelId}/shorts`;
+
+        const raw = await new Promise((resolve, reject) => {
+          const args = [
+            '--flat-playlist', '--no-warnings', '--quiet',
+            ...ytdlpArgs,
+            '--playlist-items', '1-15',
+            '-J', channelUrl,
+          ];
+          const proc = spawn(YTDLP, args, { env: { ...process.env, HTTP_USER_AGENT: getRandomUA() } });
+          let out = '';
+          const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} reject(new Error('timeout')); }, 20000);
+          proc.stdout.on('data', d => { out += d; });
+          proc.stderr.on('data', () => {});
+          proc.on('close', code => {
+            clearTimeout(timer);
+            if (code !== 0) return reject(new Error(`exit ${code}`));
+            try { resolve(JSON.parse(out)); } catch { reject(new Error('parse')); }
+          });
+          proc.on('error', e => { clearTimeout(timer); reject(e); });
+        });
+
+        const entries = (raw.entries || []).filter(v => v.id && (!v.duration || v.duration <= 62));
+        entries.slice(0, 5).forEach(v => {
+          results.push({
+            id: v.id,
+            title: v.title || 'Short',
+            thumbnail: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+            duration: v.duration ? formatSecondsToTime(v.duration) : '',
+            durationSecs: v.duration || 0,
+            views: v.view_count ? formatViewCount(v.view_count) : '',
+            channel: v.uploader || v.channel || raw.uploader || raw.channel || '',
+            channelId: v.uploader_id || v.channel_id || channelId,
+            channelAvatar: '',
+            isShort: true,
+          });
+        });
+      } catch {}
+    }));
+
+    if (results.length < 5) {
+      return res.status(200).json({ shorts: [] });
+    }
+
+    // Shuffle results
+    const shorts = results.sort(() => Math.random() - 0.5);
+    res.json({ shorts });
+  } catch (e) {
+    console.error('[shorts/personalized] error:', e.message);
+    res.status(500).json({ shorts: [], error: e.message });
+  }
+});
+
 // ─── Health ──────────────────────────────────────────────────────────────────
 
 app.get('/api/health', (req, res) => {
@@ -2901,6 +3026,18 @@ app.get('/api/health', (req, res) => {
     visitorData: !!YOUTUBE_VISITOR_DATA,
     poToken: !!YOUTUBE_PO_TOKEN,
   });
+});
+
+// Catch unmatched API routes and return JSON (not HTML)
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: 'API endpoint not found' });
+});
+
+// Global error handler — ensures unhandled exceptions return JSON, not HTML
+app.use((err, req, res, next) => {
+  console.error('[server] unhandled error:', err?.message || err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: err?.message || 'Internal server error' });
 });
 
 app.get('*', (req, res) => {

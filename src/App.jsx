@@ -12,6 +12,7 @@ import AdminPage from './components/AdminPage';
 import FeedSettingsModal from './components/FeedSettingsModal';
 
 const isAdminPath = window.location.pathname === '/admin';
+const sharedVideoId = new URLSearchParams(window.location.search).get('v');
 
 function App() {
   const [darkMode, setDarkMode] = useState(true);
@@ -32,7 +33,35 @@ function App() {
     if (isAdminPath) return;
     fetch('/api/auth/me', { credentials: 'include' })
       .then(r => r.ok ? r.json() : null)
-      .then(data => setUser(data?.user || null))
+      .then(data => {
+        setUser(data?.user || null);
+        if (data?.user && sharedVideoId) {
+          fetch(`/api/info/${sharedVideoId}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(info => {
+              setSelectedVideo({
+                id: sharedVideoId,
+                title: info?.title || 'Video',
+                thumbnail: `https://i.ytimg.com/vi/${sharedVideoId}/hqdefault.jpg`,
+                channel: '',
+                channelId: '',
+                channelAvatar: '',
+                views: '',
+              });
+            })
+            .catch(() => {
+              setSelectedVideo({
+                id: sharedVideoId,
+                title: 'Video',
+                thumbnail: `https://i.ytimg.com/vi/${sharedVideoId}/hqdefault.jpg`,
+                channel: '',
+                channelId: '',
+                channelAvatar: '',
+                views: '',
+              });
+            });
+        }
+      })
       .catch(() => setUser(null));
   }, []);
 
@@ -196,6 +225,7 @@ function App() {
             />
           ) : view === 'shorts' ? (
             <ShortsPage
+              user={user}
               onVideoSelect={handleVideoSelect}
               onChannelSelect={handleChannelSelect}
             />

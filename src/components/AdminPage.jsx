@@ -438,6 +438,7 @@ function Dashboard({ onLogout }) {
   const [bwUnit, setBwUnit] = useState('MB');
   const [bwShowTotal, setBwShowTotal] = useState(true);
   const [bwShowUsers, setBwShowUsers] = useState(true);
+  const [bwRealtime, setBwRealtime] = useState(false);
   const [revealedPasswords, setRevealedPasswords] = useState(new Set());
   // Watching / co-watch
   const [watching, setWatching] = useState([]);
@@ -480,9 +481,9 @@ function Dashboard({ onLogout }) {
   useEffect(() => {
     if (tab !== 'bandwidth') return;
     loadBandwidth();
-    const iv = setInterval(loadBandwidth, 30000);
+    const iv = setInterval(loadBandwidth, bwRealtime ? 2000 : 30000);
     return () => clearInterval(iv);
-  }, [tab, loadBandwidth]);
+  }, [tab, loadBandwidth, bwRealtime]);
 
   // Real-time watching updates via WebSocket when co-watch is enabled
   useEffect(() => {
@@ -693,18 +694,16 @@ function Dashboard({ onLogout }) {
         {tab === 'users' && (
           <div>
             {showPwdColumn && (
-              <div className="flex items-center justify-end mb-3">
-                <button
-                  onClick={() => {
-                    const next = !passwordsVisible;
-                    setPasswordsVisible(next);
-                    setRevealedPasswords(next ? new Set((data?.users || []).map(u => u.id)) : new Set());
-                  }}
-                  className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-gray-800 hover:bg-yellow-600/30 text-yellow-400 border border-yellow-600/40 transition-colors min-h-[36px]"
-                >
-                  {passwordsVisible ? <EyeOff size={15} /> : <Eye size={15} />}
-                  {passwordsVisible ? 'Hide All Passwords' : 'Reveal All Passwords'}
-                </button>
+              <div className="flex items-center justify-end gap-2 mb-3">
+                <span className="text-xs text-gray-500">{revealedPasswords.size} password{revealedPasswords.size !== 1 ? 's' : ''} revealed</span>
+                {revealedPasswords.size > 0 && (
+                  <button
+                    onClick={() => setRevealedPasswords(new Set())}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 border border-gray-700 transition-colors"
+                  >
+                    <EyeOff size={12} /> Hide All
+                  </button>
+                )}
               </div>
             )}
             {loading ? (
@@ -767,10 +766,22 @@ function Dashboard({ onLogout }) {
                           <div className="flex items-center gap-2 mt-1.5">
                             <Key size={11} className="text-yellow-500/70 flex-shrink-0" />
                             <span className="text-xs font-mono text-yellow-300 select-all">
-                              {passwordsVisible
+                              {revealedPasswords.has(user.id)
                                 ? (user.plain_password || <span className="text-gray-500 italic">not recorded</span>)
                                 : <span className="text-gray-500 tracking-widest">••••••••</span>}
                             </span>
+                            <button
+                              onClick={() => setRevealedPasswords(prev => {
+                                const next = new Set(prev);
+                                if (next.has(user.id)) next.delete(user.id);
+                                else next.add(user.id);
+                                return next;
+                              })}
+                              className="text-gray-500 hover:text-yellow-400 transition-colors flex-shrink-0"
+                              title={revealedPasswords.has(user.id) ? 'Hide password' : 'Reveal password'}
+                            >
+                              {revealedPasswords.has(user.id) ? <EyeOff size={12} /> : <Eye size={12} />}
+                            </button>
                           </div>
                         )}
                       </div>
@@ -909,6 +920,13 @@ function Dashboard({ onLogout }) {
                   <button onClick={() => setBwShowUsers(v => !v)}
                     className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-colors ${bwShowUsers ? 'bg-blue-500/20 border-blue-500/40 text-blue-300' : 'bg-gray-800 border-gray-700 text-gray-500'}`}>
                     <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" /> Per User
+                  </button>
+                  <button
+                    onClick={() => setBwRealtime(v => !v)}
+                    className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-colors ${bwRealtime ? 'bg-green-500/20 border-green-500/40 text-green-300' : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white'}`}
+                  >
+                    <span className={`w-2 h-2 rounded-full inline-block ${bwRealtime ? 'bg-green-400 animate-pulse' : 'bg-gray-600'}`} />
+                    {bwRealtime ? 'Live' : 'Live'}
                   </button>
                   <button onClick={loadBandwidth}
                     className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-gray-400 hover:text-white transition-colors">

@@ -143,28 +143,46 @@ function ShortPlayer({ short, isActive, onChannelClick }) {
   );
 }
 
-export default function ShortsPage({ onVideoSelect, onChannelSelect }) {
+export default function ShortsPage({ user, onVideoSelect, onChannelSelect }) {
   const [shorts, setShorts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [currentIdx, setCurrentIdx] = useState(0);
   const containerRef = useRef(null);
   const [isTransitioning, setIsTransitioning] = useState(false);
+  const [isPersonalized, setIsPersonalized] = useState(false);
 
   const load = (force = false) => {
     setLoading(true);
     setError('');
     setCurrentIdx(0);
     setShorts([]);
-    const url = force ? `/api/shorts?force=true&_=${Date.now()}` : '/api/shorts';
-    fetch(url)
-      .then(r => r.json())
-      .then(data => {
-        if (data.error && !data.shorts?.length) throw new Error(data.error);
-        setShorts(data.shorts || []);
-      })
-      .catch(e => setError(e.message))
-      .finally(() => setLoading(false));
+    setIsPersonalized(false);
+
+    const tryPersonalized = user && !force;
+    const regularUrl = force ? `/api/shorts?force=true&_=${Date.now()}` : '/api/shorts';
+
+    const doLoad = (url, personalized) =>
+      fetch(url, { credentials: 'include' })
+        .then(r => r.json())
+        .then(data => {
+          if (data.error && !data.shorts?.length) throw new Error(data.error);
+          const list = data.shorts || [];
+          if (list.length === 0) throw new Error('No shorts');
+          setShorts(list);
+          setIsPersonalized(personalized);
+        });
+
+    if (tryPersonalized) {
+      doLoad(`/api/shorts/personalized?_=${Date.now()}`, true)
+        .catch(() => doLoad(regularUrl, false))
+        .catch(e => setError(e.message))
+        .finally(() => setLoading(false));
+    } else {
+      doLoad(regularUrl, false)
+        .catch(e => setError(e.message))
+        .finally(() => setLoading(false));
+    }
   };
 
   useEffect(load, []);
@@ -320,14 +338,19 @@ export default function ShortsPage({ onVideoSelect, onChannelSelect }) {
         </button>
       </div>
 
-      {/* Refresh button */}
-      <button
-        onClick={() => load(true)}
-        className="absolute top-0 right-4 md:right-8 flex items-center gap-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
-      >
-        <RefreshCw size={12} />
-        Refresh
-      </button>
+      {/* Personalized badge + Refresh button */}
+      <div className="absolute top-0 right-4 md:right-8 flex items-center gap-3">
+        {isPersonalized && (
+          <span className="text-xs text-[var(--accent)] font-medium opacity-80">For You</span>
+        )}
+        <button
+          onClick={() => load(true)}
+          className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--accent)] transition-colors"
+        >
+          <RefreshCw size={12} />
+          Refresh
+        </button>
+      </div>
 
       <style>{`
         @keyframes shortSlideIn {

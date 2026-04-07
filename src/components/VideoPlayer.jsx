@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   ArrowLeft, Play, Pause, Volume2, VolumeX, Maximize, Minimize,
   Loader2, Settings, Download, Video, Music, Disc3, Headphones, FileAudio,
-  Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp, Bookmark, BookmarkCheck
+  Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp, Bookmark, BookmarkCheck,
+  Share2, Check
 } from 'lucide-react';
 
 // sessionStorage cache — auto-cleared when the tab closes
@@ -335,6 +336,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   // CSS-based fullscreen fallback (when native fullscreen is unavailable, e.g. in iframes)
   const [cssFull, setCssFull] = useState(false);
 
+  // Share copied toast
+  const [shareCopied, setShareCopied] = useState(false);
+
   // Skip indicator: { side: 'left'|'right', key: number }
   const [skipIndicator, setSkipIndicator] = useState(null);
   const skipIndicatorTimer = useRef(null);
@@ -357,6 +361,15 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   const proxySeekRef = useRef(0);
   const seekReloadRef = useRef(false);
   const wasPlayingRef = useRef(false);
+
+  // Refs that mirror state values for use in effects/callbacks without stale closures
+  const speedRef = useRef(1);
+  const qualityRef = useRef(null);
+  const subtitlesEnabledRef = useRef(false);
+  const selectedSubtitleRef = useRef('en');
+
+  // Server busy info
+  const [serverBusyInfo, setServerBusyInfo] = useState(null); // { current, max }
 
   // Define ALL callbacks first before using them in effects
 
@@ -381,18 +394,22 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
     const currentProxyStart = proxySeekRef.current;
 
-    // Check every buffered range the element knows about (not just the last one),
-    // so that a seek to any already-downloaded position works natively without
-    // reloading the proxy stream — this covers both forward and backward seeks.
-    let isBuffered = false;
+    // Compute the furthest absolute position the browser has buffered
+    let bufEnd = currentProxyStart;
     for (let i = 0; i < v.buffered.length; i++) {
-      const lo = currentProxyStart + v.buffered.start(i);
-      const hi = currentProxyStart + v.buffered.end(i);
-      if (clamped >= lo && clamped <= hi) { isBuffered = true; break; }
+      bufEnd = Math.max(bufEnd, currentProxyStart + v.buffered.end(i));
     }
 
-    if (isBuffered && clamped >= currentProxyStart) {
-      // Native seek — instant, no server round-trip
+    // ── Backward seek fix ──────────────────────────────────────────────────
+    // When seeking within the current proxy stream's range (clamped >= proxyStart),
+    // always use native seeking. The browser will buffer any small gap automatically.
+    // We only reload the proxy when seeking BEFORE the proxy start (can't go back
+    // on a forward-only stream) or FAR ahead of the buffered end (large forward jump).
+    const isBackward = clamped < currentTimeRef.current;
+    const farAhead = !isBackward && clamped > bufEnd + 30;
+
+    if (clamped >= currentProxyStart && !farAhead) {
+      // Native seek within the current proxy stream — no restart
       v.currentTime = clamped - currentProxyStart;
       currentTimeRef.current = clamped;
       setCurrentTime(clamped);
@@ -400,8 +417,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       return;
     }
 
-    // Target is outside any buffered range or before the proxy start —
-    // reload the proxy stream from the target position.
+    // Proxy reload needed: seeking before proxy start or large forward jump
     seekReloadRef.current = true;
     currentTimeRef.current = clamped;
     setCurrentTime(clamped);
@@ -437,6 +453,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     else v.pause();
   }, []);
 
+  // Keep mirror refs in sync with their state counterparts
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { qualityRef.current = quality; }, [quality]);
+  useEffect(() => { subtitlesEnabledRef.current = subtitlesEnabled; }, [subtitlesEnabled]);
+  useEffect(() => { selectedSubtitleRef.current = currentSubtitleLang; }, [currentSubtitleLang]);
+
   // Now define effects that use the callbacks above
 
   useEffect(() => {
@@ -465,7 +487,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     // Pre-check: ask server if it can handle another stream before loading
     fetch('/api/stream/available')
       .then(r => r.json())
-      .then(data => { if (!data.available) setServerBusy(true); })
+      .then(data => {
+        if (!data.available) {
+          setServerBusy(true);
+          setServerBusyInfo({ current: data.current, max: data.max });
+        }
+      })
       .catch(() => {});
 
     // Formats — check sessionStorage first
@@ -634,6 +661,11 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           title: video.title || '',
           thumbnail: video.thumbnail || '',
           position: Math.floor(currentTimeRef.current),
+          paused: videoRef.current?.paused ?? true,
+          speed: speedRef.current,
+          quality: qualityRef.current,
+          subtitleLang: selectedSubtitleRef.current,
+          subtitlesOn: subtitlesEnabledRef.current,
         }),
       }).catch(() => {});
     };
@@ -643,7 +675,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     return () => { clearInterval(id); reportWatchingRef.current = null; };
   }, [video.id, user]);
 
-  // Co-watch sync: if admin is watching with a user, poll their position and seek to match
+  // Co-watch sync: if admin is watching with a user, poll their position and all states
   useEffect(() => {
     if (!coWatchUserId) return;
     const sync = async () => {
@@ -651,16 +683,45 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         const r = await fetch(`/api/admin/watching/${coWatchUserId}`, { credentials: 'include' });
         if (!r.ok) return;
         const data = await r.json();
+
+        // Position sync (allow 4s tolerance — admin stream loads slower than user)
         const target = data.position || 0;
-        if (Math.abs(currentTimeRef.current - target) > 5) {
+        if (Math.abs(currentTimeRef.current - target) > 4) {
           seekTo(target);
+        }
+
+        // Pause/play state — admin mirrors user's play state exactly
+        const v = videoRef.current;
+        if (v && data.paused !== undefined) {
+          if (data.paused && !v.paused) v.pause();
+          else if (!data.paused && v.paused) v.play().catch(() => {});
+        }
+
+        // Speed sync
+        if (data.speed && data.speed !== speedRef.current) {
+          setSpeed(data.speed);
+        }
+
+        // Quality sync (changeQuality handles the proxy reload)
+        if (data.quality && data.quality !== qualityRef.current) {
+          changeQuality(data.quality);
+        }
+
+        // Subtitle on/off sync
+        if (data.subtitlesOn !== undefined && data.subtitlesOn !== subtitlesEnabledRef.current) {
+          setSubtitlesEnabled(data.subtitlesOn);
+        }
+
+        // Subtitle language sync — only if we have cues loaded for that language
+        if (data.subtitleLang && data.subtitleLang !== selectedSubtitleRef.current) {
+          setCurrentSubtitleLang(data.subtitleLang);
         }
       } catch {}
     };
     sync();
-    const id = setInterval(sync, 5000);
+    const id = setInterval(sync, 4000);
     return () => clearInterval(id);
-  }, [coWatchUserId, seekTo]);
+  }, [coWatchUserId, seekTo, changeQuality]);
 
   const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
 
@@ -867,46 +928,49 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     }
   };
 
-  // Double-tap left/right to seek ±10 s; single tap toggles play.
-  // Uses a non-passive touchend listener so we can call preventDefault() and
-  // prevent the synthetic click event that mobile browsers fire after touch.
-  const singleTapTimer = useRef(null);
+  // Touch controls: tap left third = skip -10s, tap right third = skip +10s, tap center = play/pause.
+  // Uses non-passive listeners to call preventDefault() and block page scroll / synthetic clicks.
+  const touchStartXRef = useRef(null);
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
     const handleTouchStart = (e) => {
       if (e.target.closest('.video-controls-layer')) return;
-      e.preventDefault(); // prevent scroll and double-tap zoom on the video area
+      e.preventDefault();
+      touchStartXRef.current = e.touches[0].clientX;
     };
 
     const handleTouchEnd = (e) => {
       if (e.target.closest('.video-controls-layer')) return;
-      e.preventDefault(); // stop synthetic mouse/click events
+      e.preventDefault();
 
       const touch = e.changedTouches[0];
       if (!touch) return;
-      const rect = container.getBoundingClientRect();
-      const side = touch.clientX < rect.left + rect.width / 2 ? 'left' : 'right';
-      const now = Date.now();
-      const last = lastTapRef.current;
 
-      if (now - last.time < 350 && last.side === side) {
-        // Double-tap: seek ±10s
-        clearTimeout(singleTapTimer.current);
-        singleTapTimer.current = null;
-        lastTapRef.current = { time: 0, side: null };
-        seekTo(currentTimeRef.current + (side === 'left' ? -10 : 10));
-        showSkip(side);
+      // Ignore if finger moved significantly (scroll attempt)
+      const deltaX = Math.abs(touch.clientX - (touchStartXRef.current ?? touch.clientX));
+      const deltaY = Math.abs(touch.clientY - (touchStartXRef.current ?? touch.clientY));
+      if (deltaX > 20) return;
+
+      const rect = container.getBoundingClientRect();
+      const relX = touch.clientX - rect.left;
+      const third = rect.width / 3;
+
+      if (relX < third) {
+        // Left third: skip back
+        seekTo(currentTimeRef.current - 10);
+        showSkip('left');
+        showControls();
+      } else if (relX > third * 2) {
+        // Right third: skip forward
+        seekTo(currentTimeRef.current + 10);
+        showSkip('right');
         showControls();
       } else {
-        // Single tap: wait to see if a second tap arrives
-        lastTapRef.current = { time: now, side };
-        clearTimeout(singleTapTimer.current);
-        singleTapTimer.current = setTimeout(() => {
-          togglePlay();
-          showControls();
-        }, 350);
+        // Center: toggle play/pause
+        togglePlay();
+        showControls();
       }
     };
 
@@ -916,7 +980,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       container.removeEventListener('touchstart', handleTouchStart);
       container.removeEventListener('touchend', handleTouchEnd);
     };
-  }, [seekTo, showSkip, showControls, togglePlay]); // currentTimeRef is a ref — no need to include
+  }, [seekTo, showSkip, showControls, togglePlay]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
@@ -1335,6 +1399,20 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
             <p className="text-xs text-[var(--text-secondary)]">{video.views}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
+            {/* Share button */}
+            <button
+              onClick={() => {
+                const url = `${window.location.origin}${window.location.pathname}?v=${video.id}`;
+                navigator.clipboard.writeText(url).then(() => {
+                  setShareCopied(true);
+                  setTimeout(() => setShareCopied(false), 2000);
+                }).catch(() => {});
+              }}
+              title="Copy link"
+              className={`p-2 rounded-full transition-all ${shareCopied ? 'text-green-400 bg-green-400/10' : 'hover:bg-[var(--border)]'}`}
+            >
+              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
+            </button>
             {/* Save button */}
             <button
               onClick={toggleSave}
