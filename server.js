@@ -758,6 +758,12 @@ app.post('/api/watching', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/watching/stop', requireAuth, (req, res) => {
+  watchingNow.delete(req.user.id);
+  broadcastWatchingToAdmins();
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/watching', requireAdmin, (req, res) => {
   const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
   if (!cfg?.allow_co_watch) return res.status(403).json({ error: 'Co-watch is disabled' });
@@ -2032,12 +2038,20 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 });
 
 // ─── Stream availability check (called before video loads) ───────────────────
+// Uses watchingNow (updated every 10s, expires in 35s) which is far more reliable
+// than activeStreamSet (HTTP connections close when the buffer fills up).
 
-app.get('/api/stream/available', (req, res) => {
+app.get('/api/stream/available', requireAuth, (req, res) => {
   const streamSettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
   const maxStreams = streamSettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
-  const available = activeStreamSet.size < maxStreams;
-  res.json({ available, current: activeStreamSet.size, max: maxStreams });
+  const now = Date.now();
+  let activeViewers = 0;
+  for (const [uid, entry] of watchingNow.entries()) {
+    // Count other users who reported watching in the last 30s (exclude caller — they may be switching videos)
+    if (uid !== req.user.id && now - entry.updatedAt < 30000) activeViewers++;
+  }
+  const available = activeViewers < maxStreams;
+  res.json({ available, current: activeViewers, max: maxStreams });
 });
 
 // ─── Proxy (streaming) ───────────────────────────────────────────────────────

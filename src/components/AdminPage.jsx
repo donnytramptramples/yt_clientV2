@@ -866,7 +866,7 @@ function Dashboard({ onLogout }) {
                         </div>
                         <p className="text-xs text-gray-300 truncate">{entry.title}</p>
                         <p className="text-xs text-gray-500 mt-0.5">
-                          At {Math.floor(entry.position / 60)}:{String(entry.position % 60).padStart(2, '0')} · updated {secsAgo}s ago
+                          At {Math.floor(entry.position / 60)}:{String(Math.floor(entry.position) % 60).padStart(2, '0')} · updated {secsAgo}s ago
                         </p>
                       </div>
                       <button

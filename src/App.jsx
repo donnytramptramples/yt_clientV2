@@ -120,7 +120,33 @@ function App() {
               {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
           </div>
-          <AuthPage onAuth={setUser} />
+          <AuthPage onAuth={(authedUser) => {
+            setUser(authedUser);
+            // If there's a shared video in the URL, open it after login
+            if (sharedVideoId) {
+              fetch(`/api/info/${sharedVideoId}`)
+                .then(r => r.ok ? r.json() : null)
+                .then(info => {
+                  setSelectedVideo({
+                    id: sharedVideoId,
+                    title: info?.title || 'Video',
+                    thumbnail: `https://i.ytimg.com/vi/${sharedVideoId}/hqdefault.jpg`,
+                    channel: info?.channel || '',
+                    channelId: info?.channelId || '',
+                    channelAvatar: '',
+                    views: info?.views || '',
+                  });
+                })
+                .catch(() => {
+                  setSelectedVideo({
+                    id: sharedVideoId,
+                    title: 'Video',
+                    thumbnail: `https://i.ytimg.com/vi/${sharedVideoId}/hqdefault.jpg`,
+                    channel: '', channelId: '', channelAvatar: '', views: '',
+                  });
+                });
+            }
+          }} />
         </div>
       </div>
     );

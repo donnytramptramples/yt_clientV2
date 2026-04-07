@@ -338,6 +338,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
   // Share copied toast
   const [shareCopied, setShareCopied] = useState(false);
+  const [showSharePopup, setShowSharePopup] = useState(false);
+  const sharePopupRef = useRef(null);
 
   // Skip indicator: { side: 'left'|'right', key: number }
   const [skipIndicator, setSkipIndicator] = useState(null);
@@ -480,14 +482,21 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     seekReloadRef.current = false;
     wasPlayingRef.current = false;
     setServerBusy(false);
+    setShowSharePopup(false);
     setChapters([]);
     setHoverInfo(null);
     setShowChapters(false);
 
-    // Pre-check: ask server if it can handle another stream before loading
-    fetch('/api/stream/available')
-      .then(r => r.json())
+    // Pre-check: ask server if it can handle another stream before loading.
+    // credentials: 'include' sends the session cookie. If unauthenticated (e.g. co-watch
+    // admin view), the server returns 401 — we skip the check and let the video load.
+    fetch('/api/stream/available', { credentials: 'include' })
+      .then(r => {
+        if (!r.ok) return null; // 401 or other error — skip the block
+        return r.json();
+      })
       .then(data => {
+        if (!data) return;
         if (!data.available) {
           setServerBusy(true);
           setServerBusyInfo({ current: data.current, max: data.max });
@@ -672,8 +681,22 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     reportWatchingRef.current = report;
     report();
     const id = setInterval(report, 10000);
-    return () => { clearInterval(id); reportWatchingRef.current = null; };
+    return () => {
+      clearInterval(id);
+      reportWatchingRef.current = null;
+      // Immediately free the stream slot when the user leaves this video
+      fetch('/api/watching/stop', { method: 'POST', credentials: 'include' }).catch(() => {});
+    };
   }, [video.id, user]);
+
+  // Lock to prevent co-watch seeking loops: after seeking, block re-seek for 8s
+  const coWatchSeekLockUntilRef = useRef(0);
+
+  // Keep latest seekTo/changeQuality in refs so the sync interval never goes stale
+  const seekToRef = useRef(seekTo);
+  const changeQualityRef = useRef(changeQuality);
+  useEffect(() => { seekToRef.current = seekTo; }, [seekTo]);
+  useEffect(() => { changeQualityRef.current = changeQuality; }, [changeQuality]);
 
   // Co-watch sync: if admin is watching with a user, poll their position and all states
   useEffect(() => {
@@ -684,10 +707,19 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         if (!r.ok) return;
         const data = await r.json();
 
-        // Position sync (allow 4s tolerance — admin stream loads slower than user)
+        // Position sync:
+        // Only seek if: difference > 4s AND lock expired AND no proxy reload already in progress
         const target = data.position || 0;
-        if (Math.abs(currentTimeRef.current - target) > 4) {
-          seekTo(target);
+        const now = Date.now();
+        const syncBlocked = seekReloadRef.current || now < coWatchSeekLockUntilRef.current;
+        if (Math.abs(currentTimeRef.current - target) > 4 && !syncBlocked) {
+          if (videoRef.current) {
+            // Lock for 12s: enough time for the proxy to start and the first frames to arrive
+            coWatchSeekLockUntilRef.current = now + 12000;
+            seekToRef.current(target);
+          }
+          // If video element doesn't exist yet (formats still loading), skip this
+          // cycle without setting the lock so we retry on the next interval.
         }
 
         // Pause/play state — admin mirrors user's play state exactly
@@ -704,7 +736,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
         // Quality sync (changeQuality handles the proxy reload)
         if (data.quality && data.quality !== qualityRef.current) {
-          changeQuality(data.quality);
+          changeQualityRef.current(data.quality);
         }
 
         // Subtitle on/off sync
@@ -721,9 +753,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     sync();
     const id = setInterval(sync, 4000);
     return () => clearInterval(id);
-  }, [coWatchUserId, seekTo, changeQuality]);
+  }, [coWatchUserId]);
 
-  const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
+  // Don't set proxyUrl when server is busy — prevents the video element from making a stream request
+  const proxyUrl = (quality && !serverBusy) ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
 
   const toggleSubscribe = async () => {
     if (!video.channelId || subscribeLoading) return;
@@ -811,6 +844,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const onEnded = () => setPlaying(false);
     const onError = async () => {
       setIsLoading(false);
+      // Always clear the reload flag so co-watch sync isn't permanently blocked
+      seekReloadRef.current = false;
       // Check if the server returned a 503 (too busy)
       if (proxyUrl) {
         try {
@@ -1049,13 +1084,37 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
         {serverBusy ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 gap-4">
-            <div className="text-center">
-              <p className="text-white text-lg font-semibold">Server is busy</p>
-              <p className="text-white/60 text-sm mt-1">Please try again later</p>
+            <div className="text-center px-6">
+              <p className="text-white text-lg font-semibold">Server has reached max streams</p>
+              {serverBusyInfo && (
+                <p className="text-white/70 text-sm mt-1">{serverBusyInfo.current} / {serverBusyInfo.max} streams active</p>
+              )}
+              <p className="text-white/50 text-xs mt-2">Please wait for a stream to free up, then retry.</p>
             </div>
             <button
               className="px-5 py-2 rounded-lg bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90"
-              onClick={(e) => { e.stopPropagation(); setServerBusy(false); setIsLoading(true); setRetryKey(k => k + 1); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                fetch('/api/stream/available', { credentials: 'include' })
+                  .then(r => {
+                    if (!r.ok) return null;
+                    return r.json();
+                  })
+                  .then(data => {
+                    if (!data || !data.available) {
+                      if (data) setServerBusyInfo({ current: data.current, max: data.max });
+                    } else {
+                      setServerBusy(false);
+                      setIsLoading(true);
+                      setRetryKey(k => k + 1);
+                    }
+                  })
+                  .catch(() => {
+                    setServerBusy(false);
+                    setIsLoading(true);
+                    setRetryKey(k => k + 1);
+                  });
+              }}
             >Retry</button>
           </div>
         ) : (isLoading || formatsLoading || !proxyUrl) && (
@@ -1399,20 +1458,67 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
             <p className="text-xs text-[var(--text-secondary)]">{video.views}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
-            {/* Share button */}
-            <button
-              onClick={() => {
-                const url = `${window.location.origin}${window.location.pathname}?v=${video.id}`;
-                navigator.clipboard.writeText(url).then(() => {
-                  setShareCopied(true);
-                  setTimeout(() => setShareCopied(false), 2000);
-                }).catch(() => {});
-              }}
-              title="Copy link"
-              className={`p-2 rounded-full transition-all ${shareCopied ? 'text-green-400 bg-green-400/10' : 'hover:bg-[var(--border)]'}`}
-            >
-              {shareCopied ? <Check size={18} /> : <Share2 size={18} />}
-            </button>
+            {/* Share button + popup */}
+            <div className="relative" ref={sharePopupRef}>
+              <button
+                onClick={() => setShowSharePopup(v => !v)}
+                title="Share video"
+                className={`p-2 rounded-full transition-all ${showSharePopup ? 'text-[var(--accent)] bg-[var(--accent)]/10' : 'hover:bg-[var(--border)]'}`}
+              >
+                <Share2 size={18} />
+              </button>
+              {showSharePopup && <div className="fixed inset-0 z-40" onClick={() => setShowSharePopup(false)} />}
+              {showSharePopup && (() => {
+                const shareUrl = `${window.location.origin}${window.location.pathname}?v=${video.id}`;
+                const copyUrl = () => {
+                  const tryExecCopy = () => {
+                    try {
+                      const ta = document.createElement('textarea');
+                      ta.value = shareUrl;
+                      ta.style.position = 'fixed'; ta.style.top = '-9999px'; ta.style.left = '-9999px';
+                      document.body.appendChild(ta);
+                      ta.focus(); ta.select();
+                      document.execCommand('copy');
+                      document.body.removeChild(ta);
+                      setShareCopied(true);
+                      setTimeout(() => setShareCopied(false), 2000);
+                    } catch { /* manual copy from input below */ }
+                  };
+                  if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(shareUrl).then(() => {
+                      setShareCopied(true);
+                      setTimeout(() => setShareCopied(false), 2000);
+                    }).catch(tryExecCopy);
+                  } else {
+                    tryExecCopy();
+                  }
+                };
+                return (
+                  <div
+                    className="absolute right-0 bottom-full mb-2 z-50 bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl shadow-xl p-3 w-72"
+                    onClick={e => e.stopPropagation()}
+                  >
+                    <p className="text-xs font-semibold text-[var(--text-secondary)] mb-2">Share this video</p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        value={shareUrl}
+                        onFocus={e => e.target.select()}
+                        className="flex-1 text-xs bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg px-2 py-1.5 text-[var(--text-primary)] cursor-text select-all min-w-0"
+                      />
+                      <button
+                        onClick={copyUrl}
+                        className={`flex-shrink-0 flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${shareCopied ? 'bg-green-600 text-white' : 'bg-[var(--accent)] text-white hover:opacity-90'}`}
+                      >
+                        {shareCopied ? <><Check size={12} /> Copied</> : 'Copy'}
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-[var(--text-secondary)] mt-1.5">Click the URL to select it, or use Copy</p>
+                  </div>
+                );
+              })()}
+            </div>
             {/* Save button */}
             <button
               onClick={toggleSave}
