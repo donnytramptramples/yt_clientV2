@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { Shield, Users, Settings, LogOut, Trash2, RefreshCw, Eye, EyeOff, ChevronRight, ChevronLeft, Clock, Activity, Rss, Key, Radio, Play, ArrowLeft } from 'lucide-react';
+import { Shield, Users, Settings, LogOut, Trash2, RefreshCw, Eye, EyeOff, ChevronRight, ChevronLeft, Clock, Activity, Rss, Key, Radio, Play, ArrowLeft, TrendingUp } from 'lucide-react';
 import VideoPlayer from './VideoPlayer';
 
 function timeAgo(ts) {
@@ -349,23 +349,102 @@ function ResetPasswordModal({ user, onClose, onSuccess }) {
   );
 }
 
+const BW_COLORS = ['#f87171','#60a5fa','#34d399','#fbbf24','#a78bfa','#fb923c','#38bdf8','#4ade80','#f472b6','#e879f9'];
+
+function fmtBW(bytes, unit) {
+  if (unit === 'Mbit') {
+    const mbit = (bytes * 8) / 1e6;
+    return mbit >= 100 ? mbit.toFixed(0) : mbit >= 10 ? mbit.toFixed(1) : mbit.toFixed(2);
+  }
+  const mb = bytes / 1e6;
+  return mb >= 100 ? mb.toFixed(0) : mb >= 10 ? mb.toFixed(1) : mb.toFixed(2);
+}
+
+function BandwidthChart({ series, times, unit }) {
+  if (!series.length || !times.length) return (
+    <div className="flex items-center justify-center h-48 text-gray-600 text-sm">No data yet — start streaming to see bandwidth.</div>
+  );
+
+  const W = 900, H = 280;
+  const PL = 62, PR = 16, PT = 16, PB = 36;
+  const CW = W - PL - PR;
+  const CH = H - PT - PB;
+
+  const allVals = series.flatMap(s => s.data);
+  const maxBytes = Math.max(...allVals, 1);
+
+  const xOf = i => PL + (i / Math.max(times.length - 1, 1)) * CW;
+  const yOf = v => PT + CH - (v / maxBytes) * CH;
+
+  const yticks = [0, 0.25, 0.5, 0.75, 1].map(f => ({ v: maxBytes * f, y: yOf(maxBytes * f) }));
+
+  const makePath = data => data
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(1)},${yOf(v).toFixed(1)}`)
+    .join(' ');
+
+  const xTickStep = Math.ceil(times.length / 10);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 280 }}>
+      {yticks.map(({ v, y }, i) => (
+        <g key={i}>
+          <line x1={PL} y1={y} x2={W - PR} y2={y} stroke="rgba(255,255,255,0.07)" strokeDasharray="4 4" />
+          <text x={PL - 6} y={y + 4} textAnchor="end" fill="rgba(255,255,255,0.4)" fontSize={10}>
+            {fmtBW(v, unit)}
+          </text>
+        </g>
+      ))}
+      {times.map((t, i) => {
+        if (i % xTickStep !== 0 && i !== times.length - 1) return null;
+        const d = new Date(t);
+        const label = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+        return (
+          <text key={i} x={xOf(i)} y={H - 8} textAnchor="middle" fill="rgba(255,255,255,0.35)" fontSize={9}>{label}</text>
+        );
+      })}
+      <line x1={PL} y1={PT} x2={PL} y2={PT + CH} stroke="rgba(255,255,255,0.15)" />
+      <line x1={PL} y1={PT + CH} x2={W - PR} y2={PT + CH} stroke="rgba(255,255,255,0.15)" />
+      {series.map((s, si) => (
+        <g key={s.name}>
+          <path d={makePath(s.data)} fill="none" stroke={s.color} strokeWidth={s.isTotal ? 2.5 : 1.5}
+            strokeLinejoin="round" strokeLinecap="round"
+            strokeDasharray={s.isTotal ? undefined : undefined}
+            opacity={s.isTotal ? 1 : 0.85} />
+          {s.data.map((v, i) => v > 0 && (
+            <circle key={i} cx={xOf(i)} cy={yOf(v)} r={2.5} fill={s.color} opacity={0.7} />
+          ))}
+        </g>
+      ))}
+      <text x={PL - 54} y={PT + CH / 2} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize={9}
+        transform={`rotate(-90,${PL - 54},${PT + CH / 2})`}>{unit}/min</text>
+    </svg>
+  );
+}
+
 function Dashboard({ onLogout }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState('users');
   const [viewingUser, setViewingUser] = useState(null);
   const [viewingUserMode, setViewingUserMode] = useState('history');
-  const [shownPasswords, setShownPasswords] = useState({});
   const [settings, setSettings] = useState({ max_accounts: 1000, max_connections: 500, max_sessions: 0, show_passwords: false, allow_co_watch: false });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMsg, setSettingsMsg] = useState('');
   const [resetUser, setResetUser] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
+  const [passwordsVisible, setPasswordsVisible] = useState(false);
+  const [bwData, setBwData] = useState(null);
+  const [bwLoading, setBwLoading] = useState(false);
+  const [bwUnit, setBwUnit] = useState('MB');
+  const [bwShowTotal, setBwShowTotal] = useState(true);
+  const [bwShowUsers, setBwShowUsers] = useState(true);
+  const [revealedPasswords, setRevealedPasswords] = useState(new Set());
   // Watching / co-watch
   const [watching, setWatching] = useState([]);
   const [watchingLoading, setWatchingLoading] = useState(false);
+  const [watchingConnected, setWatchingConnected] = useState(false);
   const [coWatchEntry, setCoWatchEntry] = useState(null); // currently co-watching this user
-  const watchPollRef = useRef(null);
+  const watchWsRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -389,24 +468,51 @@ function Dashboard({ onLogout }) {
 
   useEffect(() => { load(); }, [load]);
 
-  // Poll watching status whenever on users or watching tab, and co-watch is enabled
+  const loadBandwidth = useCallback(() => {
+    setBwLoading(true);
+    fetch('/api/admin/bandwidth', { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => setBwData(d))
+      .catch(() => {})
+      .finally(() => setBwLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (tab !== 'bandwidth') return;
+    loadBandwidth();
+    const iv = setInterval(loadBandwidth, 30000);
+    return () => clearInterval(iv);
+  }, [tab, loadBandwidth]);
+
+  // Real-time watching updates via WebSocket when co-watch is enabled
   useEffect(() => {
     if ((tab !== 'watching' && tab !== 'users') || !settings.allow_co_watch) {
-      clearInterval(watchPollRef.current);
+      watchWsRef.current?.close();
+      watchWsRef.current = null;
+      setWatchingConnected(false);
       setWatching([]);
       return;
     }
-    const poll = async () => {
-      if (tab === 'watching') setWatchingLoading(true);
+
+    // Already connected
+    if (watchWsRef.current && watchWsRef.current.readyState < 2) return;
+
+    setWatchingLoading(true);
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${window.location.host}/api/ws?admin=1`);
+    watchWsRef.current = ws;
+
+    ws.onopen = () => { setWatchingConnected(true); setWatchingLoading(false); };
+    ws.onmessage = (e) => {
       try {
-        const r = await fetch('/api/admin/watching', { credentials: 'include' });
-        if (r.ok) { const d = await r.json(); setWatching(d.watching || []); }
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'watching_update') setWatching(msg.watching || []);
       } catch {}
-      if (tab === 'watching') setWatchingLoading(false);
     };
-    poll();
-    watchPollRef.current = setInterval(poll, 10000);
-    return () => clearInterval(watchPollRef.current);
+    ws.onclose = () => { setWatchingConnected(false); watchWsRef.current = null; };
+    ws.onerror = () => { setWatchingLoading(false); };
+
+    return () => { ws.close(); watchWsRef.current = null; setWatchingConnected(false); };
   }, [tab, settings.allow_co_watch]);
 
   const handleDelete = async (userId) => {
@@ -560,6 +666,7 @@ function Dashboard({ onLogout }) {
         {[
           { id: 'users', label: 'Users', icon: Users },
           ...(settings.allow_co_watch ? [{ id: 'watching', label: 'Watching', icon: Radio }] : []),
+          { id: 'bandwidth', label: 'Bandwidth', icon: TrendingUp },
           { id: 'settings', label: 'Settings', icon: Settings },
         ].map(({ id, label, icon: Icon }) => (
           <button
@@ -585,6 +692,21 @@ function Dashboard({ onLogout }) {
       <div className="p-6">
         {tab === 'users' && (
           <div>
+            {showPwdColumn && (
+              <div className="flex items-center justify-end mb-3">
+                <button
+                  onClick={() => {
+                    const next = !passwordsVisible;
+                    setPasswordsVisible(next);
+                    setRevealedPasswords(next ? new Set((data?.users || []).map(u => u.id)) : new Set());
+                  }}
+                  className="flex items-center gap-2 text-sm px-4 py-2 rounded-lg bg-gray-800 hover:bg-yellow-600/30 text-yellow-400 border border-yellow-600/40 transition-colors min-h-[36px]"
+                >
+                  {passwordsVisible ? <EyeOff size={15} /> : <Eye size={15} />}
+                  {passwordsVisible ? 'Hide All Passwords' : 'Reveal All Passwords'}
+                </button>
+              </div>
+            )}
             {loading ? (
               <div className="flex items-center justify-center h-48">
                 <div className="animate-spin w-8 h-8 border-2 border-red-500 border-t-transparent rounded-full" />
@@ -627,7 +749,9 @@ function Dashboard({ onLogout }) {
                             </div>
                           </div>
                         )}
-                        <div className="text-sm text-gray-400 truncate mt-1">{user.email}</div>
+                        <div className="text-sm text-gray-400 truncate mt-1">
+                          {user.email || <span className="text-gray-600 italic text-xs">email hidden</span>}
+                        </div>
                         <div className="text-xs text-gray-500 flex items-center gap-3 mt-1 flex-wrap">
                           <span>Joined {new Date(user.created_at).toLocaleDateString()}</span>
                           <span className="flex items-center gap-1"><Clock size={11} /> Last seen {timeAgo(user.last_seen)}</span>
@@ -642,17 +766,11 @@ function Dashboard({ onLogout }) {
                         {showPwdColumn && (
                           <div className="flex items-center gap-2 mt-1.5">
                             <Key size={11} className="text-yellow-500/70 flex-shrink-0" />
-                            <span className="text-xs font-mono text-yellow-400/80">
-                              {shownPasswords[user.id]
+                            <span className="text-xs font-mono text-yellow-300 select-all">
+                              {passwordsVisible
                                 ? (user.plain_password || <span className="text-gray-500 italic">not recorded</span>)
-                                : '••••••••'}
+                                : <span className="text-gray-500 tracking-widest">••••••••</span>}
                             </span>
-                            <button
-                              onClick={() => setShownPasswords(p => ({ ...p, [user.id]: !p[user.id] }))}
-                              className="text-gray-500 hover:text-yellow-400 transition-colors"
-                            >
-                              {shownPasswords[user.id] ? <EyeOff size={11} /> : <Eye size={11} />}
-                            </button>
                           </div>
                         )}
                       </div>
@@ -705,7 +823,14 @@ function Dashboard({ onLogout }) {
         {tab === 'watching' && (
           <div>
             <div className="flex items-center justify-between mb-4">
-              <p className="text-sm text-gray-400">Users currently watching a video (updated every 10 s)</p>
+              <p className="text-sm text-gray-400 flex items-center gap-2">
+                Users currently watching a video
+                {watchingConnected ? (
+                  <span className="flex items-center gap-1 text-xs text-green-400"><span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" /> Live</span>
+                ) : (
+                  <span className="text-xs text-gray-500">connecting…</span>
+                )}
+              </p>
               {watchingLoading && <div className="animate-spin w-4 h-4 border border-red-500 border-t-transparent rounded-full" />}
             </div>
             {watching.length === 0 ? (
@@ -746,6 +871,105 @@ function Dashboard({ onLogout }) {
             )}
           </div>
         )}
+
+        {tab === 'bandwidth' && (() => {
+          const series = [];
+          if (bwData) {
+            if (bwShowTotal) series.push({ name: 'Total', data: bwData.total, color: '#ffffff', isTotal: true });
+            if (bwShowUsers) {
+              (bwData.users || []).forEach((u, i) => {
+                series.push({ name: u.username, data: u.data, color: BW_COLORS[i % BW_COLORS.length], isTotal: false });
+              });
+            }
+          }
+          const totalBytes = bwData ? bwData.total.reduce((a, b) => a + b, 0) : 0;
+          const peakBytes = bwData ? Math.max(...bwData.total) : 0;
+
+          return (
+            <div>
+              <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+                <div className="flex items-center gap-2">
+                  <TrendingUp size={18} className="text-blue-400" />
+                  <h3 className="font-semibold text-lg">Data Transfer — Last 60 Minutes</h3>
+                  {bwLoading && <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />}
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs">
+                    {['MB', 'Mbit'].map(u => (
+                      <button key={u} onClick={() => setBwUnit(u)}
+                        className={`px-3 py-1.5 font-medium transition-colors ${bwUnit === u ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'}`}>
+                        {u}
+                      </button>
+                    ))}
+                  </div>
+                  <button onClick={() => setBwShowTotal(v => !v)}
+                    className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-colors ${bwShowTotal ? 'bg-white/10 border-white/30 text-white' : 'bg-gray-800 border-gray-700 text-gray-500'}`}>
+                    <span className="w-2.5 h-2.5 rounded-full bg-white inline-block" /> Total
+                  </button>
+                  <button onClick={() => setBwShowUsers(v => !v)}
+                    className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border transition-colors ${bwShowUsers ? 'bg-blue-500/20 border-blue-500/40 text-blue-300' : 'bg-gray-800 border-gray-700 text-gray-500'}`}>
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" /> Per User
+                  </button>
+                  <button onClick={loadBandwidth}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-gray-800 border border-gray-700 text-gray-400 hover:text-white transition-colors">
+                    <RefreshCw size={12} /> Refresh
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4 mb-5">
+                <div className="bg-gray-900 rounded-xl border border-gray-700 p-4">
+                  <div className="text-2xl font-bold text-blue-400">{fmtBW(totalBytes, bwUnit)}</div>
+                  <div className="text-xs text-gray-400 mt-1">Total Transferred ({bwUnit})</div>
+                </div>
+                <div className="bg-gray-900 rounded-xl border border-gray-700 p-4">
+                  <div className="text-2xl font-bold text-green-400">{fmtBW(peakBytes, bwUnit)}</div>
+                  <div className="text-xs text-gray-400 mt-1">Peak per Minute ({bwUnit})</div>
+                </div>
+                <div className="bg-gray-900 rounded-xl border border-gray-700 p-4">
+                  <div className="text-2xl font-bold text-purple-400">{bwData?.users?.length ?? 0}</div>
+                  <div className="text-xs text-gray-400 mt-1">Active Users</div>
+                </div>
+              </div>
+
+              <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 mb-5">
+                <BandwidthChart series={series} times={bwData?.times ?? []} unit={bwUnit} />
+              </div>
+
+              {bwShowUsers && bwData?.users?.length > 0 && (
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-400 mb-3">Per-User Breakdown</h4>
+                  <div className="space-y-2">
+                    {(bwData.users || []).map((u, i) => {
+                      const userTotal = u.data.reduce((a, b) => a + b, 0);
+                      const pct = totalBytes > 0 ? (userTotal / totalBytes) * 100 : 0;
+                      const color = BW_COLORS[i % BW_COLORS.length];
+                      return (
+                        <div key={u.userId} className="flex items-center gap-3 bg-gray-900 rounded-lg px-4 py-3 border border-gray-800">
+                          <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ background: color }} />
+                          <span className="text-sm font-medium text-white w-32 truncate">{u.username}</span>
+                          <div className="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                            <div className="h-full rounded-full transition-all" style={{ width: `${pct.toFixed(1)}%`, background: color }} />
+                          </div>
+                          <span className="text-sm text-gray-300 w-24 text-right font-mono">{fmtBW(userTotal, bwUnit)} {bwUnit}</span>
+                          <span className="text-xs text-gray-500 w-12 text-right">{pct.toFixed(1)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {!bwData && !bwLoading && (
+                <div className="text-center text-gray-500 py-12">
+                  <TrendingUp size={40} className="mx-auto mb-3 opacity-30" />
+                  <p>No bandwidth data available yet.</p>
+                  <p className="text-sm mt-1">Data is collected as users stream videos.</p>
+                </div>
+              )}
+            </div>
+          );
+        })()}
 
         {tab === 'settings' && (
           <div className="max-w-md space-y-6">

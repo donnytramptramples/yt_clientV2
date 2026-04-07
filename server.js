@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Readable } from 'stream';
+import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import { spawn, execSync } from 'child_process';
 import os from 'os';
@@ -84,6 +84,38 @@ setInterval(() => {
     if (d.updatedAt < stale) watchingNow.delete(uid);
   }
 }, 15000);
+
+// ─── Bandwidth tracker ───────────────────────────────────────────────────────
+const BW_BUCKETS = 60;          // keep 60 minutes of history
+const BW_BUCKET_MS = 60 * 1000; // 1-minute buckets
+const bwPerUser = new Map();    // userId -> [{ t, bytes }]
+const bwTotal = [];             // [{ t, bytes }]
+
+function recordBandwidth(userId, bytes) {
+  if (!bytes || bytes <= 0) return;
+  const t = Math.floor(Date.now() / BW_BUCKET_MS) * BW_BUCKET_MS;
+
+  if (userId !== null && userId !== undefined) {
+    if (!bwPerUser.has(userId)) bwPerUser.set(userId, []);
+    const arr = bwPerUser.get(userId);
+    const last = arr[arr.length - 1];
+    if (last && last.t === t) last.bytes += bytes;
+    else { arr.push({ t, bytes }); if (arr.length > BW_BUCKETS) arr.shift(); }
+  }
+
+  const last = bwTotal[bwTotal.length - 1];
+  if (last && last.t === t) last.bytes += bytes;
+  else { bwTotal.push({ t, bytes }); if (bwTotal.length > BW_BUCKETS) bwTotal.shift(); }
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - BW_BUCKETS * BW_BUCKET_MS;
+  for (const [uid, arr] of bwPerUser.entries()) {
+    const filtered = arr.filter(b => b.t >= cutoff);
+    if (filtered.length === 0) bwPerUser.delete(uid);
+    else bwPerUser.set(uid, filtered);
+  }
+}, 5 * 60 * 1000);
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Linux; Android 13; SM-A135F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
@@ -570,9 +602,12 @@ app.get('/api/admin/users', requireAdmin, (req, res) => {
     const adminCfg = authDb.prepare('SELECT show_passwords FROM admin_settings WHERE id = 1').get();
     const showPwds = !!(adminCfg?.show_passwords);
     for (const u of users) {
-      u.email = decrypt(u.email);
-      if (showPwds) {
-        u.plain_password = decrypt(u.plain_password);
+      const decEmail = decrypt(u.email);
+      // If decryption failed the raw enc: string is returned — hide it
+      u.email = (decEmail && !decEmail.startsWith('enc:')) ? decEmail : null;
+      if (showPwds && u.plain_password) {
+        const dec = decrypt(u.plain_password);
+        u.plain_password = (dec && !dec.startsWith('enc:') && !dec.startsWith('$2')) ? dec : null;
       } else {
         delete u.plain_password;
       }
@@ -684,6 +719,24 @@ app.post('/api/admin/settings', requireAdmin, (req, res) => {
 
 // ─── Currently-watching reporting (user-facing) ──────────────────────────────
 
+// Admin WebSocket clients for real-time watching updates
+const adminWsClients = new Set();
+
+function broadcastWatchingToAdmins() {
+  if (adminWsClients.size === 0) return;
+  const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
+  if (!cfg?.allow_co_watch) return;
+  const now = Date.now();
+  const active = [];
+  for (const entry of watchingNow.values()) {
+    if (now - entry.updatedAt < 35000) active.push(entry);
+  }
+  const msg = JSON.stringify({ type: 'watching_update', watching: active });
+  for (const ws of adminWsClients) {
+    if (ws.readyState === 1) ws.send(msg);
+  }
+}
+
 app.post('/api/watching', requireAuth, (req, res) => {
   const { videoId, title, thumbnail, position } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
@@ -696,6 +749,7 @@ app.post('/api/watching', requireAuth, (req, res) => {
     position: parseFloat(position) || 0,
     updatedAt: Date.now(),
   });
+  broadcastWatchingToAdmins();
   res.json({ ok: true });
 });
 
@@ -716,6 +770,34 @@ app.get('/api/admin/watching/:userId', requireAdmin, (req, res) => {
   const entry = watchingNow.get(parseInt(req.params.userId));
   if (!entry) return res.status(404).json({ error: 'User not currently watching' });
   res.json(entry);
+});
+
+// ─── Bandwidth stats ─────────────────────────────────────────────────────────
+
+app.get('/api/admin/bandwidth', requireAdmin, (req, res) => {
+  const users = authDb.prepare('SELECT id, username FROM users').all();
+  const userMap = new Map(users.map(u => [u.id, u.username]));
+
+  const now = Math.floor(Date.now() / BW_BUCKET_MS) * BW_BUCKET_MS;
+  const times = Array.from({ length: BW_BUCKETS }, (_, i) => now - (BW_BUCKETS - 1 - i) * BW_BUCKET_MS);
+
+  const totalData = times.map(t => {
+    const entry = bwTotal.find(e => e.t === t);
+    return entry ? entry.bytes : 0;
+  });
+
+  const usersData = [];
+  for (const [userId, log] of bwPerUser.entries()) {
+    const data = times.map(t => {
+      const entry = log.find(e => e.t === t);
+      return entry ? entry.bytes : 0;
+    });
+    if (data.some(b => b > 0)) {
+      usersData.push({ userId, username: userMap.get(userId) || `User ${userId}`, data });
+    }
+  }
+
+  res.json({ times, total: totalData, users: usersData });
 });
 
 // ─── Watch history (user-facing) ─────────────────────────────────────────────
@@ -1942,6 +2024,15 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
   }
 });
 
+// ─── Stream availability check (called before video loads) ───────────────────
+
+app.get('/api/stream/available', (req, res) => {
+  const streamSettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
+  const maxStreams = streamSettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
+  const available = activeStreamSet.size < maxStreams;
+  res.json({ available, current: activeStreamSet.size, max: maxStreams });
+});
+
 // ─── Proxy (streaming) ───────────────────────────────────────────────────────
 
 app.get('/api/proxy/:videoId', async (req, res) => {
@@ -1974,6 +2065,20 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   const rangeHeader = req.headers.range;
 
   console.log(`[proxy] ${videoId} q=${quality} seek=${seekSeconds}s range=${rangeHeader || 'none'}`);
+
+  // Optional user detection for bandwidth accounting
+  const _bwUser = getSessionUser(req.cookies?.session);
+  const _bwUid = _bwUser?.id ?? null;
+  const _origWrite = res.write.bind(res);
+  const _origEnd = res.end.bind(res);
+  res.write = function (chunk, ...args) {
+    if (chunk) recordBandwidth(_bwUid, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    return _origWrite(chunk, ...args);
+  };
+  res.end = function (chunk, ...args) {
+    if (chunk) recordBandwidth(_bwUid, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    return _origEnd(chunk, ...args);
+  };
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
@@ -2088,6 +2193,20 @@ app.get('/api/stream/:videoId', async (req, res) => {
   activeStreamSet.add(streamId);
   let streamCleaned = false;
   const cleanup = () => { if (!streamCleaned) { streamCleaned = true; activeStreamSet.delete(streamId); } };
+
+  // Bandwidth accounting for stream route
+  const _sBwUser = getSessionUser(req.cookies?.session);
+  const _sBwUid = _sBwUser?.id ?? null;
+  const _sOrigWrite = res.write.bind(res);
+  const _sOrigEnd = res.end.bind(res);
+  res.write = function (chunk, ...args) {
+    if (chunk) recordBandwidth(_sBwUid, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    return _sOrigWrite(chunk, ...args);
+  };
+  res.end = function (chunk, ...args) {
+    if (chunk) recordBandwidth(_sBwUid, Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk));
+    return _sOrigEnd(chunk, ...args);
+  };
 
   const controller = new AbortController();
   req.on('close', () => { controller.abort(); cleanup(); });
@@ -2793,31 +2912,40 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`Bot bypass: cookies=${hasCookies()} visitor_data=${!!YOUTUBE_VISITOR_DATA} po_token=${!!YOUTUBE_PO_TOKEN}`);
 });
 
-// BUG FIX: WebSocket server now properly handles seek progress notifications
 const wss = new WebSocketServer({ server });
 const wsClients = new Map(); // videoId -> Set of clients
 
 wss.on('connection', (ws, req) => {
-  // Parse video ID from URL if provided
   const url = new URL(req.url, `http://${req.headers.host}`);
   const videoId = url.searchParams.get('v');
+  const isAdmin = url.searchParams.get('admin') === '1';
 
-  if (videoId) {
+  if (isAdmin) {
+    adminWsClients.add(ws);
+    // Send current watching state immediately on connect
+    const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
+    if (cfg?.allow_co_watch) {
+      const now = Date.now();
+      const active = [];
+      for (const entry of watchingNow.values()) {
+        if (now - entry.updatedAt < 35000) active.push(entry);
+      }
+      ws.send(JSON.stringify({ type: 'watching_update', watching: active }));
+    } else {
+      ws.send(JSON.stringify({ type: 'watching_update', watching: [] }));
+    }
+  } else if (videoId) {
     if (!wsClients.has(videoId)) {
       wsClients.set(videoId, new Set());
     }
     wsClients.get(videoId).add(ws);
-
-    // Send initial ready state
     ws.send(JSON.stringify({ type: 'ready', videoId }));
   }
 
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
-      // Handle seek requests from client
-      if (msg.type === 'seek' && msg.time !== undefined) {
-        // Broadcast seek to other clients watching same video (for sync)
+      if (msg.type === 'seek' && msg.time !== undefined && videoId) {
         const clients = wsClients.get(videoId);
         if (clients) {
           clients.forEach(client => {
@@ -2833,7 +2961,9 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    if (videoId && wsClients.has(videoId)) {
+    if (isAdmin) {
+      adminWsClients.delete(ws);
+    } else if (videoId && wsClients.has(videoId)) {
       wsClients.get(videoId).delete(ws);
       if (wsClients.get(videoId).size === 0) {
         wsClients.delete(videoId);

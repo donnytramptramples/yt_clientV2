@@ -346,6 +346,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   const touchJustHappenedTimer = useRef(null);
   // Ref mirror of currentTime to avoid stale closures in non-reactive event handlers
   const currentTimeRef = useRef(0);
+  // Stable ref for position reporting (avoids stale closures in seekTo)
+  const reportWatchingRef = useRef(null);
 
   // Chapters list panel
   const [showChapters, setShowChapters] = useState(false);
@@ -394,6 +396,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       v.currentTime = clamped - currentProxyStart;
       currentTimeRef.current = clamped;
       setCurrentTime(clamped);
+      reportWatchingRef.current?.();
       return;
     }
 
@@ -405,6 +408,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const newSeek = Math.floor(clamped);
     proxySeekRef.current = newSeek;
     setProxySeek(newSeek);
+    reportWatchingRef.current?.();
   }, [duration]);
 
   const changeQuality = useCallback((q) => {
@@ -457,6 +461,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     setChapters([]);
     setHoverInfo(null);
     setShowChapters(false);
+
+    // Pre-check: ask server if it can handle another stream before loading
+    fetch('/api/stream/available')
+      .then(r => r.json())
+      .then(data => { if (!data.available) setServerBusy(true); })
+      .catch(() => {});
 
     // Formats — check sessionStorage first
     const cachedFormats = ssGet(`formats:${video.id}`);
@@ -569,6 +579,11 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     setCurrentCue(cue);
   }, [currentTime, subtitleCues, subtitlesEnabled]);
 
+  // Report position instantly when subtitles are toggled (for admin co-watch)
+  useEffect(() => {
+    reportWatchingRef.current?.();
+  }, [subtitlesEnabled]);
+
   // Check for saved resume position when video changes
   useEffect(() => {
     const saved = ssGet(`pos:${video.id}`);
@@ -606,6 +621,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   }, [video.id]);
 
   // Report current watching position to server every 10s (for admin co-watch)
+  // Also callable immediately via reportWatchingRef for instant seek/subtitle updates
   useEffect(() => {
     if (!video?.id || !user) return;
     const report = () => {
@@ -621,9 +637,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         }),
       }).catch(() => {});
     };
+    reportWatchingRef.current = report;
     report();
     const id = setInterval(report, 10000);
-    return () => clearInterval(id);
+    return () => { clearInterval(id); reportWatchingRef.current = null; };
   }, [video.id, user]);
 
   // Co-watch sync: if admin is watching with a user, poll their position and seek to match
@@ -858,6 +875,11 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const container = containerRef.current;
     if (!container) return;
 
+    const handleTouchStart = (e) => {
+      if (e.target.closest('.video-controls-layer')) return;
+      e.preventDefault(); // prevent scroll and double-tap zoom on the video area
+    };
+
     const handleTouchEnd = (e) => {
       if (e.target.closest('.video-controls-layer')) return;
       e.preventDefault(); // stop synthetic mouse/click events
@@ -888,8 +910,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       }
     };
 
+    container.addEventListener('touchstart', handleTouchStart, { passive: false });
     container.addEventListener('touchend', handleTouchEnd, { passive: false });
-    return () => container.removeEventListener('touchend', handleTouchEnd);
+    return () => {
+      container.removeEventListener('touchstart', handleTouchStart);
+      container.removeEventListener('touchend', handleTouchEnd);
+    };
   }, [seekTo, showSkip, showControls, togglePlay]); // currentTimeRef is a ref — no need to include
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;

@@ -8,7 +8,10 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     proxy: {
-      '/api': 'http://localhost:10000'
+      '/api': {
+        target: 'http://localhost:10000',
+        ws: true,
+      }
     }
   }
 });
