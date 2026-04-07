@@ -72,7 +72,18 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 const MAX_CONCURRENT_STREAMS = 5;
-let activeStreams = 0;
+// Use a Set so cleanup is always idempotent — each stream gets a unique ID
+const activeStreamSet = new Set();
+
+// ─── Currently-watching tracker ──────────────────────────────────────────────
+// userId → { videoId, title, thumbnail, position, updatedAt }
+const watchingNow = new Map();
+setInterval(() => {
+  const stale = Date.now() - 35000;
+  for (const [uid, d] of watchingNow.entries()) {
+    if (d.updatedAt < stale) watchingNow.delete(uid);
+  }
+}, 15000);
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Linux; Android 13; SM-A135F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
@@ -112,6 +123,51 @@ const YOUTUBE_COOKIES_B64 = process.env.YOUTUBE_COOKIES || '';
 // Write cookies to disk once on startup if provided
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ─── Encryption helpers ───────────────────────────────────────────────────────
+const KEY_FILE = path.join(DATA_DIR, '.key');
+let ENCRYPT_KEY;
+try {
+  ENCRYPT_KEY = Buffer.from(fs.readFileSync(KEY_FILE, 'utf8').trim(), 'hex');
+  if (ENCRYPT_KEY.length !== 32) throw new Error('bad key length');
+} catch {
+  ENCRYPT_KEY = crypto.randomBytes(32);
+  fs.writeFileSync(KEY_FILE, ENCRYPT_KEY.toString('hex'), 'utf8');
+  console.log('[crypto] Generated new encryption key at', KEY_FILE);
+}
+
+// AES-256-GCM encrypt — returns 'enc:<base64>' or original value if falsy
+function encrypt(text) {
+  if (!text) return text;
+  const str = String(text);
+  if (str.startsWith('enc:')) return str; // already encrypted
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPT_KEY, iv);
+  const enc = Buffer.concat([cipher.update(str, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return 'enc:' + Buffer.concat([iv, tag, enc]).toString('base64');
+}
+
+// AES-256-GCM decrypt — accepts 'enc:<base64>' or plain (legacy) text
+function decrypt(encoded) {
+  if (!encoded) return encoded;
+  const str = String(encoded);
+  if (!str.startsWith('enc:')) return str; // not yet encrypted (legacy data)
+  try {
+    const buf = Buffer.from(str.slice(4), 'base64');
+    const iv = buf.slice(0, 12);
+    const tag = buf.slice(12, 28);
+    const data = buf.slice(28);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPT_KEY, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+  } catch { return encoded; }
+}
+
+// SHA-256 hash for email lookups (deterministic, no salt needed for high-entropy values)
+function emailHash(email) {
+  return crypto.createHash('sha256').update(email.toLowerCase().trim()).digest('hex');
+}
 
 const COOKIES_PATH = path.join(DATA_DIR, 'cookies.txt');
 if (YOUTUBE_COOKIES_B64) {
@@ -183,7 +239,10 @@ authDb.exec(`
   CREATE TABLE IF NOT EXISTS admin_settings (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     max_accounts INTEGER DEFAULT 1000,
-    max_connections INTEGER DEFAULT 500
+    max_connections INTEGER DEFAULT 500,
+    max_sessions INTEGER DEFAULT 0,
+    show_passwords INTEGER DEFAULT 0,
+    allow_co_watch INTEGER DEFAULT 0
   );
   INSERT OR IGNORE INTO admin_settings (id, max_accounts, max_connections) VALUES (1, 1000, 500);
   CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -216,6 +275,33 @@ authDb.exec(`
 // Migrations
 try { authDb.exec('ALTER TABLE sessions ADD COLUMN last_seen INTEGER DEFAULT 0'); } catch {}
 try { authDb.exec('ALTER TABLE user_preferences ADD COLUMN use_algorithm INTEGER DEFAULT 1'); } catch {}
+try { authDb.exec('ALTER TABLE users ADD COLUMN plain_password TEXT DEFAULT NULL'); } catch {}
+try { authDb.exec('ALTER TABLE users ADD COLUMN email_hash TEXT DEFAULT NULL'); } catch {}
+try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN max_sessions INTEGER DEFAULT 0'); } catch {}
+try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN show_passwords INTEGER DEFAULT 0'); } catch {}
+try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN allow_co_watch INTEGER DEFAULT 0'); } catch {}
+authDb.prepare('UPDATE admin_settings SET max_sessions = 0 WHERE max_sessions IS NULL').run();
+authDb.prepare('UPDATE admin_settings SET show_passwords = 0 WHERE show_passwords IS NULL').run();
+authDb.prepare('UPDATE admin_settings SET allow_co_watch = 0 WHERE allow_co_watch IS NULL').run();
+
+// Encrypt existing plaintext emails and plain_passwords, and populate email_hash
+{
+  const rows = authDb.prepare(`SELECT id, email, plain_password FROM users WHERE email NOT LIKE 'enc:%'`).all();
+  const upd = authDb.prepare('UPDATE users SET email = ?, email_hash = ?, plain_password = ? WHERE id = ?');
+  for (const row of rows) {
+    const encEmail = encrypt(row.email);
+    const hash = emailHash(row.email);
+    const encPwd = row.plain_password && !row.plain_password.startsWith('enc:') ? encrypt(row.plain_password) : row.plain_password;
+    upd.run(encEmail, hash, encPwd, row.id);
+  }
+  // Also ensure email_hash is set for already-encrypted rows missing a hash
+  const missingHash = authDb.prepare(`SELECT id, email FROM users WHERE email_hash IS NULL`).all();
+  const updHash = authDb.prepare('UPDATE users SET email_hash = ? WHERE id = ?');
+  for (const row of missingHash) {
+    try { updHash.run(emailHash(decrypt(row.email)), row.id); } catch {}
+  }
+  if (rows.length > 0) console.log(`[crypto] Encrypted ${rows.length} existing user records`);
+}
 
 const subsDb = new Database(path.join(DATA_DIR, 'subscriptions.db'));
 subsDb.pragma('journal_mode = WAL');
@@ -266,7 +352,9 @@ function getSessionUser(token) {
     if (sess) authDb.prepare('DELETE FROM sessions WHERE token = ?').run(token);
     return null;
   }
-  return authDb.prepare('SELECT id, username, email FROM users WHERE id = ?').get(sess.user_id);
+  const u = authDb.prepare('SELECT id, username, email FROM users WHERE id = ?').get(sess.user_id);
+  if (u) u.email = decrypt(u.email);
+  return u;
 }
 
 function requireAuth(req, res, next) {
@@ -348,10 +436,11 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const hash = await bcrypt.hash(password, 10);
-    const stmt = authDb.prepare('INSERT INTO users (username, email, password_hash) VALUES (?,?,?)');
+    const cleanEmail = email.trim().toLowerCase();
+    const stmt = authDb.prepare('INSERT INTO users (username, email, email_hash, password_hash, plain_password) VALUES (?,?,?,?,?)');
     let result;
     try {
-      result = stmt.run(username.trim(), email.trim().toLowerCase(), hash);
+      result = stmt.run(username.trim(), encrypt(cleanEmail), emailHash(cleanEmail), hash, encrypt(password));
     } catch (e) {
       if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'Username or email already taken' });
       throw e;
@@ -376,11 +465,20 @@ app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-    const user = authDb.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(username, username.toLowerCase());
+    const user = authDb.prepare('SELECT * FROM users WHERE username = ? OR email_hash = ?').get(username, emailHash(username));
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // Check concurrent session limit
+    const loginSettings = authDb.prepare('SELECT max_sessions FROM admin_settings WHERE id = 1').get();
+    if (loginSettings?.max_sessions > 0) {
+      const activeSessions = authDb.prepare('SELECT COUNT(*) as cnt FROM sessions WHERE expires_at > ?').get(Date.now()).cnt;
+      if (activeSessions >= loginSettings.max_sessions) {
+        return res.status(429).json({ error: 'Server is full — maximum concurrent sessions reached. Try again later.' });
+      }
+    }
 
     const token = createSession(user.id);
     res.cookie('session', token, {
@@ -389,7 +487,7 @@ app.post('/api/auth/login', async (req, res) => {
       sameSite: 'lax',
       path: '/',
     });
-    res.json({ user: { id: user.id, username: user.username, email: user.email } });
+    res.json({ user: { id: user.id, username: user.username, email: decrypt(user.email) } });
   } catch (e) {
     console.error('[auth] login error:', e.message);
     res.status(500).json({ error: e.message });
@@ -461,12 +559,24 @@ app.get('/api/admin/check', requireAdmin, (req, res) => {
 app.get('/api/admin/users', requireAdmin, (req, res) => {
   try {
     const users = authDb.prepare(`
-      SELECT u.id, u.username, u.email, u.created_at,
+      SELECT u.id, u.username, u.email, u.created_at, u.plain_password,
         (SELECT COUNT(*) FROM sessions s WHERE s.user_id = u.id AND s.expires_at > ?) as active_sessions,
         (SELECT MAX(s.last_seen) FROM sessions s WHERE s.user_id = u.id) as last_seen,
         (SELECT COUNT(*) FROM watch_history wh WHERE wh.user_id = u.id) as watch_count
       FROM users u ORDER BY u.created_at DESC
     `).all(Date.now());
+
+    // Decrypt sensitive fields — only expose plain_password when show_passwords is enabled
+    const adminCfg = authDb.prepare('SELECT show_passwords FROM admin_settings WHERE id = 1').get();
+    const showPwds = !!(adminCfg?.show_passwords);
+    for (const u of users) {
+      u.email = decrypt(u.email);
+      if (showPwds) {
+        u.plain_password = decrypt(u.plain_password);
+      } else {
+        delete u.plain_password;
+      }
+    }
 
     // Attach subscription count from subsDb
     const subCounts = subsDb.prepare(`
@@ -510,7 +620,7 @@ app.post('/api/admin/users/:id/reset-password', requireAdmin, async (req, res) =
     const { password } = req.body;
     if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
     const hash = await bcrypt.hash(password, 10);
-    authDb.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id);
+    authDb.prepare('UPDATE users SET password_hash = ?, plain_password = ? WHERE id = ?').run(hash, encrypt(password), id);
     authDb.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
     res.json({ ok: true });
   } catch (e) {
@@ -531,6 +641,17 @@ app.get('/api/admin/users/:id/watch-history', requireAdmin, (req, res) => {
   }
 });
 
+app.get('/api/admin/users/:id/subscriptions', requireAdmin, (req, res) => {
+  try {
+    const { id } = req.params;
+    const subs = subsDb.prepare('SELECT * FROM subscriptions WHERE user_id = ? ORDER BY subscribed_at DESC').all(id);
+    const user = authDb.prepare('SELECT id, username FROM users WHERE id = ?').get(id);
+    res.json({ user, subscriptions: subs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/admin/settings', requireAdmin, (req, res) => {
   const settings = authDb.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
   res.json({ settings });
@@ -538,18 +659,63 @@ app.get('/api/admin/settings', requireAdmin, (req, res) => {
 
 app.post('/api/admin/settings', requireAdmin, (req, res) => {
   try {
-    const { max_accounts, max_connections } = req.body;
+    const { max_accounts, max_connections, max_sessions, show_passwords, allow_co_watch } = req.body;
     if (max_accounts !== undefined) {
       authDb.prepare('UPDATE admin_settings SET max_accounts = ? WHERE id = 1').run(parseInt(max_accounts));
     }
     if (max_connections !== undefined) {
       authDb.prepare('UPDATE admin_settings SET max_connections = ? WHERE id = 1').run(parseInt(max_connections));
     }
+    if (max_sessions !== undefined) {
+      authDb.prepare('UPDATE admin_settings SET max_sessions = ? WHERE id = 1').run(Math.max(0, parseInt(max_sessions) || 0));
+    }
+    if (show_passwords !== undefined) {
+      authDb.prepare('UPDATE admin_settings SET show_passwords = ? WHERE id = 1').run(show_passwords ? 1 : 0);
+    }
+    if (allow_co_watch !== undefined) {
+      authDb.prepare('UPDATE admin_settings SET allow_co_watch = ? WHERE id = 1').run(allow_co_watch ? 1 : 0);
+    }
     const settings = authDb.prepare('SELECT * FROM admin_settings WHERE id = 1').get();
     res.json({ settings });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ─── Currently-watching reporting (user-facing) ──────────────────────────────
+
+app.post('/api/watching', requireAuth, (req, res) => {
+  const { videoId, title, thumbnail, position } = req.body;
+  if (!videoId) return res.status(400).json({ error: 'videoId required' });
+  watchingNow.set(req.user.id, {
+    userId: req.user.id,
+    username: req.user.username,
+    videoId,
+    title: title || '',
+    thumbnail: thumbnail || '',
+    position: parseFloat(position) || 0,
+    updatedAt: Date.now(),
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/watching', requireAdmin, (req, res) => {
+  const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
+  if (!cfg?.allow_co_watch) return res.status(403).json({ error: 'Co-watch is disabled' });
+  const now = Date.now();
+  const active = [];
+  for (const entry of watchingNow.values()) {
+    if (now - entry.updatedAt < 35000) active.push(entry);
+  }
+  res.json({ watching: active });
+});
+
+app.get('/api/admin/watching/:userId', requireAdmin, (req, res) => {
+  const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
+  if (!cfg?.allow_co_watch) return res.status(403).json({ error: 'Co-watch is disabled' });
+  const entry = watchingNow.get(parseInt(req.params.userId));
+  if (!entry) return res.status(404).json({ error: 'User not currently watching' });
+  res.json(entry);
 });
 
 // ─── Watch history (user-facing) ─────────────────────────────────────────────
@@ -752,6 +918,65 @@ app.get('/api/saved/:videoId/status', requireAuth, (req, res) => {
 });
 
 // ─── YouTube helpers ─────────────────────────────────────────────────────────
+
+// ─── Chapter parsing ─────────────────────────────────────────────────────────
+function parseChaptersFromDescription(description, videoDuration) {
+  if (!description) return [];
+  const lines = description.split('\n');
+  const chapters = [];
+  // Match patterns like "0:00", "1:30", "1:02:30"
+  const tsRe = /^(?:(\d+):)?(\d+):(\d{2})\b/;
+  for (const line of lines) {
+    const m = line.match(tsRe);
+    if (!m) continue;
+    const h = parseInt(m[1] || 0);
+    const mn = parseInt(m[2]);
+    const s = parseInt(m[3]);
+    const time = h * 3600 + mn * 60 + s;
+    // Everything after the timestamp, stripping common separators
+    const title = line.replace(tsRe, '').replace(/^\s*[-–—|·•:]\s*/, '').trim();
+    if (title && time >= 0) chapters.push({ time, title });
+  }
+  // Must have at least 2 chapters and the first must be at 0:00
+  if (chapters.length < 2 || chapters[0].time !== 0) return [];
+  // Deduplicate by time
+  const seen = new Set();
+  const deduped = chapters.filter(c => { if (seen.has(c.time)) return false; seen.add(c.time); return true; });
+  // Add endTime for each chapter
+  for (let i = 0; i < deduped.length; i++) {
+    deduped[i].endTime = deduped[i + 1]?.time ?? (videoDuration || 0);
+  }
+  return deduped;
+}
+
+function extractChaptersFromInfo(info, videoDuration) {
+  try {
+    const playerOverlays = info.player_overlays;
+    if (!playerOverlays) return [];
+    // Try the observe array / get method
+    let mmBar = null;
+    if (typeof playerOverlays.get === 'function') {
+      mmBar = playerOverlays.get('MultiMarkersPlayerBar');
+    } else if (Array.isArray(playerOverlays)) {
+      mmBar = playerOverlays.find(n => n?.type === 'MultiMarkersPlayerBar');
+    }
+    if (!mmBar?.markers_map) return [];
+    for (const marker of mmBar.markers_map) {
+      const chaps = marker?.value?.chapters;
+      if (chaps?.length >= 2) {
+        const result = chaps.map((c, i, arr) => ({
+          title: String(c.title),
+          time: Math.floor((c.time_range_start_millis || 0) / 1000),
+          endTime: i + 1 < arr.length
+            ? Math.floor((arr[i + 1].time_range_start_millis || 0) / 1000)
+            : (videoDuration || 0),
+        }));
+        if (result.length >= 2) return result;
+      }
+    }
+  } catch {}
+  return [];
+}
 
 async function getVideoInfo(videoId) {
   const cached = infoCache.get(videoId);
@@ -1467,12 +1692,15 @@ app.get('/api/feed', requireAuth, async (req, res) => {
 app.get('/api/info/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
-  let duration = 0, title = '';
+  let duration = 0, title = '', chapters = [], description = '';
 
   try {
     const info = await getVideoInfo(videoId);
     duration = info.basic_info?.duration || 0;
     title = info.basic_info?.title || '';
+    description = info.basic_info?.short_description || '';
+    // Try to get chapters from the YouTube API first
+    chapters = extractChaptersFromInfo(info, duration);
   } catch {}
 
   if (!duration || !title) {
@@ -1480,7 +1708,13 @@ app.get('/api/info/:videoId', async (req, res) => {
       const data = await getYtDlpFormatsWithRetry(videoId);
       if (!duration && data.meta?.duration) duration = data.meta.duration;
       if (!title && data.meta?.title) title = data.meta.title;
+      if (!description && data.meta?.description) description = data.meta.description;
     } catch {}
+  }
+
+  // Fallback: parse chapters from description
+  if (chapters.length === 0 && description) {
+    chapters = parseChaptersFromDescription(description, duration);
   }
 
   if (!duration && !title) {
@@ -1490,7 +1724,7 @@ app.get('/api/info/:videoId', async (req, res) => {
     });
   }
 
-  res.json({ duration, title, source: 'combined' });
+  res.json({ duration, title, chapters, source: 'combined' });
 });
 
 app.get('/api/formats/:videoId', async (req, res) => {
@@ -1844,15 +2078,19 @@ app.get('/api/stream/:videoId', async (req, res) => {
     }
   }
 
-  if (activeStreams >= MAX_CONCURRENT_STREAMS) {
-    return res.status(503).json({ error: 'Server busy, please try again' });
+  const streamSettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
+  const maxStreams = streamSettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
+  if (activeStreamSet.size >= maxStreams) {
+    return res.status(503).json({ error: 'Server is busy, please try again later.' });
   }
 
-  activeStreams++;
-  const cleanup = () => { activeStreams = Math.max(0, activeStreams - 1); };
+  const streamId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  activeStreamSet.add(streamId);
+  let streamCleaned = false;
+  const cleanup = () => { if (!streamCleaned) { streamCleaned = true; activeStreamSet.delete(streamId); } };
 
   const controller = new AbortController();
-  req.on('close', () => controller.abort());
+  req.on('close', () => { controller.abort(); cleanup(); });
 
   try {
     const info = await getVideoInfo(videoId);
@@ -2539,7 +2777,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     youtube: !!youtube,
-    activeStreams,
+    activeStreams: activeStreamSet.size,
     cookies: hasCookies(),
     visitorData: !!YOUTUBE_VISITOR_DATA,
     poToken: !!YOUTUBE_PO_TOKEN,

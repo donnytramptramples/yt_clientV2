@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Shield, Users, Settings, LogOut, Trash2, RefreshCw, Eye, EyeOff, ChevronRight, ChevronLeft, Clock, Activity } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Shield, Users, Settings, LogOut, Trash2, RefreshCw, Eye, EyeOff, ChevronRight, ChevronLeft, Clock, Activity, Rss, Key, Radio, Play, ArrowLeft } from 'lucide-react';
+import VideoPlayer from './VideoPlayer';
 
 function timeAgo(ts) {
   if (!ts) return 'Never';
@@ -233,7 +234,62 @@ function UserWatchHistory({ userId, username, onBack }) {
   );
 }
 
-function ResetPasswordModal({ user, onClose }) {
+function UserSubscriptions({ userId, username, onBack }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`/api/admin/users/${userId}/subscriptions`, { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => setData(d))
+      .catch(() => setData({ subscriptions: [] }))
+      .finally(() => setLoading(false));
+  }, [userId]);
+
+  if (loading) return (
+    <div className="flex items-center justify-center h-64">
+      <div className="animate-spin w-8 h-8 border-2 border-red-500 border-t-transparent rounded-full" />
+    </div>
+  );
+
+  return (
+    <div>
+      <button onClick={onBack} className="flex items-center gap-2 text-gray-400 hover:text-white mb-6 transition-colors">
+        <ChevronLeft size={18} /> Back to users
+      </button>
+      <h2 className="text-xl font-bold mb-2">Subscriptions</h2>
+      <p className="text-gray-400 text-sm mb-6">User: <span className="text-white font-medium">{username}</span> — {data?.subscriptions?.length || 0} subscribed</p>
+
+      {data?.subscriptions?.length === 0 ? (
+        <p className="text-gray-500 text-center py-12">No subscriptions for this user yet.</p>
+      ) : (
+        <div className="space-y-2">
+          {data.subscriptions.map((sub) => (
+            <div key={sub.channel_id} className="flex items-center gap-3 p-3 rounded-lg bg-gray-800 border border-gray-700">
+              {sub.channel_avatar ? (
+                <img src={sub.channel_avatar} alt="" className="w-9 h-9 object-cover rounded-full flex-shrink-0 bg-gray-700" />
+              ) : (
+                <div className="w-9 h-9 rounded-full bg-gray-700 flex-shrink-0 flex items-center justify-center text-xs font-bold">
+                  {sub.channel_name?.[0]?.toUpperCase() || '?'}
+                </div>
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium truncate">{sub.channel_name}</p>
+                <p className="text-xs text-gray-500 truncate">{sub.channel_id}</p>
+              </div>
+              <div className="text-xs text-gray-500 flex-shrink-0 flex items-center gap-1">
+                <Clock size={12} />
+                {new Date(sub.subscribed_at).toLocaleDateString()}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResetPasswordModal({ user, onClose, onSuccess }) {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -253,6 +309,7 @@ function ResetPasswordModal({ user, onClose }) {
       const data = await r.json();
       if (!r.ok) throw new Error(data.error);
       setDone(true);
+      onSuccess?.(password);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -297,11 +354,18 @@ function Dashboard({ onLogout }) {
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState('users');
   const [viewingUser, setViewingUser] = useState(null);
-  const [settings, setSettings] = useState({ max_accounts: 1000, max_connections: 500 });
+  const [viewingUserMode, setViewingUserMode] = useState('history');
+  const [shownPasswords, setShownPasswords] = useState({});
+  const [settings, setSettings] = useState({ max_accounts: 1000, max_connections: 500, max_sessions: 0, show_passwords: false, allow_co_watch: false });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMsg, setSettingsMsg] = useState('');
   const [resetUser, setResetUser] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
+  // Watching / co-watch
+  const [watching, setWatching] = useState([]);
+  const [watchingLoading, setWatchingLoading] = useState(false);
+  const [coWatchEntry, setCoWatchEntry] = useState(null); // currently co-watching this user
+  const watchPollRef = useRef(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -309,13 +373,41 @@ function Dashboard({ onLogout }) {
       .then(r => r.json())
       .then(d => {
         setData(d);
-        if (d.settings) setSettings({ max_accounts: d.settings.max_accounts, max_connections: d.settings.max_connections });
+        if (d.settings) {
+          setSettings({
+            max_accounts: d.settings.max_accounts ?? 1000,
+            max_connections: d.settings.max_connections ?? 500,
+            max_sessions: d.settings.max_sessions ?? 0,
+            show_passwords: !!(d.settings.show_passwords),
+            allow_co_watch: !!(d.settings.allow_co_watch),
+          });
+        }
       })
       .catch(() => {})
       .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => { load(); }, [load]);
+
+  // Poll watching status whenever on users or watching tab, and co-watch is enabled
+  useEffect(() => {
+    if ((tab !== 'watching' && tab !== 'users') || !settings.allow_co_watch) {
+      clearInterval(watchPollRef.current);
+      setWatching([]);
+      return;
+    }
+    const poll = async () => {
+      if (tab === 'watching') setWatchingLoading(true);
+      try {
+        const r = await fetch('/api/admin/watching', { credentials: 'include' });
+        if (r.ok) { const d = await r.json(); setWatching(d.watching || []); }
+      } catch {}
+      if (tab === 'watching') setWatchingLoading(false);
+    };
+    poll();
+    watchPollRef.current = setInterval(poll, 10000);
+    return () => clearInterval(watchPollRef.current);
+  }, [tab, settings.allow_co_watch]);
 
   const handleDelete = async (userId) => {
     if (!window.confirm('Permanently delete this account and all its data?')) return;
@@ -326,6 +418,19 @@ function Dashboard({ onLogout }) {
     } catch {}
     setDeletingId(null);
   };
+
+  const handlePasswordReset = useCallback((userId, newPassword) => {
+    setData(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        users: prev.users.map(u =>
+          u.id === userId ? { ...u, plain_password: newPassword } : u
+        ),
+      };
+    });
+    setResetUser(null);
+  }, []);
 
   const handleSaveSettings = async () => {
     setSettingsSaving(true); setSettingsMsg('');
@@ -338,6 +443,17 @@ function Dashboard({ onLogout }) {
       });
       const d = await r.json();
       if (!r.ok) throw new Error(d.error);
+      if (d.settings) {
+        setSettings({
+          max_accounts: d.settings.max_accounts ?? 1000,
+          max_connections: d.settings.max_connections ?? 500,
+          max_sessions: d.settings.max_sessions ?? 0,
+          show_passwords: !!(d.settings.show_passwords),
+          allow_co_watch: !!(d.settings.allow_co_watch),
+        });
+        // Reload users list so password column appears/disappears immediately
+        load();
+      }
       setSettingsMsg('Settings saved successfully.');
     } catch (e) {
       setSettingsMsg('Error: ' + e.message);
@@ -351,17 +467,58 @@ function Dashboard({ onLogout }) {
     onLogout();
   };
 
-  if (viewingUser) {
+  // Co-watch view — render VideoPlayer inside admin panel
+  if (coWatchEntry) {
+    const coVideo = {
+      id: coWatchEntry.videoId,
+      title: coWatchEntry.title || 'Unknown video',
+      thumbnail: coWatchEntry.thumbnail || '',
+      channel: coWatchEntry.username ? `User: ${coWatchEntry.username}` : '',
+      channelId: '',
+      channelAvatar: '',
+      views: '',
+    };
     return (
-      <div className="min-h-screen bg-gray-950 text-white p-6">
-        <UserWatchHistory
-          userId={viewingUser.id}
-          username={viewingUser.username}
-          onBack={() => setViewingUser(null)}
-        />
+      <div className="min-h-screen bg-gray-950 text-white">
+        <div className="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center gap-3">
+          <button onClick={() => setCoWatchEntry(null)} className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm">
+            <ArrowLeft size={16} /> Back to admin
+          </button>
+          <span className="text-xs text-gray-500">Co-watching with <span className="text-yellow-400 font-medium">{coWatchEntry.username}</span> — syncs every 5 s</span>
+        </div>
+        <div className="p-4">
+          <VideoPlayer
+            video={coVideo}
+            user={null}
+            onBack={() => setCoWatchEntry(null)}
+            coWatchUserId={coWatchEntry.userId}
+          />
+        </div>
       </div>
     );
   }
+
+  if (viewingUser) {
+    return (
+      <div className="min-h-screen bg-gray-950 text-white p-6">
+        {viewingUserMode === 'subscriptions' ? (
+          <UserSubscriptions
+            userId={viewingUser.id}
+            username={viewingUser.username}
+            onBack={() => setViewingUser(null)}
+          />
+        ) : (
+          <UserWatchHistory
+            userId={viewingUser.id}
+            username={viewingUser.username}
+            onBack={() => setViewingUser(null)}
+          />
+        )}
+      </div>
+    );
+  }
+
+  const showPwdColumn = settings.show_passwords;
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -391,7 +548,9 @@ function Dashboard({ onLogout }) {
             <div className="text-sm text-gray-400 mt-1">Account Limit</div>
           </div>
           <div className="bg-gray-900 rounded-xl border border-gray-700 p-4">
-            <div className="text-3xl font-bold text-purple-400">{data.settings?.max_connections ?? '—'}</div>
+            <div className="text-3xl font-bold text-purple-400">
+              {data.settings?.max_sessions > 0 ? data.settings.max_sessions : '∞'}
+            </div>
             <div className="text-sm text-gray-400 mt-1">Session Limit</div>
           </div>
         </div>
@@ -400,6 +559,7 @@ function Dashboard({ onLogout }) {
       <div className="flex border-b border-gray-800 px-6">
         {[
           { id: 'users', label: 'Users', icon: Users },
+          ...(settings.allow_co_watch ? [{ id: 'watching', label: 'Watching', icon: Radio }] : []),
           { id: 'settings', label: 'Settings', icon: Settings },
         ].map(({ id, label, icon: Icon }) => (
           <button
@@ -410,6 +570,9 @@ function Dashboard({ onLogout }) {
             }`}
           >
             <Icon size={15} /> {label}
+            {id === 'watching' && watching.length > 0 && (
+              <span className="bg-green-500 text-white text-[10px] rounded-full w-4 h-4 flex items-center justify-center">{watching.length}</span>
+            )}
           </button>
         ))}
         <div className="ml-auto flex items-center py-3">
@@ -430,22 +593,41 @@ function Dashboard({ onLogout }) {
               <div className="space-y-2">
                 {(data?.users || []).map(user => {
                   const isActive = user.last_seen && (Date.now() - user.last_seen) < 15 * 60 * 1000;
+                  const watchEntry = watching.find(w => w.userId === user.id && (Date.now() - w.updatedAt) < 35000);
                   return (
-                    <div key={user.id} className="flex items-center gap-4 p-4 bg-gray-900 rounded-xl border border-gray-700 hover:border-gray-600 transition-colors">
+                    <div key={user.id} className={`flex items-center gap-4 p-4 bg-gray-900 rounded-xl border transition-colors ${watchEntry ? 'border-green-700 hover:border-green-600' : 'border-gray-700 hover:border-gray-600'}`}>
                       <div className="w-10 h-10 rounded-full bg-gradient-to-br from-gray-600 to-gray-700 flex items-center justify-center text-sm font-bold flex-shrink-0">
                         {user.username[0]?.toUpperCase()}
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{user.username}</span>
-                          {isActive && (
+                          {watchEntry ? (
                             <span className="flex items-center gap-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded-full px-2 py-0.5">
                               <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" />
+                              Watching now
+                            </span>
+                          ) : isActive ? (
+                            <span className="flex items-center gap-1 text-xs bg-gray-700/60 text-gray-400 border border-gray-600 rounded-full px-2 py-0.5">
+                              <span className="w-1.5 h-1.5 bg-gray-400 rounded-full" />
                               Online
                             </span>
-                          )}
+                          ) : null}
                         </div>
-                        <div className="text-sm text-gray-400 truncate">{user.email}</div>
+                        {watchEntry && (
+                          <div className="flex items-center gap-2 mt-1 bg-green-950/40 border border-green-800/40 rounded-lg px-2 py-1">
+                            {watchEntry.thumbnail && (
+                              <img src={watchEntry.thumbnail} alt="" className="w-12 h-7 object-cover rounded flex-shrink-0 bg-gray-700" />
+                            )}
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs text-green-300 truncate font-medium">{watchEntry.title}</p>
+                              <p className="text-[11px] text-green-600">
+                                At {Math.floor(watchEntry.position / 60)}:{String(Math.floor(watchEntry.position) % 60).padStart(2, '0')}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+                        <div className="text-sm text-gray-400 truncate mt-1">{user.email}</div>
                         <div className="text-xs text-gray-500 flex items-center gap-3 mt-1 flex-wrap">
                           <span>Joined {new Date(user.created_at).toLocaleDateString()}</span>
                           <span className="flex items-center gap-1"><Clock size={11} /> Last seen {timeAgo(user.last_seen)}</span>
@@ -456,13 +638,44 @@ function Dashboard({ onLogout }) {
                             <Eye size={11} /> {user.watch_count ?? 0} watched
                           </span>
                         </div>
+                        {/* Password display — only when show_passwords is enabled in settings */}
+                        {showPwdColumn && (
+                          <div className="flex items-center gap-2 mt-1.5">
+                            <Key size={11} className="text-yellow-500/70 flex-shrink-0" />
+                            <span className="text-xs font-mono text-yellow-400/80">
+                              {shownPasswords[user.id]
+                                ? (user.plain_password || <span className="text-gray-500 italic">not recorded</span>)
+                                : '••••••••'}
+                            </span>
+                            <button
+                              onClick={() => setShownPasswords(p => ({ ...p, [user.id]: !p[user.id] }))}
+                              className="text-gray-500 hover:text-yellow-400 transition-colors"
+                            >
+                              {shownPasswords[user.id] ? <EyeOff size={11} /> : <Eye size={11} />}
+                            </button>
+                          </div>
+                        )}
                       </div>
-                      <div className="flex items-center gap-2 flex-shrink-0">
+                      <div className="flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
                         <button
-                          onClick={() => setViewingUser(user)}
+                          onClick={() => { setViewingUserMode('history'); setViewingUser(user); }}
                           className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-blue-600 text-gray-300 hover:text-white transition-colors border border-gray-700"
                         >
                           <Eye size={13} /> History <ChevronRight size={13} />
+                        </button>
+                        {watchEntry && settings.allow_co_watch && (
+                          <button
+                            onClick={() => setCoWatchEntry(watchEntry)}
+                            className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-green-900/60 hover:bg-yellow-600 text-green-300 hover:text-white transition-colors border border-green-700"
+                          >
+                            <Play size={13} /> Watch with
+                          </button>
+                        )}
+                        <button
+                          onClick={() => { setViewingUserMode('subscriptions'); setViewingUser(user); }}
+                          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-green-600 text-gray-300 hover:text-white transition-colors border border-gray-700"
+                        >
+                          <Rss size={13} /> Subs <ChevronRight size={13} />
                         </button>
                         <button
                           onClick={() => setResetUser(user)}
@@ -489,6 +702,51 @@ function Dashboard({ onLogout }) {
           </div>
         )}
 
+        {tab === 'watching' && (
+          <div>
+            <div className="flex items-center justify-between mb-4">
+              <p className="text-sm text-gray-400">Users currently watching a video (updated every 10 s)</p>
+              {watchingLoading && <div className="animate-spin w-4 h-4 border border-red-500 border-t-transparent rounded-full" />}
+            </div>
+            {watching.length === 0 ? (
+              <p className="text-gray-500 text-center py-12">No one is watching right now.</p>
+            ) : (
+              <div className="space-y-3">
+                {watching.map(entry => {
+                  const secsAgo = Math.floor((Date.now() - entry.updatedAt) / 1000);
+                  return (
+                    <div key={entry.userId} className="flex items-center gap-4 p-4 bg-gray-900 rounded-xl border border-gray-700">
+                      {entry.thumbnail ? (
+                        <img src={entry.thumbnail} alt="" className="w-20 h-12 object-cover rounded flex-shrink-0 bg-gray-700" />
+                      ) : (
+                        <div className="w-20 h-12 rounded bg-gray-700 flex-shrink-0" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="font-medium text-sm">{entry.username}</span>
+                          <span className="flex items-center gap-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded-full px-2 py-0.5">
+                            <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" /> Live
+                          </span>
+                        </div>
+                        <p className="text-xs text-gray-300 truncate">{entry.title}</p>
+                        <p className="text-xs text-gray-500 mt-0.5">
+                          At {Math.floor(entry.position / 60)}:{String(entry.position % 60).padStart(2, '0')} · updated {secsAgo}s ago
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setCoWatchEntry(entry)}
+                        className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-gray-800 hover:bg-yellow-600 text-gray-300 hover:text-white transition-colors border border-gray-700 flex-shrink-0"
+                      >
+                        <Play size={13} /> Watch with
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === 'settings' && (
           <div className="max-w-md space-y-6">
             <div>
@@ -507,9 +765,24 @@ function Dashboard({ onLogout }) {
                   />
                   <p className="text-xs text-gray-500 mt-1">New registrations are blocked when this limit is reached.</p>
                 </div>
+
                 <div>
                   <label className="block text-sm text-gray-400 mb-1">
-                    Max Concurrent Connections
+                    Max Concurrent Sessions <span className="text-gray-500">(0 = unlimited)</span>
+                  </label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={settings.max_sessions}
+                    onChange={e => setSettings(s => ({ ...s, max_sessions: parseInt(e.target.value) || 0 }))}
+                    className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-red-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Login is blocked when this many active user sessions exist. 0 means no limit.</p>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-1">
+                    Max Concurrent Streams
                   </label>
                   <input
                     type="number"
@@ -518,35 +791,67 @@ function Dashboard({ onLogout }) {
                     onChange={e => setSettings(s => ({ ...s, max_connections: parseInt(e.target.value) || 1 }))}
                     className="w-full bg-gray-800 border border-gray-600 rounded-lg px-4 py-3 text-white focus:outline-none focus:border-red-500"
                   />
-                  <p className="text-xs text-gray-500 mt-1">Maximum number of simultaneous active sessions allowed.</p>
+                  <p className="text-xs text-gray-500 mt-1">Maximum simultaneous video/audio streams. Excess requests get a "server busy" error.</p>
                 </div>
-
-                {settingsMsg && (
-                  <p className={`text-sm ${settingsMsg.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>{settingsMsg}</p>
-                )}
-
-                <button
-                  onClick={handleSaveSettings}
-                  disabled={settingsSaving}
-                  className="px-6 py-2.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-medium transition-colors disabled:opacity-50"
-                >
-                  {settingsSaving ? 'Saving...' : 'Save Settings'}
-                </button>
               </div>
             </div>
 
             <div className="border-t border-gray-800 pt-6">
-              <h3 className="font-semibold mb-2 text-gray-300">Security Note</h3>
-              <p className="text-sm text-gray-500">
-                User passwords are stored as bcrypt hashes and cannot be recovered. You can reset a user's password to a new value using the "Reset PW" button. All existing sessions for that user will be invalidated.
-              </p>
+              <h3 className="font-semibold text-lg mb-4">Privacy &amp; Features</h3>
+              <div className="space-y-5">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <div className="relative flex-shrink-0 mt-0.5">
+                    <input type="checkbox" className="sr-only" checked={settings.show_passwords}
+                      onChange={e => setSettings(s => ({ ...s, show_passwords: e.target.checked }))} />
+                    <div className={`w-10 h-6 rounded-full transition-colors ${settings.show_passwords ? 'bg-yellow-500' : 'bg-gray-700'}`} />
+                    <div className={`absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all ${settings.show_passwords ? 'left-5' : 'left-1'}`} />
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium text-white">Show passwords to admin</div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      When enabled, a per-user eye icon lets you reveal their stored (encrypted) password on their card.
+                    </div>
+                  </div>
+                </label>
+
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <div className="relative flex-shrink-0 mt-0.5">
+                    <input type="checkbox" className="sr-only" checked={settings.allow_co_watch}
+                      onChange={e => setSettings(s => ({ ...s, allow_co_watch: e.target.checked }))} />
+                    <div className={`w-10 h-6 rounded-full transition-colors ${settings.allow_co_watch ? 'bg-green-500' : 'bg-gray-700'}`} />
+                    <div className={`absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all ${settings.allow_co_watch ? 'left-5' : 'left-1'}`} />
+                  </div>
+                  <div>
+                    <div className="text-sm font-medium text-white">Enable co-watch (silent admin viewing)</div>
+                    <div className="text-xs text-gray-500 mt-0.5">
+                      Shows a "Watching" tab with currently active viewers. Admin can silently watch the same video at the same position — users are never notified.
+                    </div>
+                  </div>
+                </label>
+              </div>
             </div>
+
+            {settingsMsg && (
+              <p className={`text-sm ${settingsMsg.startsWith('Error') ? 'text-red-400' : 'text-green-400'}`}>{settingsMsg}</p>
+            )}
+
+            <button
+              onClick={handleSaveSettings}
+              disabled={settingsSaving}
+              className="px-6 py-2.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-medium transition-colors disabled:opacity-50"
+            >
+              {settingsSaving ? 'Saving...' : 'Save Settings'}
+            </button>
           </div>
         )}
       </div>
 
       {resetUser && (
-        <ResetPasswordModal user={resetUser} onClose={() => setResetUser(null)} />
+        <ResetPasswordModal
+          user={resetUser}
+          onClose={() => setResetUser(null)}
+          onSuccess={(newPassword) => handlePasswordReset(resetUser.id, newPassword)}
+        />
       )}
     </div>
   );

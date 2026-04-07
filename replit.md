@@ -75,6 +75,27 @@ bash start.sh
 - Build: `npm run build` (creates `dist/`)
 - Run: `node server.js` (serves dist/ statically + API on PORT)
 
+## Video Chapters
+
+Chapters are extracted in this order:
+1. From YouTube's `MultiMarkersPlayerBar` via youtubei.js `player_overlays`
+2. Parsed from the video description (timestamp lines like `0:00 Intro`)
+
+Chapters are returned in `/api/info/:videoId` and cached in sessionStorage. The VideoPlayer displays:
+- White divider marks on the progress bar at each chapter boundary
+- Chapter name + time tooltip when hovering over the progress bar
+- Current chapter name displayed inline next to the timestamp
+
+## Database Encryption
+
+Sensitive fields in `auth.db` are encrypted at rest using AES-256-GCM:
+- `users.email` — stored encrypted, looked up via `users.email_hash` (SHA-256)
+- `users.plain_password` — stored encrypted
+
+The encryption key is auto-generated on first run and stored at `data/.key`.
+Existing plaintext records are automatically migrated to encrypted form on startup.
+The `enc:` prefix is used to distinguish encrypted from legacy plaintext data.
+
 ## Bot Detection Fixes
 
 yt-dlp tries these clients in order until one works:

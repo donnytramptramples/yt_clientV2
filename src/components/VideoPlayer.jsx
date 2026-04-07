@@ -266,7 +266,7 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
   );
 }
 
-export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
+export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWatchUserId = null }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
   const progressRef = useRef(null);
@@ -305,6 +305,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
   const [autoTranslate, setAutoTranslate] = useState(false);
   const [translateTo, setTranslateTo] = useState('en');
 
+  // Chapters
+  const [chapters, setChapters] = useState([]);
+  const [hoverInfo, setHoverInfo] = useState(null); // { pct, time, chapter }
+
   // Description + Comments
   const [description, setDescription] = useState('');
   const [comments, setComments] = useState([]);
@@ -324,6 +328,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
   // Resume prompt
   const [resumeAt, setResumeAt] = useState(null);
 
+  // Server busy state
+  const [serverBusy, setServerBusy] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
+
   // CSS-based fullscreen fallback (when native fullscreen is unavailable, e.g. in iframes)
   const [cssFull, setCssFull] = useState(false);
 
@@ -333,6 +341,14 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
 
   // Double-tap tracking for touch seek
   const lastTapRef = useRef({ time: 0, side: null });
+  // Prevents onClick from firing after a touch event
+  const touchJustHappenedRef = useRef(false);
+  const touchJustHappenedTimer = useRef(null);
+  // Ref mirror of currentTime to avoid stale closures in non-reactive event handlers
+  const currentTimeRef = useRef(0);
+
+  // Chapters list panel
+  const [showChapters, setShowChapters] = useState(false);
 
   // Proxy seeking — all seeking goes through proxySeekRef; no native seeking for proxy streams
   const [proxySeek, setProxySeek] = useState(0);
@@ -376,6 +392,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     if (isBuffered && clamped >= currentProxyStart) {
       // Native seek — instant, no server round-trip
       v.currentTime = clamped - currentProxyStart;
+      currentTimeRef.current = clamped;
       setCurrentTime(clamped);
       return;
     }
@@ -383,6 +400,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     // Target is outside any buffered range or before the proxy start —
     // reload the proxy stream from the target position.
     seekReloadRef.current = true;
+    currentTimeRef.current = clamped;
     setCurrentTime(clamped);
     const newSeek = Math.floor(clamped);
     proxySeekRef.current = newSeek;
@@ -435,6 +453,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     proxySeekRef.current = 0;
     seekReloadRef.current = false;
     wasPlayingRef.current = false;
+    setServerBusy(false);
+    setChapters([]);
+    setHoverInfo(null);
+    setShowChapters(false);
 
     // Formats — check sessionStorage first
     const cachedFormats = ssGet(`formats:${video.id}`);
@@ -460,15 +482,17 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
         .finally(() => setFormatsLoading(false));
     }
 
-    // Info (duration) — check sessionStorage first
+    // Info (duration + chapters) — check sessionStorage first
     const cachedInfo = ssGet(`info:${video.id}`);
     if (cachedInfo) {
       if (cachedInfo.duration) { apiDuration.current = cachedInfo.duration; setDuration(cachedInfo.duration); }
+      if (cachedInfo.chapters?.length) setChapters(cachedInfo.chapters);
     } else {
       fetch(`/api/info/${video.id}`)
         .then(r => r.json())
         .then(data => {
           if (data.duration) { apiDuration.current = data.duration; setDuration(data.duration); }
+          if (data.chapters?.length) setChapters(data.chapters);
           ssSet(`info:${video.id}`, data);
         })
         .catch(() => {});
@@ -581,6 +605,46 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     return () => clearTimeout(timer);
   }, [video.id]);
 
+  // Report current watching position to server every 10s (for admin co-watch)
+  useEffect(() => {
+    if (!video?.id || !user) return;
+    const report = () => {
+      fetch('/api/watching', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          videoId: video.id,
+          title: video.title || '',
+          thumbnail: video.thumbnail || '',
+          position: Math.floor(currentTimeRef.current),
+        }),
+      }).catch(() => {});
+    };
+    report();
+    const id = setInterval(report, 10000);
+    return () => clearInterval(id);
+  }, [video.id, user]);
+
+  // Co-watch sync: if admin is watching with a user, poll their position and seek to match
+  useEffect(() => {
+    if (!coWatchUserId) return;
+    const sync = async () => {
+      try {
+        const r = await fetch(`/api/admin/watching/${coWatchUserId}`, { credentials: 'include' });
+        if (!r.ok) return;
+        const data = await r.json();
+        const target = data.position || 0;
+        if (Math.abs(currentTimeRef.current - target) > 5) {
+          seekTo(target);
+        }
+      } catch {}
+    };
+    sync();
+    const id = setInterval(sync, 5000);
+    return () => clearInterval(id);
+  }, [coWatchUserId, seekTo]);
+
   const proxyUrl = quality ? `/api/proxy/${video.id}?quality=${quality}${proxySeek > 0 ? `&t=${proxySeek}` : ''}` : null;
 
   const toggleSubscribe = async () => {
@@ -630,7 +694,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     if (!v) return;
 
     const onTimeUpdate = () => {
-      setCurrentTime(proxySeekRef.current + v.currentTime);
+      const t = proxySeekRef.current + v.currentTime;
+      currentTimeRef.current = t;
+      setCurrentTime(t);
       if (v.buffered.length > 0) {
         setBufferedEnd(proxySeekRef.current + v.buffered.end(v.buffered.length - 1));
       }
@@ -665,7 +731,16 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     const onLoadStart = () => { setIsLoading(true); };
 
     const onEnded = () => setPlaying(false);
-    const onError = () => { setIsLoading(false); };
+    const onError = async () => {
+      setIsLoading(false);
+      // Check if the server returned a 503 (too busy)
+      if (proxyUrl) {
+        try {
+          const r = await fetch(proxyUrl, { method: 'HEAD' });
+          if (r.status === 503) { setServerBusy(true); return; }
+        } catch {}
+      }
+    };
 
     v.addEventListener('timeupdate', onTimeUpdate);
     v.addEventListener('durationchange', onDurationChange);
@@ -775,35 +850,52 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
     }
   };
 
-  // Double-tap left/right to seek ±10 s; single tap toggles play (debounced).
+  // Double-tap left/right to seek ±10 s; single tap toggles play.
+  // Uses a non-passive touchend listener so we can call preventDefault() and
+  // prevent the synthetic click event that mobile browsers fire after touch.
   const singleTapTimer = useRef(null);
-  const handleTouchEnd = useCallback((e) => {
-    if (e.target.closest('.video-controls-layer')) return;
-    const touch = e.changedTouches[0];
-    if (!touch || !containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const side = touch.clientX < rect.left + rect.width / 2 ? 'left' : 'right';
-    const now = Date.now();
-    const last = lastTapRef.current;
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
 
-    if (now - last.time < 300 && last.side === side) {
-      clearTimeout(singleTapTimer.current);
-      e.preventDefault();
-      seekTo(currentTime + (side === 'left' ? -10 : 10));
-      showSkip(side);
-      showControls();
-      lastTapRef.current = { time: 0, side: null };
-    } else {
-      lastTapRef.current = { time: now, side };
-      clearTimeout(singleTapTimer.current);
-      singleTapTimer.current = setTimeout(() => { togglePlay(); showControls(); }, 220);
-      e.preventDefault();
-    }
-  }, [currentTime, seekTo, showSkip, showControls, togglePlay]);
+    const handleTouchEnd = (e) => {
+      if (e.target.closest('.video-controls-layer')) return;
+      e.preventDefault(); // stop synthetic mouse/click events
+
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      const rect = container.getBoundingClientRect();
+      const side = touch.clientX < rect.left + rect.width / 2 ? 'left' : 'right';
+      const now = Date.now();
+      const last = lastTapRef.current;
+
+      if (now - last.time < 350 && last.side === side) {
+        // Double-tap: seek ±10s
+        clearTimeout(singleTapTimer.current);
+        singleTapTimer.current = null;
+        lastTapRef.current = { time: 0, side: null };
+        seekTo(currentTimeRef.current + (side === 'left' ? -10 : 10));
+        showSkip(side);
+        showControls();
+      } else {
+        // Single tap: wait to see if a second tap arrives
+        lastTapRef.current = { time: now, side };
+        clearTimeout(singleTapTimer.current);
+        singleTapTimer.current = setTimeout(() => {
+          togglePlay();
+          showControls();
+        }, 350);
+      }
+    };
+
+    container.addEventListener('touchend', handleTouchEnd, { passive: false });
+    return () => container.removeEventListener('touchend', handleTouchEnd);
+  }, [seekTo, showSkip, showControls, togglePlay]); // currentTimeRef is a ref — no need to include
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPct = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
   const noSubtitlesAvailable = availableSubtitles.length === 0;
+  const currentChapter = chapters.length > 0 ? chapters.findLast(c => currentTime >= c.time) ?? null : null;
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -837,13 +929,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
         onMouseMove={showControls}
         onClick={() => { togglePlay(); showControls(); }}
         onDoubleClick={toggleFullscreen}
-        onTouchEnd={handleTouchEnd}
         onKeyDown={(e) => { if (e.key === 'Escape' && cssFull) { setCssFull(false); setFullscreen(false); } }}
         tabIndex={-1}
       >
         {proxyUrl && (
           <video
-            key={`${video.id}-${quality}-${proxySeek}`}
+            key={`${video.id}-${quality}-${proxySeek}-${retryKey}`}
             ref={videoRef}
             src={proxyUrl}
             className="video-element"
@@ -866,7 +957,18 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
           </>
         )}
 
-        {(isLoading || formatsLoading || !proxyUrl) && (
+        {serverBusy ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 gap-4">
+            <div className="text-center">
+              <p className="text-white text-lg font-semibold">Server is busy</p>
+              <p className="text-white/60 text-sm mt-1">Please try again later</p>
+            </div>
+            <button
+              className="px-5 py-2 rounded-lg bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90"
+              onClick={(e) => { e.stopPropagation(); setServerBusy(false); setIsLoading(true); setRetryKey(k => k + 1); }}
+            >Retry</button>
+          </div>
+        ) : (isLoading || formatsLoading || !proxyUrl) && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/75 pointer-events-none gap-4">
             <Loader2 size={56} className="text-[var(--accent)] animate-spin" />
             <div className="text-center">
@@ -906,18 +1008,54 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
           onClick={e => e.stopPropagation()}
         >
           <div className="px-4 pb-1 pt-4">
-            <div
-              ref={progressRef}
-              className="relative h-1.5 rounded-full bg-white/25 cursor-pointer group/bar"
-              style={{ touchAction: 'none' }}
-              onMouseDown={onProgressMouseDown}
-            >
-              <div className="absolute inset-y-0 left-0 rounded-full bg-white/30" style={{ width: `${bufferedPct}%` }} />
-              <div className="absolute inset-y-0 left-0 rounded-full bg-[var(--accent)]" style={{ width: `${progressPct}%` }} />
+            {/* Chapter markers + progress bar */}
+            <div className="relative">
+              {/* Chapter hover tooltip */}
+              {hoverInfo && (
+                <div
+                  className="absolute bottom-full mb-2 pointer-events-none z-10 flex flex-col items-center"
+                  style={{ left: `${hoverInfo.pct}%`, transform: 'translateX(-50%)' }}
+                >
+                  {hoverInfo.chapter && (
+                    <div className="text-xs bg-black/90 text-white px-2 py-0.5 rounded mb-0.5 whitespace-nowrap max-w-[200px] truncate">
+                      {hoverInfo.chapter.title}
+                    </div>
+                  )}
+                  <div className="text-xs bg-black/90 text-white px-2 py-0.5 rounded whitespace-nowrap font-mono">
+                    {formatTime(hoverInfo.time)}
+                  </div>
+                </div>
+              )}
               <div
-                className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full -ml-1.5 opacity-0 group-hover/bar:opacity-100 transition-opacity"
-                style={{ left: `${progressPct}%` }}
-              />
+                ref={progressRef}
+                className="relative h-1.5 rounded-full bg-white/25 cursor-pointer group/bar"
+                style={{ touchAction: 'none' }}
+                onMouseDown={onProgressMouseDown}
+                onMouseMove={(e) => {
+                  if (!duration || !progressRef.current) return;
+                  const rect = progressRef.current.getBoundingClientRect();
+                  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  const time = pct * duration;
+                  const chapter = chapters.length > 0 ? (chapters.findLast(c => time >= c.time) ?? null) : null;
+                  setHoverInfo({ pct: pct * 100, time, chapter });
+                }}
+                onMouseLeave={() => setHoverInfo(null)}
+              >
+                <div className="absolute inset-y-0 left-0 rounded-full bg-white/30" style={{ width: `${bufferedPct}%` }} />
+                <div className="absolute inset-y-0 left-0 rounded-full bg-[var(--accent)]" style={{ width: `${progressPct}%` }} />
+                {/* Chapter dividers */}
+                {chapters.length > 1 && duration > 0 && chapters.slice(1).map((ch) => (
+                  <div
+                    key={ch.time}
+                    className="absolute top-0 bottom-0 w-px bg-black/60 z-10"
+                    style={{ left: `${(ch.time / duration) * 100}%` }}
+                  />
+                ))}
+                <div
+                  className="absolute top-1/2 -translate-y-1/2 w-3 h-3 bg-white rounded-full -ml-1.5 opacity-0 group-hover/bar:opacity-100 transition-opacity"
+                  style={{ left: `${progressPct}%` }}
+                />
+              </div>
             </div>
           </div>
 
@@ -929,6 +1067,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
             <span className="text-xs tabular-nums whitespace-nowrap">
               {formatTime(currentTime)} / {duration ? formatTime(duration) : '--:--'}
             </span>
+
+            {currentChapter && (
+              <span className="text-xs text-white/60 truncate max-w-[180px] hidden sm:block" title={currentChapter.title}>
+                {currentChapter.title}
+              </span>
+            )}
 
             <div className="flex items-center gap-1.5 group/vol">
               <button onClick={toggleMute} className="hover:text-[var(--accent)] transition-colors">
@@ -1190,6 +1334,46 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect }) {
           </div>
         </div>
       </div>
+
+      {/* Chapters list */}
+      {chapters.length >= 2 && (
+        <div className="mt-3 breeze-card">
+          <button
+            className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-[var(--bg-primary)] transition-colors"
+            onClick={() => setShowChapters(s => !s)}
+          >
+            <span className="font-medium text-sm flex items-center gap-2">
+              <span className="text-[var(--accent)]">▶</span>
+              Chapters <span className="text-[var(--text-secondary)] font-normal text-xs">({chapters.length})</span>
+            </span>
+            {showChapters ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          </button>
+          {showChapters && (
+            <div className="px-2 pb-3 flex flex-col gap-0.5 max-h-72 overflow-y-auto">
+              {chapters.map((ch, i) => {
+                const isActive = currentChapter === ch;
+                return (
+                  <button
+                    key={ch.time}
+                    onClick={() => seekTo(ch.time)}
+                    className={`flex items-center gap-3 px-3 py-2 rounded-lg text-left transition-colors w-full ${
+                      isActive
+                        ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
+                        : 'hover:bg-[var(--bg-primary)] text-[var(--text-primary)]'
+                    }`}
+                  >
+                    <span className={`text-xs font-mono tabular-nums flex-shrink-0 ${isActive ? 'text-[var(--accent)]' : 'text-[var(--text-secondary)]'}`}>
+                      {formatTime(ch.time)}
+                    </span>
+                    <span className={`text-sm truncate ${isActive ? 'font-semibold' : ''}`}>{ch.title}</span>
+                    {isActive && <span className="ml-auto flex-shrink-0 w-1.5 h-1.5 bg-[var(--accent)] rounded-full" />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Description */}
       <div className="mt-3 breeze-card">
