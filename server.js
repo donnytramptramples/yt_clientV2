@@ -69,7 +69,7 @@ Log.setLevel(Log.Level.ERROR);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 5000;
 
 const MAX_CONCURRENT_STREAMS = 5;
 // Use a Set so cleanup is always idempotent — each stream gets a unique ID
@@ -722,6 +722,9 @@ app.post('/api/admin/settings', requireAdmin, (req, res) => {
 // Admin WebSocket clients for real-time watching updates
 const adminWsClients = new Set();
 
+// Maps each admin WS connection → the userId they are currently co-watching (if any)
+const coWatchTargets = new Map();
+
 function broadcastWatchingToAdmins() {
   if (adminWsClients.size === 0) return;
   const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
@@ -737,10 +740,19 @@ function broadcastWatchingToAdmins() {
   }
 }
 
+// Push a single user's state to every admin WS that registered interest via cowatch_join
+function pushCowatchUpdate(userId, entry) {
+  if (coWatchTargets.size === 0) return;
+  const msg = JSON.stringify({ type: 'cowatch_update', data: entry });
+  for (const [ws, targetId] of coWatchTargets.entries()) {
+    if (targetId === userId && ws.readyState === 1) ws.send(msg);
+  }
+}
+
 app.post('/api/watching', requireAuth, (req, res) => {
   const { videoId, title, thumbnail, position, paused, speed, quality, subtitleLang, subtitlesOn } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
-  watchingNow.set(req.user.id, {
+  const entry = {
     userId: req.user.id,
     username: req.user.username,
     videoId,
@@ -753,8 +765,10 @@ app.post('/api/watching', requireAuth, (req, res) => {
     subtitleLang: subtitleLang || null,
     subtitlesOn: !!subtitlesOn,
     updatedAt: Date.now(),
-  });
+  };
+  watchingNow.set(req.user.id, entry);
   broadcastWatchingToAdmins();
+  pushCowatchUpdate(req.user.id, entry); // real-time push to co-watching admins
   res.json({ ok: true });
 });
 
@@ -2038,20 +2052,15 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 });
 
 // ─── Stream availability check (called before video loads) ───────────────────
-// Uses watchingNow (updated every 10s, expires in 35s) which is far more reliable
-// than activeStreamSet (HTTP connections close when the buffer fills up).
+// Uses activeStreamSet — the live count of open proxy connections, accurate in real-time.
 
 app.get('/api/stream/available', requireAuth, (req, res) => {
   const streamSettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
   const maxStreams = streamSettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
-  const now = Date.now();
-  let activeViewers = 0;
-  for (const [uid, entry] of watchingNow.entries()) {
-    // Count other users who reported watching in the last 30s (exclude caller — they may be switching videos)
-    if (uid !== req.user.id && now - entry.updatedAt < 30000) activeViewers++;
-  }
-  const available = activeViewers < maxStreams;
-  res.json({ available, current: activeViewers, max: maxStreams });
+  // Use the live activeStreamSet count — accurate in real-time, no staleness issues
+  const current = activeStreamSet.size;
+  const available = current < maxStreams;
+  res.json({ available, current, max: maxStreams });
 });
 
 // ─── Proxy (streaming) ───────────────────────────────────────────────────────
@@ -2103,6 +2112,21 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
   const controller = new AbortController();
   req.on('close', () => controller.abort());
+
+  // ── Concurrent stream limit (admins bypass) ────────────────────────────────
+  const _proxyIsAdmin = !!getAdminSession(req.cookies?.admin_token);
+  if (!_proxyIsAdmin) {
+    const _proxySettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
+    const _proxyMax = _proxySettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
+    if (activeStreamSet.size >= _proxyMax) {
+      return res.status(503).json({ error: 'Server is busy, please try again later.' });
+    }
+  }
+  const _proxyStreamId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  activeStreamSet.add(_proxyStreamId);
+  let _proxyCleaned = false;
+  const _proxyCleanup = () => { if (!_proxyCleaned) { _proxyCleaned = true; activeStreamSet.delete(_proxyStreamId); } };
+  req.on('close', _proxyCleanup);
 
   try {
     const qualityNum = parseInt(quality, 10);
@@ -2175,6 +2199,8 @@ app.get('/api/proxy/:videoId', async (req, res) => {
         fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
       });
     }
+  } finally {
+    _proxyCleanup();
   }
 });
 
@@ -3071,6 +3097,14 @@ wss.on('connection', (ws, req) => {
   const videoId = url.searchParams.get('v');
   const isAdmin = url.searchParams.get('admin') === '1';
 
+  // Parse cookies from the WS upgrade request (Express middleware doesn't run here)
+  const wsCookies = {};
+  (req.headers.cookie || '').split(';').forEach(part => {
+    const [k, ...v] = part.trim().split('=');
+    if (k) wsCookies[k.trim()] = decodeURIComponent(v.join('='));
+  });
+  const wsUser = !isAdmin ? getSessionUser(wsCookies.session) : null;
+
   if (isAdmin) {
     adminWsClients.add(ws);
     // Send current watching state immediately on connect
@@ -3096,6 +3130,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
+      // Peer seek broadcast (video room clients)
       if (msg.type === 'seek' && msg.time !== undefined && videoId) {
         const clients = wsClients.get(videoId);
         if (clients) {
@@ -3106,6 +3141,37 @@ wss.on('connection', (ws, req) => {
           });
         }
       }
+      // Co-watch interest registration — admin indicates which user they are watching
+      if (msg.type === 'cowatch_join' && isAdmin && msg.userId) {
+        coWatchTargets.set(ws, parseInt(msg.userId, 10));
+        // Immediately push the current state of that user if available
+        const entry = watchingNow.get(parseInt(msg.userId, 10));
+        if (entry && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'cowatch_update', data: entry }));
+        }
+      }
+      if (msg.type === 'cowatch_leave' && isAdmin) {
+        coWatchTargets.delete(ws);
+      }
+      // Real-time position update from a user's player — 1s interval, no HTTP involved
+      if (msg.type === 'position_update' && !isAdmin && wsUser?.id) {
+        const entry = {
+          userId: wsUser.id,
+          username: wsUser.username,
+          videoId: msg.videoId || videoId || '',
+          title: msg.title || '',
+          thumbnail: msg.thumbnail || '',
+          position: parseFloat(msg.position) || 0,
+          paused: !!msg.paused,
+          speed: parseFloat(msg.speed) || 1,
+          quality: msg.quality || null,
+          subtitleLang: msg.subtitleLang || null,
+          subtitlesOn: !!msg.subtitlesOn,
+          updatedAt: Date.now(),
+        };
+        watchingNow.set(wsUser.id, entry);
+        pushCowatchUpdate(wsUser.id, entry); // instant push to co-watching admin
+      }
     } catch (e) {
       // Invalid JSON, ignore
     }
@@ -3114,6 +3180,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (isAdmin) {
       adminWsClients.delete(ws);
+      coWatchTargets.delete(ws); // clean up any co-watch registration
     } else if (videoId && wsClients.has(videoId)) {
       wsClients.get(videoId).delete(ws);
       if (wsClients.get(videoId).size === 0) {

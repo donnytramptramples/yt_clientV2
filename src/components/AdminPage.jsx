@@ -591,7 +591,7 @@ function Dashboard({ onLogout }) {
           <button onClick={() => setCoWatchEntry(null)} className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm">
             <ArrowLeft size={16} /> Back to admin
           </button>
-          <span className="text-xs text-gray-500">Co-watching with <span className="text-yellow-400 font-medium">{coWatchEntry.username}</span> — syncs every 5 s</span>
+          <span className="text-xs text-gray-500">Co-watching with <span className="text-yellow-400 font-medium">{coWatchEntry.username}</span> — live sync via WebSocket</span>
         </div>
         <div className="p-4">
           <VideoPlayer
@@ -599,6 +599,12 @@ function Dashboard({ onLogout }) {
             user={null}
             onBack={() => setCoWatchEntry(null)}
             coWatchUserId={coWatchEntry.userId}
+            onCoWatchVideoChange={(data) => setCoWatchEntry(prev => prev ? {
+              ...prev,
+              videoId: data.videoId,
+              title: data.title || 'Unknown video',
+              thumbnail: data.thumbnail || '',
+            } : prev)}
           />
         </div>
       </div>

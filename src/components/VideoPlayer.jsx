@@ -267,7 +267,7 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
   );
 }
 
-export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWatchUserId = null }) {
+export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWatchUserId = null, onCoWatchVideoChange = null, initialPosition = null }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
   const progressRef = useRef(null);
@@ -363,6 +363,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   const proxySeekRef = useRef(0);
   const seekReloadRef = useRef(false);
   const wasPlayingRef = useRef(false);
+  // Stable ref so the video-reset effect can read the latest initialPosition
+  // without being added to its dependency array (which would reset the video on every tick)
+  const initialPositionRef = useRef(initialPosition);
+  useEffect(() => { initialPositionRef.current = initialPosition; }, [initialPosition]);
 
   // Refs that mirror state values for use in effects/callbacks without stale closures
   const speedRef = useRef(1);
@@ -395,31 +399,42 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     wasPlayingRef.current = !v.paused;
 
     const currentProxyStart = proxySeekRef.current;
+    const relTarget = clamped - currentProxyStart; // position relative to current proxy stream
 
-    // Compute the furthest absolute position the browser has buffered
+    // Check whether the target falls inside any of the browser's buffered ranges.
+    // Fragmented MP4 (frag_keyframe) supports native seeking within buffered ranges
+    // in both directions. Only proxy-reload when the target is outside the buffer.
+    let inBuffer = false;
+    if (relTarget >= 0) {
+      for (let i = 0; i < v.buffered.length; i++) {
+        if (relTarget >= v.buffered.start(i) && relTarget <= v.buffered.end(i) + 0.5) {
+          inBuffer = true;
+          break;
+        }
+      }
+    }
+
+    // Compute absolute furthest buffered end
     let bufEnd = currentProxyStart;
     for (let i = 0; i < v.buffered.length; i++) {
       bufEnd = Math.max(bufEnd, currentProxyStart + v.buffered.end(i));
     }
+    // Allow native seek only within 5s of the buffer end for forward seeks.
+    // Anything beyond triggers a proxy reload so the browser isn't left stalling.
+    const isForward = clamped >= currentTimeRef.current;
+    const closeAhead = isForward && clamped <= bufEnd + 5 && relTarget >= 0;
 
-    // ── Backward seek fix ──────────────────────────────────────────────────
-    // When seeking within the current proxy stream's range (clamped >= proxyStart),
-    // always use native seeking. The browser will buffer any small gap automatically.
-    // We only reload the proxy when seeking BEFORE the proxy start (can't go back
-    // on a forward-only stream) or FAR ahead of the buffered end (large forward jump).
-    const isBackward = clamped < currentTimeRef.current;
-    const farAhead = !isBackward && clamped > bufEnd + 30;
-
-    if (clamped >= currentProxyStart && !farAhead) {
-      // Native seek within the current proxy stream — no restart
-      v.currentTime = clamped - currentProxyStart;
+    if (inBuffer || closeAhead) {
+      // Native seek — inside the buffer or within 5s of the buffer end
+      v.currentTime = relTarget;
       currentTimeRef.current = clamped;
       setCurrentTime(clamped);
       reportWatchingRef.current?.();
+      wsSendRef.current?.();
       return;
     }
 
-    // Proxy reload needed: seeking before proxy start or large forward jump
+    // Proxy reload — target before proxy start, outside buffer, or large jump
     seekReloadRef.current = true;
     currentTimeRef.current = clamped;
     setCurrentTime(clamped);
@@ -427,6 +442,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     proxySeekRef.current = newSeek;
     setProxySeek(newSeek);
     reportWatchingRef.current?.();
+    wsSendRef.current?.();
   }, [duration]);
 
   const changeQuality = useCallback((q) => {
@@ -477,8 +493,13 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     setComments([]);
     setShowDescription(false);
     setShowComments(false);
-    setProxySeek(0);
-    proxySeekRef.current = 0;
+    // For co-watch: start 10s behind the known position so the stream is ready
+    // before the user's current moment arrives, giving the browser loading headroom.
+    const startAt = (coWatchUserId && initialPosition > 10)
+      ? Math.max(0, Math.floor(initialPosition) - 10)
+      : 0;
+    setProxySeek(startAt);
+    proxySeekRef.current = startAt;
     seekReloadRef.current = false;
     wasPlayingRef.current = false;
     setServerBusy(false);
@@ -689,7 +710,90 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     };
   }, [video.id, user]);
 
-  // Lock to prevent co-watch seeking loops: after seeking, block re-seek for 8s
+  // WS send ref — set by the user WS effect so seekTo can push instant updates
+  const wsSendRef = useRef(null);
+
+  // User-side WebSocket: sends position to server every 200ms so admin co-watch is live.
+  // Only active for real users (not for the admin's co-watch VideoPlayer instance).
+  useEffect(() => {
+    if (!user || !video?.id || coWatchUserId) return;
+
+    let ws = null;
+    let sendId = null;
+    let reconnectTimer = null;
+    let alive = true;
+
+    const buildPayload = () => ({
+      type: 'position_update',
+      videoId: video.id,
+      title: video.title || '',
+      thumbnail: video.thumbnail || '',
+      position: currentTimeRef.current,
+      paused: videoRef.current?.paused ?? true,
+      speed: speedRef.current,
+      quality: qualityRef.current,
+      subtitleLang: selectedSubtitleRef.current,
+      subtitlesOn: subtitlesEnabledRef.current,
+      sentAt: Date.now(),
+    });
+
+    const send = () => {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(buildPayload()));
+      }
+    };
+
+    const sendImmediate = () => send();
+
+    const connect = () => {
+      if (!alive) return;
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${window.location.host}/api/ws?v=${video.id}`);
+      ws.onopen = () => {
+        send();
+        sendId = setInterval(send, 200);
+        const v = videoRef.current;
+        if (v) {
+          v.addEventListener('play', sendImmediate);
+          v.addEventListener('pause', sendImmediate);
+          v.addEventListener('seeked', sendImmediate);
+          v.addEventListener('waiting', sendImmediate);
+        }
+      };
+      ws.onclose = () => {
+        clearInterval(sendId);
+        const v = videoRef.current;
+        if (v) {
+          v.removeEventListener('play', sendImmediate);
+          v.removeEventListener('pause', sendImmediate);
+          v.removeEventListener('seeked', sendImmediate);
+          v.removeEventListener('waiting', sendImmediate);
+        }
+        reconnectTimer = setTimeout(connect, 2000);
+      };
+      ws.onerror = () => ws.close();
+    };
+
+    connect();
+    wsSendRef.current = send;
+
+    return () => {
+      alive = false;
+      wsSendRef.current = null;
+      clearInterval(sendId);
+      clearTimeout(reconnectTimer);
+      const v = videoRef.current;
+      if (v) {
+        v.removeEventListener('play', sendImmediate);
+        v.removeEventListener('pause', sendImmediate);
+        v.removeEventListener('seeked', sendImmediate);
+        v.removeEventListener('waiting', sendImmediate);
+      }
+      ws?.close();
+    };
+  }, [video.id, user, coWatchUserId]);
+
+  // Lock to prevent co-watch seeking loops: after seeking, block re-seek for 5s
   const coWatchSeekLockUntilRef = useRef(0);
 
   // Keep latest seekTo/changeQuality in refs so the sync interval never goes stale
@@ -698,61 +802,176 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   useEffect(() => { seekToRef.current = seekTo; }, [seekTo]);
   useEffect(() => { changeQualityRef.current = changeQuality; }, [changeQuality]);
 
-  // Co-watch sync: if admin is watching with a user, poll their position and all states
+  // Co-watch sync: mirrors the user's exact position in real-time via WebSocket.
+  // The user sends position every 200ms; admin uses tiered playback-rate drift correction.
   useEffect(() => {
     if (!coWatchUserId) return;
-    const sync = async () => {
-      try {
-        const r = await fetch(`/api/admin/watching/${coWatchUserId}`, { credentials: 'include' });
-        if (!r.ok) return;
-        const data = await r.json();
 
-        // Position sync:
-        // Only seek if: difference > 4s AND lock expired AND no proxy reload already in progress
-        const target = data.position || 0;
-        const now = Date.now();
-        const syncBlocked = seekReloadRef.current || now < coWatchSeekLockUntilRef.current;
-        if (Math.abs(currentTimeRef.current - target) > 4 && !syncBlocked) {
-          if (videoRef.current) {
-            // Lock for 12s: enough time for the proxy to start and the first frames to arrive
-            coWatchSeekLockUntilRef.current = now + 12000;
-            seekToRef.current(target);
-          }
-          // If video element doesn't exist yet (formats still loading), skip this
-          // cycle without setting the lock so we retry on the next interval.
-        }
+    const SYNC_THRESHOLD = 0.15; // 150ms — ignore tiny jitter
+    const JUMP_THRESHOLD = 20.0; // 20s   — only hard-jump for extreme desync
 
-        // Pause/play state — admin mirrors user's play state exactly
-        const v = videoRef.current;
-        if (v && data.paused !== undefined) {
-          if (data.paused && !v.paused) v.pause();
-          else if (!data.paused && v.paused) v.play().catch(() => {});
-        }
-
-        // Speed sync
-        if (data.speed && data.speed !== speedRef.current) {
-          setSpeed(data.speed);
-        }
-
-        // Quality sync (changeQuality handles the proxy reload)
-        if (data.quality && data.quality !== qualityRef.current) {
-          changeQualityRef.current(data.quality);
-        }
-
-        // Subtitle on/off sync
-        if (data.subtitlesOn !== undefined && data.subtitlesOn !== subtitlesEnabledRef.current) {
-          setSubtitlesEnabled(data.subtitlesOn);
-        }
-
-        // Subtitle language sync — only if we have cues loaded for that language
-        if (data.subtitleLang && data.subtitleLang !== selectedSubtitleRef.current) {
-          setCurrentSubtitleLang(data.subtitleLang);
-        }
-      } catch {}
+    const initialized = { current: false };
+    const lastData    = { current: null };
+    // Smoothed latency: keep last 5 round-trip estimates
+    const latencySamples = [];
+    const smoothLatency = () => {
+      if (!latencySamples.length) return 0;
+      return latencySamples.reduce((a, b) => a + b, 0) / latencySamples.length / 1000;
     };
-    sync();
-    const id = setInterval(sync, 4000);
-    return () => clearInterval(id);
+
+    let wsInstance    = null;
+    let reconnectTimer = null;
+    let initRetryId   = null;
+    let lastSeekAt    = 0;
+    let lastVideoId   = null; // track video changes
+
+    // ── Core sync ─────────────────────────────────────────────────────────────
+    const applyData = (data) => {
+      lastData.current = data;
+
+      // Track latency from the sentAt timestamp the user embeds
+      if (data.sentAt) {
+        const sample = Date.now() - data.sentAt;
+        latencySamples.push(sample);
+        if (latencySamples.length > 5) latencySamples.shift();
+      }
+
+      const latency    = smoothLatency();
+      const userPos    = (parseFloat(data.position) || 0) + latency;
+      const userPaused = data.paused ?? true;
+      const now        = Date.now();
+      const v          = videoRef.current;
+
+      // ── Video change detection ───────────────────────────────────────────────
+      // If the user navigated to a different video, tell the parent immediately.
+      if (data.videoId && lastVideoId && data.videoId !== lastVideoId) {
+        lastVideoId = data.videoId;
+        initialized.current = false; // force re-init for the new video
+        if (onCoWatchVideoChange) {
+          onCoWatchVideoChange(data);
+          return; // parent will remount VideoPlayer with the new video
+        }
+      }
+      if (data.videoId && !lastVideoId) lastVideoId = data.videoId;
+
+      // ── Initial join: seek 10s behind user to give the browser loading headroom.
+      // The tiered playback-rate will close the gap without re-seeking.
+      // Retried every 500ms until quality is resolved.
+      if (!initialized.current) {
+        if (v && qualityRef.current) {
+          initialized.current = true;
+          clearInterval(initRetryId);
+          initRetryId = null;
+          lastSeekAt = now;
+          coWatchSeekLockUntilRef.current = now + 5000;
+          const startPos = Math.max(0, userPos - 10);
+          seekToRef.current(startPos);
+          wasPlayingRef.current = !userPaused;
+        }
+        return;
+      }
+
+      if (!v) return;
+
+      // ── Play / pause sync ────────────────────────────────────────────────────
+      if (userPaused) {
+        if (!v.paused) v.pause();
+        if (v.playbackRate !== 1.0) v.playbackRate = 1.0;
+        return;
+      }
+
+      // User is playing — ensure admin plays too
+      const seekInProgress = seekReloadRef.current;
+      const seekLocked     = now < coWatchSeekLockUntilRef.current;
+
+      if (seekInProgress) {
+        wasPlayingRef.current = true;
+        v.playbackRate = 1.0;
+        return;
+      }
+
+      if (!seekLocked) {
+        const adminPos = currentTimeRef.current;
+        const diff     = userPos - adminPos; // positive = admin is behind
+
+        if (Math.abs(diff) > JUMP_THRESHOLD && now - lastSeekAt > 1500) {
+          // Extreme desync only — hard seek
+          lastSeekAt = now;
+          coWatchSeekLockUntilRef.current = now + 4000;
+          seekToRef.current(userPos);
+          wasPlayingRef.current = true;
+          v.playbackRate = 1.0;
+          return;
+        } else if (Math.abs(diff) > 8) {
+          // Large gap (e.g. initial catch-up) — play faster/slower to close it quickly
+          v.playbackRate = diff > 0 ? 1.25 : 0.8;
+        } else if (Math.abs(diff) > 3) {
+          // Moderate gap — moderate rate adjustment
+          v.playbackRate = diff > 0 ? 1.1 : 0.92;
+        } else if (Math.abs(diff) > SYNC_THRESHOLD) {
+          // Fine drift — small nudge
+          v.playbackRate = diff > 0 ? 1.04 : 0.97;
+        } else {
+          // Locked in
+          v.playbackRate = 1.0;
+        }
+      }
+
+      // Make sure admin is playing
+      if (v.paused) {
+        v.play().catch(() => {});
+      }
+
+      // ── Metadata sync (always, even during seek lock) ────────────────────────
+      if (data.speed && data.speed !== speedRef.current) setSpeed(data.speed);
+      if (data.quality && data.quality !== qualityRef.current) changeQualityRef.current(data.quality);
+      if (data.subtitlesOn !== undefined && data.subtitlesOn !== subtitlesEnabledRef.current) setSubtitlesEnabled(data.subtitlesOn);
+      if (data.subtitleLang && data.subtitleLang !== selectedSubtitleRef.current) setCurrentSubtitleLang(data.subtitleLang);
+    };
+
+    // ── WebSocket with auto-reconnect ─────────────────────────────────────────
+    const connect = () => {
+      const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${window.location.host}/api/ws?admin=1`);
+      wsInstance = ws;
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ type: 'cowatch_join', userId: coWatchUserId }));
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type !== 'cowatch_update' || !msg.data) return;
+          applyData(msg.data);
+          // If quality not ready yet, retry every 500ms until init succeeds
+          if (!initialized.current && !initRetryId) {
+            initRetryId = setInterval(() => {
+              if (initialized.current) { clearInterval(initRetryId); initRetryId = null; return; }
+              if (lastData.current) applyData(lastData.current);
+            }, 500);
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => { wsInstance = null; reconnectTimer = setTimeout(connect, 2000); };
+      ws.onerror = () => ws.close();
+    };
+
+    connect();
+
+    return () => {
+      if (wsInstance) {
+        wsInstance.onclose = null;
+        if (wsInstance.readyState === WebSocket.OPEN) {
+          wsInstance.send(JSON.stringify({ type: 'cowatch_leave' }));
+        }
+        wsInstance.close();
+        wsInstance = null;
+      }
+      clearTimeout(reconnectTimer);
+      clearInterval(initRetryId);
+    };
   }, [coWatchUserId]);
 
   // Don't set proxyUrl when server is busy — prevents the video element from making a stream request
@@ -898,17 +1117,17 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
       if (e.key === 'ArrowLeft') {
         e.preventDefault();
-        seekTo(currentTime - 10);
+        seekTo(currentTimeRef.current - 10);
         showSkip('left');
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
-        seekTo(currentTime + 10);
+        seekTo(currentTimeRef.current + 10);
         showSkip('right');
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [cssFull, currentTime, seekTo, showSkip]);
+  }, [cssFull, seekTo, showSkip]);
 
   useEffect(() => {
     if (!playing) setControlsVisible(true);
@@ -1083,39 +1302,50 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         )}
 
         {serverBusy ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 gap-4">
-            <div className="text-center px-6">
-              <p className="text-white text-lg font-semibold">Server has reached max streams</p>
-              {serverBusyInfo && (
-                <p className="text-white/70 text-sm mt-1">{serverBusyInfo.current} / {serverBusyInfo.max} streams active</p>
-              )}
-              <p className="text-white/50 text-xs mt-2">Please wait for a stream to free up, then retry.</p>
-            </div>
-            <button
-              className="px-5 py-2 rounded-lg bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90"
-              onClick={(e) => {
-                e.stopPropagation();
-                fetch('/api/stream/available', { credentials: 'include' })
-                  .then(r => {
-                    if (!r.ok) return null;
-                    return r.json();
-                  })
-                  .then(data => {
-                    if (!data || !data.available) {
-                      if (data) setServerBusyInfo({ current: data.current, max: data.max });
-                    } else {
+          <div className="absolute inset-0 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-5 px-8 py-7 rounded-2xl border border-[#3daee9]/25 bg-[#1a1d27] shadow-[0_8px_40px_rgba(0,0,0,0.7)] max-w-[280px] w-full mx-4">
+              <div className="w-12 h-12 rounded-full flex items-center justify-center bg-[#3daee9]/10 border border-[#3daee9]/30">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3daee9" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="3" width="20" height="14" rx="2"/>
+                  <path d="M8 21h8M12 17v4"/>
+                  <path d="M12 8v3M12 14h.01" stroke="#f39c12" strokeWidth="2"/>
+                </svg>
+              </div>
+              <div className="text-center">
+                <p className="text-[#3daee9] text-base font-semibold tracking-wide">Server Limit Reached</p>
+                {serverBusyInfo && (
+                  <p className="text-[#8b9bb4] text-sm mt-1.5">
+                    {serverBusyInfo.current} / {serverBusyInfo.max} streams in use
+                  </p>
+                )}
+                <p className="text-[#556070] text-xs mt-2 leading-relaxed">All stream slots are occupied.<br/>Wait for one to free up, then retry.</p>
+              </div>
+              <button
+                className="w-full py-2 rounded-lg bg-[#3daee9]/15 border border-[#3daee9]/35 text-[#3daee9] text-sm font-medium hover:bg-[#3daee9]/25 hover:border-[#3daee9]/55 transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  fetch('/api/stream/available', { credentials: 'include' })
+                    .then(r => {
+                      if (!r.ok) return null;
+                      return r.json();
+                    })
+                    .then(data => {
+                      if (!data || !data.available) {
+                        if (data) setServerBusyInfo({ current: data.current, max: data.max });
+                      } else {
+                        setServerBusy(false);
+                        setIsLoading(true);
+                        setRetryKey(k => k + 1);
+                      }
+                    })
+                    .catch(() => {
                       setServerBusy(false);
                       setIsLoading(true);
                       setRetryKey(k => k + 1);
-                    }
-                  })
-                  .catch(() => {
-                    setServerBusy(false);
-                    setIsLoading(true);
-                    setRetryKey(k => k + 1);
-                  });
-              }}
-            >Retry</button>
+                    });
+                }}
+              >Retry</button>
+            </div>
           </div>
         ) : (isLoading || formatsLoading || !proxyUrl) && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/75 pointer-events-none gap-4">
