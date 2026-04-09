@@ -63,6 +63,7 @@ async function ensureYtDlp() {
 await ensureYtDlp();
 
 const ytdlpCache = new Map();
+const ytdlpInFlight = new Map(); // videoId -> Promise (dedup concurrent calls)
 const YTDLP_TTL = 15 * 60 * 1000;
 
 Log.setLevel(Log.Level.ERROR);
@@ -725,6 +726,10 @@ const adminWsClients = new Set();
 // Maps each admin WS connection → the userId they are currently co-watching (if any)
 const coWatchTargets = new Map();
 
+// Throttle watching-list broadcasts: userId → last broadcast timestamp
+// Prevents flooding admins at 200ms WS update rate (max once per 2s per user)
+const watchingBroadcastThrottle = new Map();
+
 function broadcastWatchingToAdmins() {
   if (adminWsClients.size === 0) return;
   const cfg = authDb.prepare('SELECT allow_co_watch FROM admin_settings WHERE id = 1').get();
@@ -916,7 +921,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     const match = await bcrypt.compare(currentPassword || '', user.password_hash);
     if (!match) return res.status(401).json({ error: 'Current password is incorrect' });
     const hash = await bcrypt.hash(newPassword, 10);
-    authDb.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, req.user.id);
+    authDb.prepare('UPDATE users SET password_hash = ?, plain_password = ? WHERE id = ?').run(hash, encrypt(newPassword), req.user.id);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1221,7 +1226,7 @@ async function getYtDlpFormats(videoId, attempt = 0) {
   return result;
 }
 
-async function getYtDlpFormatsWithRetry(videoId) {
+async function _doYtDlpFormatsWithRetry(videoId) {
   const clients = ['tv_embedded', 'android_vr', 'mweb', 'android', 'ios', 'web'];
   let lastError;
   for (let i = 0; i < clients.length; i++) {
@@ -1234,10 +1239,32 @@ async function getYtDlpFormatsWithRetry(videoId) {
         e.message.includes('403') || e.message.includes('confirm') || e.message.includes('429');
       if (!isBotError) throw e;
       console.log(`[ytdlp] Bot/rate error with client ${clients[i]}, trying next... (${e.message.substring(0, 80)})`);
-      if (i < clients.length - 1) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+      if (i < clients.length - 1) {
+        // Human-like delay: base + random jitter so retries don't look robotic
+        const base = 1500 + i * 1000;
+        const jitter = Math.floor(Math.random() * 1000);
+        await new Promise(r => setTimeout(r, base + jitter));
+      }
     }
   }
   throw lastError;
+}
+
+async function getYtDlpFormatsWithRetry(videoId) {
+  // Return cached result immediately if still fresh
+  const cached = ytdlpCache.get(videoId);
+  if (cached && Date.now() - cached.ts < YTDLP_TTL) return cached;
+
+  // Deduplicate concurrent callers — all share the same in-flight promise
+  if (ytdlpInFlight.has(videoId)) {
+    return ytdlpInFlight.get(videoId);
+  }
+
+  const promise = _doYtDlpFormatsWithRetry(videoId).finally(() => {
+    ytdlpInFlight.delete(videoId);
+  });
+  ytdlpInFlight.set(videoId, promise);
+  return promise;
 }
 
 function pickYtDlpVideo(formats, targetHeight) {
@@ -2119,7 +2146,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     const _proxySettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
     const _proxyMax = _proxySettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
     if (activeStreamSet.size >= _proxyMax) {
-      return res.status(503).json({ error: 'Server is busy, please try again later.' });
+      return res.status(503).json({ error: 'Server is busy, please try again later.', current: activeStreamSet.size, max: _proxyMax });
     }
   }
   const _proxyStreamId = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -2518,6 +2545,7 @@ app.get('/api/download/:videoId', async (req, res) => {
     const qualityNum = parseInt(quality, 10);
     // Always use fresh URLs for downloads — cached URLs may be expired
     ytdlpCache.delete(videoId);
+    ytdlpInFlight.delete(videoId);
 
     // CRITICAL FIX: Try yt-dlp first, fallback to youtubei.js if it fails
     let data;
@@ -3153,7 +3181,7 @@ wss.on('connection', (ws, req) => {
       if (msg.type === 'cowatch_leave' && isAdmin) {
         coWatchTargets.delete(ws);
       }
-      // Real-time position update from a user's player — 1s interval, no HTTP involved
+      // Real-time position update from a user's player — 200ms interval, no HTTP involved
       if (msg.type === 'position_update' && !isAdmin && wsUser?.id) {
         const entry = {
           userId: wsUser.id,
@@ -3170,7 +3198,13 @@ wss.on('connection', (ws, req) => {
           updatedAt: Date.now(),
         };
         watchingNow.set(wsUser.id, entry);
-        pushCowatchUpdate(wsUser.id, entry); // instant push to co-watching admin
+        pushCowatchUpdate(wsUser.id, entry); // instant push to co-watching admin detail view
+        // Also update the admin watching list, throttled to max once per 2s per user
+        const lastBroadcast = watchingBroadcastThrottle.get(wsUser.id) || 0;
+        if (Date.now() - lastBroadcast > 2000) {
+          watchingBroadcastThrottle.set(wsUser.id, Date.now());
+          broadcastWatchingToAdmins();
+        }
       }
     } catch (e) {
       // Invalid JSON, ignore
@@ -3181,10 +3215,11 @@ wss.on('connection', (ws, req) => {
     if (isAdmin) {
       adminWsClients.delete(ws);
       coWatchTargets.delete(ws); // clean up any co-watch registration
-    } else if (videoId && wsClients.has(videoId)) {
-      wsClients.get(videoId).delete(ws);
-      if (wsClients.get(videoId).size === 0) {
-        wsClients.delete(videoId);
+    } else {
+      if (wsUser?.id) watchingBroadcastThrottle.delete(wsUser.id);
+      if (videoId && wsClients.has(videoId)) {
+        wsClients.get(videoId).delete(ws);
+        if (wsClients.get(videoId).size === 0) wsClients.delete(videoId);
       }
     }
   });
