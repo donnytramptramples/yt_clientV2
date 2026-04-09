@@ -25,6 +25,29 @@ function ssSet(key, data) {
   } catch {}
 }
 
+// localStorage cache — persists across sessions (7-day TTL for position)
+const LS_POS_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function lsGet(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const { data, exp } = JSON.parse(raw);
+    if (Date.now() > exp) { localStorage.removeItem(key); return null; }
+    return data;
+  } catch { return null; }
+}
+
+function lsSet(key, data, ttl = LS_POS_TTL) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ data, exp: Date.now() + ttl }));
+  } catch {}
+}
+
+function lsRemove(key) {
+  try { localStorage.removeItem(key); } catch {}
+}
+
 function formatTime(secs) {
   const s = Math.floor(secs || 0);
   const h = Math.floor(s / 3600);
@@ -361,6 +384,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   // Proxy seeking — all seeking goes through proxySeekRef; no native seeking for proxy streams
   const [proxySeek, setProxySeek] = useState(0);
   const proxySeekRef = useRef(0);
+  // Mirrors the committed proxySeek *state* value so the seek debounce can detect no-ops
+  const proxySeekStateRef = useRef(0);
   const seekReloadRef = useRef(false);
   const wasPlayingRef = useRef(false);
   // Debounce proxy seek reloads so rapid scrubbing only triggers one stream reload
@@ -370,6 +395,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   // When a proxy reload starts the stream N seconds before the target, this holds
   // the native-seek offset (seconds into the new stream) applied in onCanPlay.
   const seekTargetRelRef = useRef(0);
+  // Monotonically-increasing ID — each seekTo call increments this so the debounce
+  // callback can bail out if it has been superseded by a newer seek.
+  const seekIdRef = useRef(0);
   // Stable ref so the video-reset effect can read the latest initialPosition
   // without being added to its dependency array (which would reset the video on every tick)
   const initialPositionRef = useRef(initialPosition);
@@ -404,56 +432,53 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
     const clamped = Math.max(0, Math.min(duration > 0 ? duration - 1 : 1e9, targetTime));
     wasPlayingRef.current = !v.paused;
-
-    const currentProxyStart = proxySeekRef.current;
-    const relTarget = clamped - currentProxyStart; // position relative to current proxy stream
-
-    // Check whether the target falls inside any of the browser's buffered ranges.
-    // Only do a native seek when the target is strictly within what's already buffered —
-    // no "close ahead" tolerance, which used to cause stalls.
-    let inBuffer = false;
-    if (relTarget >= 0) {
-      for (let i = 0; i < v.buffered.length; i++) {
-        if (relTarget >= v.buffered.start(i) - 0.5 && relTarget <= v.buffered.end(i)) {
-          inBuffer = true;
-          break;
-        }
-      }
-    }
-
-    if (inBuffer) {
-      // Native seek — cancel any pending proxy reload since we don't need it
-      if (proxySeekDebounceRef.current) {
-        clearTimeout(proxySeekDebounceRef.current);
-        proxySeekDebounceRef.current = null;
-      }
-      seekPendingRef.current = false;
-      v.currentTime = relTarget;
-      currentTimeRef.current = clamped;
-      setCurrentTime(clamped);
-      reportWatchingRef.current?.();
-      wsSendRef.current?.();
-      return;
-    }
-
-    // Proxy reload needed. Start the stream 30s before the target so the user
-    // can seek backwards up to ~30s without triggering another full reload.
-    // seekTargetRelRef stores the native-seek offset applied in onCanPlay.
     const targetFloor = Math.floor(clamped);
-    const streamStart = Math.max(0, targetFloor - 30);
-    const seekTargetRel = targetFloor - streamStart; // offset within the new stream (0–30)
 
-    proxySeekRef.current = streamStart;
-    seekTargetRelRef.current = seekTargetRel;
-    seekPendingRef.current = true;  // kept true until after post-load native seek (onSeeked)
+    // For this proxy fMP4 format (frag_keyframe+empty_moov), native v.currentTime seeks
+    // fail: the browser's seekable range is only the tiny amount buffered from the stream
+    // start, so seeks beyond it are silently rejected and currentTime resets to 0.
+    // The only reliable approach is a server-side seek: reload the stream starting at the
+    // target second. seekTargetRelRef stays 0 so no post-load native seek is needed.
+    proxySeekRef.current = targetFloor;
+    seekTargetRelRef.current = 0;
+    seekPendingRef.current = true;
     currentTimeRef.current = clamped;
     setCurrentTime(clamped);
+
+    // Tag this seek so stale debounce callbacks can self-cancel
+    const seekId = ++seekIdRef.current;
 
     if (proxySeekDebounceRef.current) clearTimeout(proxySeekDebounceRef.current);
     proxySeekDebounceRef.current = setTimeout(() => {
       proxySeekDebounceRef.current = null;
+
+      // A newer seekTo has superseded this one
+      if (seekIdRef.current !== seekId) return;
+
+      // seekPendingRef was already cleared (e.g. quality change happened mid-seek)
+      if (!seekPendingRef.current) {
+        reportWatchingRef.current?.();
+        wsSendRef.current?.();
+        return;
+      }
+
       seekReloadRef.current = true;
-      setProxySeek(streamStart);
+
+      if (targetFloor === proxySeekStateRef.current) {
+        // setProxySeek() would be a React no-op, so the video src won't change.
+        // The stream already starts at targetFloor; reset to the very beginning of
+        // the current stream (v.currentTime = 0 is always seekable for fMP4).
+        seekPendingRef.current = false;
+        seekReloadRef.current = false;
+        const v2 = videoRef.current;
+        if (v2) {
+          v2.currentTime = 0;
+          if (wasPlayingRef.current && v2.paused) v2.play().catch(() => {});
+        }
+      } else {
+        setProxySeek(targetFloor);
+      }
+
       reportWatchingRef.current?.();
       wsSendRef.current?.();
     }, 150);
@@ -493,6 +518,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   }, []);
 
   // Keep mirror refs in sync with their state counterparts
+  useEffect(() => { proxySeekStateRef.current = proxySeek; }, [proxySeek]);
   useEffect(() => { speedRef.current = speed; }, [speed]);
   useEffect(() => { qualityRef.current = quality; }, [quality]);
   useEffect(() => { subtitlesEnabledRef.current = subtitlesEnabled; }, [subtitlesEnabled]);
@@ -667,18 +693,18 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     reportWatchingRef.current?.();
   }, [subtitlesEnabled]);
 
-  // Check for saved resume position when video changes
+  // Check for saved resume position when video changes (localStorage persists across sessions)
   useEffect(() => {
-    const saved = ssGet(`pos:${video.id}`);
+    const saved = lsGet(`pos:${video.id}`);
     if (saved && saved > 5) setResumeAt(saved);
     else setResumeAt(null);
   }, [video.id]);
 
-  // Save playback position every 5 seconds
+  // Save playback position every 5 seconds to localStorage so it survives page refreshes
   useEffect(() => {
     const id = setInterval(() => {
       if (currentTime > 5 && duration > 0 && currentTime < duration - 5) {
-        ssSet(`pos:${video.id}`, currentTime);
+        lsSet(`pos:${video.id}`, currentTime);
       }
     }, 5000);
     return () => clearInterval(id);
@@ -777,7 +803,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       ws = new WebSocket(`${proto}://${window.location.host}/api/ws?v=${video.id}`);
       ws.onopen = () => {
         send();
-        sendId = setInterval(send, 200);
+        sendId = setInterval(send, 100);
         const v = videoRef.current;
         if (v) {
           v.addEventListener('play', sendImmediate);
@@ -833,8 +859,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   useEffect(() => {
     if (!coWatchUserId) return;
 
-    const SYNC_THRESHOLD = 0.15; // 150ms — ignore tiny jitter
-    const JUMP_THRESHOLD = 10.0; // 10s   — hard-jump; anything smaller uses rate correction
+    const SYNC_THRESHOLD = 0.08; // 80ms  — ignore tiny jitter
+    const JUMP_THRESHOLD = 2.5;  // 2.5s  — hard-jump; anything smaller uses rate correction
 
     const initialized = { current: false };
     const lastData    = { current: null };
@@ -890,8 +916,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           clearInterval(initRetryId);
           initRetryId = null;
           lastSeekAt = now;
-          coWatchSeekLockUntilRef.current = now + 5000;
-          const LOAD_AHEAD = 5; // seconds to seek ahead of current user position
+          coWatchSeekLockUntilRef.current = now + 3000;
+          const LOAD_AHEAD = 3; // seconds to seek ahead of current user position
           seekToRef.current(userPos + LOAD_AHEAD);
           wasPlayingRef.current = !userPaused;
         }
@@ -921,10 +947,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         const adminPos = currentTimeRef.current;
         const diff     = userPos - adminPos; // positive = admin is behind
 
-        if (Math.abs(diff) > JUMP_THRESHOLD && now - lastSeekAt > 1500) {
+        if (Math.abs(diff) > JUMP_THRESHOLD && now - lastSeekAt > 800) {
           // Hard seek — gap too large for rate correction to be practical
           lastSeekAt = now;
-          coWatchSeekLockUntilRef.current = now + 4000;
+          coWatchSeekLockUntilRef.current = now + 2000;
           seekToRef.current(userPos);
           wasPlayingRef.current = true;
           v.playbackRate = 1.0;
@@ -1077,7 +1103,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const onWaiting = () => setIsLoading(true);
     const onCanPlay = () => {
       setIsLoading(false);
-      if (seekReloadRef.current || wasPlayingRef.current) {
+      // Enter this branch when: a proxy reload just finished (seekReloadRef), OR there's a
+      // pending native-seek offset to apply (seekTargetRelRef > 0), OR the video was playing
+      // before the reload and needs to resume.
+      if (seekReloadRef.current || seekTargetRelRef.current > 0 || wasPlayingRef.current) {
         seekReloadRef.current = false;
         if (seekTargetRelRef.current > 0) {
           // Post-load native seek: jump to the precise target within the pre-buffered window.
@@ -1318,7 +1347,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           >Resume</button>
           <button
             className="px-3 py-1 rounded bg-[var(--border)] text-[var(--text-secondary)] text-xs hover:bg-[var(--bg-primary)]"
-            onClick={() => { sessionStorage.removeItem(`pos:${video.id}`); setResumeAt(null); }}
+            onClick={() => { lsRemove(`pos:${video.id}`); setResumeAt(null); }}
           >Start over</button>
         </div>
       )}

@@ -586,26 +586,40 @@ function Dashboard({ onLogout }) {
       views: '',
     };
     return (
-      <div className="min-h-screen bg-gray-950 text-white">
-        <div className="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center gap-3">
-          <button onClick={() => setCoWatchEntry(null)} className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors text-sm">
-            <ArrowLeft size={16} /> Back to admin
+      <div className="min-h-screen bg-gray-950 text-white flex flex-col">
+        {/* Compact top bar */}
+        <div className="flex-shrink-0 bg-gray-900 border-b border-gray-800 px-3 py-2 flex items-center gap-2 flex-wrap">
+          <button
+            onClick={() => setCoWatchEntry(null)}
+            className="flex items-center gap-1.5 text-gray-400 hover:text-white transition-colors text-sm whitespace-nowrap"
+          >
+            <ArrowLeft size={15} /> Back
           </button>
-          <span className="text-xs text-gray-500">Co-watching with <span className="text-yellow-400 font-medium">{coWatchEntry.username}</span> — live sync via WebSocket</span>
+          <span className="hidden sm:inline text-gray-600">|</span>
+          <div className="flex items-center gap-1.5 text-xs text-gray-500 min-w-0">
+            <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse flex-shrink-0" />
+            <span className="truncate">
+              Co-watching <span className="text-yellow-400 font-medium">{coWatchEntry.username}</span>
+              {coWatchEntry.title && <span className="hidden sm:inline text-gray-600"> · {coWatchEntry.title}</span>}
+            </span>
+          </div>
         </div>
-        <div className="p-4">
-          <VideoPlayer
-            video={coVideo}
-            user={null}
-            onBack={() => setCoWatchEntry(null)}
-            coWatchUserId={coWatchEntry.userId}
-            onCoWatchVideoChange={(data) => setCoWatchEntry(prev => prev ? {
-              ...prev,
-              videoId: data.videoId,
-              title: data.title || 'Unknown video',
-              thumbnail: data.thumbnail || '',
-            } : prev)}
-          />
+        {/* Player fills remaining screen */}
+        <div className="flex-1 overflow-auto">
+          <div className="w-full max-w-5xl mx-auto px-2 sm:px-4 py-2 sm:py-4">
+            <VideoPlayer
+              video={coVideo}
+              user={null}
+              onBack={() => setCoWatchEntry(null)}
+              coWatchUserId={coWatchEntry.userId}
+              onCoWatchVideoChange={(data) => setCoWatchEntry(prev => prev ? {
+                ...prev,
+                videoId: data.videoId,
+                title: data.title || 'Unknown video',
+                thumbnail: data.thumbnail || '',
+              } : prev)}
+            />
+          </div>
         </div>
       </div>
     );
@@ -635,7 +649,7 @@ function Dashboard({ onLogout }) {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
-      <header className="bg-gray-900 border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+      <header className="bg-gray-900 border-b border-gray-800 px-3 sm:px-6 py-3 sm:py-4 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <Shield size={22} className="text-red-400" />
           <span className="font-bold text-lg">Admin Panel</span>
@@ -669,7 +683,7 @@ function Dashboard({ onLogout }) {
         </div>
       )}
 
-      <div className="flex border-b border-gray-800 px-6">
+      <div className="flex border-b border-gray-800 px-2 sm:px-6 overflow-x-auto">
         {[
           { id: 'users', label: 'Users', icon: Users },
           ...(settings.allow_co_watch ? [{ id: 'watching', label: 'Watching', icon: Radio }] : []),
@@ -696,7 +710,7 @@ function Dashboard({ onLogout }) {
         </div>
       </div>
 
-      <div className="p-6">
+      <div className="p-3 sm:p-6">
         {tab === 'users' && (
           <div>
             {showPwdColumn && (
@@ -857,27 +871,29 @@ function Dashboard({ onLogout }) {
                 {watching.map(entry => {
                   const secsAgo = Math.floor((Date.now() - entry.updatedAt) / 1000);
                   return (
-                    <div key={entry.userId} className="flex items-center gap-4 p-4 bg-gray-900 rounded-xl border border-gray-700">
-                      {entry.thumbnail ? (
-                        <img src={entry.thumbnail} alt="" className="w-20 h-12 object-cover rounded flex-shrink-0 bg-gray-700" />
-                      ) : (
-                        <div className="w-20 h-12 rounded bg-gray-700 flex-shrink-0" />
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="font-medium text-sm">{entry.username}</span>
-                          <span className="flex items-center gap-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded-full px-2 py-0.5">
-                            <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" /> Live
-                          </span>
+                    <div key={entry.userId} className="flex flex-col sm:flex-row sm:items-center gap-3 p-4 bg-gray-900 rounded-xl border border-gray-700">
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        {entry.thumbnail ? (
+                          <img src={entry.thumbnail} alt="" className="w-20 h-12 object-cover rounded flex-shrink-0 bg-gray-700" />
+                        ) : (
+                          <div className="w-20 h-12 rounded bg-gray-700 flex-shrink-0" />
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="font-medium text-sm">{entry.username}</span>
+                            <span className="flex items-center gap-1 text-xs bg-green-500/20 text-green-400 border border-green-500/30 rounded-full px-2 py-0.5">
+                              <span className="w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse" /> Live
+                            </span>
+                          </div>
+                          <p className="text-xs text-gray-300 truncate">{entry.title}</p>
+                          <p className="text-xs text-gray-500 mt-0.5">
+                            At {Math.floor(entry.position / 60)}:{String(Math.floor(entry.position) % 60).padStart(2, '0')} · {secsAgo}s ago
+                          </p>
                         </div>
-                        <p className="text-xs text-gray-300 truncate">{entry.title}</p>
-                        <p className="text-xs text-gray-500 mt-0.5">
-                          At {Math.floor(entry.position / 60)}:{String(Math.floor(entry.position) % 60).padStart(2, '0')} · updated {secsAgo}s ago
-                        </p>
                       </div>
                       <button
                         onClick={() => setCoWatchEntry(entry)}
-                        className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg bg-gray-800 hover:bg-yellow-600 text-gray-300 hover:text-white transition-colors border border-gray-700 flex-shrink-0"
+                        className="flex items-center justify-center gap-1.5 text-xs px-4 py-2 rounded-lg bg-gray-800 hover:bg-yellow-600 text-gray-300 hover:text-white transition-colors border border-gray-700 flex-shrink-0 w-full sm:w-auto"
                       >
                         <Play size={13} /> Watch with
                       </button>
