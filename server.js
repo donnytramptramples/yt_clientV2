@@ -30,10 +30,19 @@ try {
   }
 }
 
+const platform = os.platform();
 let YTDLP = (() => {
-  try { return execSync('which yt-dlp').toString().trim(); } catch {}
-  const homeBin = `${os.homedir()}/bin/yt-dlp`;
-  return homeBin;
+  const binNames = platform === 'win32' ? ['yt-dlp.exe', 'yt-dlp'] : ['yt-dlp'];
+  const lookup = platform === 'win32' ? 'where' : 'which';
+  for (const name of binNames) {
+    try {
+      const resolved = execSync(`${lookup} ${name}`, { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString().trim();
+      if (resolved) return resolved.split(/\r?\n/)[0];
+    } catch {}
+  }
+  const binName = platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+  return path.join(os.homedir(), 'bin', binName);
 })();
 
 async function ensureYtDlp() {
@@ -42,16 +51,19 @@ async function ensureYtDlp() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   console.log('[setup] yt-dlp not found — downloading...');
   await new Promise((resolve, reject) => {
+    const downloadUrl = platform === 'win32'
+      ? 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'
+      : 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
     const proc = spawn('curl', [
       '-sL', '--retry', '3',
-      'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux',
+      downloadUrl,
       '-o', YTDLP,
     ]);
     proc.on('close', code => {
       if (code !== 0) return reject(new Error(`curl exited ${code}`));
       try {
-        fs.chmodSync(YTDLP, 0o755);
-        const ver = execSync(`${YTDLP} --version`).toString().trim();
+        if (platform !== 'win32') fs.chmodSync(YTDLP, 0o755);
+        const ver = execSync(`"${YTDLP}" --version`).toString().trim();
         console.log(`[setup] yt-dlp ${ver} ready`);
         resolve();
       } catch (e) { reject(e); }
