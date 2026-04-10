@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2, Rss, TrendingUp, RefreshCw } from 'lucide-react';
 import VideoCard from './VideoCard';
+import KaliLoader from './KaliLoader';
 
 export default function FeedPage({ user, onVideoSelect, onChannelSelect }) {
   const [videos, setVideos] = useState([]);
@@ -28,12 +29,7 @@ export default function FeedPage({ user, onVideoSelect, onChannelSelect }) {
   useEffect(load, [user]);
 
   if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3">
-        <Loader2 size={36} className="text-[var(--accent)] animate-spin" />
-        <p className="text-sm text-[var(--text-secondary)]">Building your feed…</p>
-      </div>
-    );
+    return <KaliLoader text="FETCHING VIDEO FEED..." />;
   }
 
   return (

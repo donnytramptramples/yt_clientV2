@@ -238,3 +238,16 @@ video::cue {
 .animate-skip-fade {
   animation: skip-fade 0.7s ease forwards;
 }
+
+@keyframes loadingBar {
+  0%   { width: 0%; }
+  30%  { width: 45%; }
+  55%  { width: 65%; }
+  75%  { width: 78%; }
+  90%  { width: 88%; }
+  100% { width: 92%; }
+}
+
+.loading-bar {
+  animation: loadingBar 4s cubic-bezier(0.1, 0.4, 0.3, 1) forwards;
+}

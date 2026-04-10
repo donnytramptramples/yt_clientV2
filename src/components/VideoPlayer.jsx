@@ -6,6 +6,7 @@ import {
   Share2, Check
 } from 'lucide-react';
 import { useDownload } from '../DownloadContext';
+import CollaboratorPicker from './CollaboratorPicker';
 
 // sessionStorage cache — auto-cleared when the tab closes
 const SS_TTL = 30 * 60 * 1000; // 30 minutes
@@ -917,6 +918,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
       if (!v) return;
 
+      // ── User's intended playback speed (used to scale drift correction) ───────
+      const userSpeed = (data.speed && data.speed > 0) ? data.speed : 1;
+
       // ── Play / pause sync ────────────────────────────────────────────────────
       if (userPaused) {
         if (!v.paused) v.pause();
@@ -930,7 +934,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
       if (seekInProgress) {
         wasPlayingRef.current = true;
-        v.playbackRate = 1.0;
+        v.playbackRate = userSpeed;
         return;
       }
 
@@ -944,20 +948,20 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           coWatchSeekLockUntilRef.current = now + 2000;
           seekToRef.current(userPos);
           wasPlayingRef.current = true;
-          v.playbackRate = 1.0;
+          v.playbackRate = userSpeed;
           return;
         } else if (Math.abs(diff) > 5) {
-          // Large gap — close it fast (1.5x: closes 5s gap in ~10s of playback)
-          v.playbackRate = diff > 0 ? 1.5 : 0.7;
+          // Large gap — close it fast (scaled relative to user's speed)
+          v.playbackRate = userSpeed * (diff > 0 ? 1.5 : 0.7);
         } else if (Math.abs(diff) > 2) {
           // Moderate gap — close it in a few seconds without sounding choppy
-          v.playbackRate = diff > 0 ? 1.15 : 0.88;
+          v.playbackRate = userSpeed * (diff > 0 ? 1.15 : 0.88);
         } else if (Math.abs(diff) > SYNC_THRESHOLD) {
           // Fine drift — imperceptible nudge
-          v.playbackRate = diff > 0 ? 1.04 : 0.97;
+          v.playbackRate = userSpeed * (diff > 0 ? 1.04 : 0.97);
         } else {
-          // Locked in
-          v.playbackRate = 1.0;
+          // Locked in — match user's speed exactly
+          v.playbackRate = userSpeed;
         }
       }
 
@@ -967,7 +971,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       }
 
       // ── Metadata sync (always, even during seek lock) ────────────────────────
-      if (data.speed && data.speed !== speedRef.current) setSpeed(data.speed);
+      if (userSpeed !== speedRef.current) setSpeed(userSpeed);
       if (data.quality && data.quality !== qualityRef.current) changeQualityRef.current(data.quality);
       if (data.subtitlesOn !== undefined && data.subtitlesOn !== subtitlesEnabledRef.current) setSubtitlesEnabled(data.subtitlesOn);
       if (data.subtitleLang && data.subtitleLang !== selectedSubtitleRef.current) setCurrentSubtitleLang(data.subtitleLang);
@@ -1174,7 +1178,11 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     };
   }, [quality, proxySeek]);
 
-  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
+  useEffect(() => {
+    // In co-watch mode the drift-correction loop controls playbackRate directly;
+    // only update it here for normal (non-cowatch) playback.
+    if (videoRef.current && !coWatchUserId) videoRef.current.playbackRate = speed;
+  }, [speed, coWatchUserId]);
 
   useEffect(() => {
     const onChange = () => {
@@ -1756,12 +1764,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
             />
           )}
           <div className="flex-1 min-w-0">
-            <p
-              className="text-sm font-semibold cursor-pointer hover:text-[var(--accent)] transition-colors truncate"
-              onClick={() => onChannelSelect && video.channelId && onChannelSelect(video.channelId)}
-            >
-              {video.channel}
-            </p>
+            <CollaboratorPicker
+              channelName={video.channel}
+              channelId={video.channelId}
+              onChannelClick={(id) => onChannelSelect && onChannelSelect(id)}
+              className="text-sm font-semibold"
+            />
             <p className="text-xs text-[var(--text-secondary)]">{video.views}</p>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2, Search } from 'lucide-react';
 import VideoCard from './VideoCard';
+import KaliLoader from './KaliLoader';
 
 function ChannelCard({ channel, onClick }) {
   return (
@@ -99,11 +100,7 @@ export default function VideoGrid({ searchQuery, onVideoSelect, onChannelSelect 
   }
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 size={36} className="text-[var(--accent)] animate-spin" />
-      </div>
-    );
+    return <KaliLoader text="EXECUTING SEARCH QUERY..." />;
   }
 
   if (isError) {

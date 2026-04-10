@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Sun, Moon, Rss, Search, LogOut, User, Zap, Bookmark, Sliders } from 'lucide-react';
 import { DownloadProvider } from './DownloadContext';
+import KaliLoader from './components/KaliLoader';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
 import VideoPlayer from './components/VideoPlayer';
@@ -105,11 +106,7 @@ function App() {
   };
 
   if (user === undefined) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-[var(--bg-primary)]">
-        <div className="text-[var(--accent)] text-lg">Loading…</div>
-      </div>
-    );
+    return <KaliLoader fullScreen text="AUTHENTICATING SESSION..." />;
   }
 
   if (user === null) {

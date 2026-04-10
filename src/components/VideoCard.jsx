@@ -1,4 +1,5 @@
 import React from 'react';
+import CollaboratorPicker from './CollaboratorPicker';
 
 function VideoCard({ video, onClick, onChannelClick }) {
   return (
@@ -32,13 +33,13 @@ function VideoCard({ video, onClick, onChannelClick }) {
             >
               {video.title}
             </h3>
-            <p
-              className="text-xs text-[var(--text-secondary)] cursor-pointer hover:text-[var(--accent)] transition-colors"
-              onClick={e => { e.stopPropagation(); if (onChannelClick && video.channelId) onChannelClick(video.channelId); }}
-            >
-              {video.channel}
-            </p>
-            <p className="text-xs text-[var(--text-secondary)]">
+            <CollaboratorPicker
+              channelName={video.channel}
+              channelId={video.channelId}
+              onChannelClick={onChannelClick}
+              className="text-xs text-[var(--text-secondary)]"
+            />
+            <p className="text-xs text-[var(--text-secondary)] mt-0.5">
               {video.views}
               {video.published && <span className="ml-2">{video.published}</span>}
             </p>

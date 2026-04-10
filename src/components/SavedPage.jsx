@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2, Bookmark, Trash2, RefreshCw, Search, X } from 'lucide-react';
 import VideoCard from './VideoCard';
+import KaliLoader from './KaliLoader';
 
 export default function SavedPage({ onVideoSelect, onChannelSelect }) {
   const [videos, setVideos] = useState([]);
@@ -31,12 +32,7 @@ export default function SavedPage({ onVideoSelect, onChannelSelect }) {
     : videos;
 
   if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-64 gap-3">
-        <Loader2 size={36} className="text-[var(--accent)] animate-spin" />
-        <p className="text-sm text-[var(--text-secondary)]">Loading saved videos…</p>
-      </div>
-    );
+    return <KaliLoader text="QUERYING SAVED VIDEOS..." />;
   }
 
   return (

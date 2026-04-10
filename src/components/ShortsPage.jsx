@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Loader2, ChevronUp, ChevronDown, Play, Pause, Volume2, VolumeX, RefreshCw, Share2 } from 'lucide-react';
+import KaliLoader from './KaliLoader';
 
 function ShortPlayer({ short, isActive, onChannelClick }) {
   const videoRef = useRef(null);
@@ -225,12 +226,7 @@ export default function ShortsPage({ user, onVideoSelect, onChannelSelect }) {
   };
 
   if (loading) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-4" style={{ height: 'calc(100vh - 80px)' }}>
-        <Loader2 size={44} className="text-[var(--accent)] animate-spin" />
-        <p className="text-sm text-[var(--text-secondary)]">Loading Shorts…</p>
-      </div>
-    );
+    return <KaliLoader text="FETCHING SHORT-FORM CONTENT..." />;
   }
 
   if (error || shorts.length === 0) {

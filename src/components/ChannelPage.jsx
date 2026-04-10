@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ArrowLeft, Loader2, Users, SortAsc, ChevronDown, Search, X } from 'lucide-react';
 import VideoCard from './VideoCard';
+import KaliLoader from './KaliLoader';
 
 const SERVER_PAGE_SIZE = 60;
 
@@ -11,17 +12,19 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [loadingAll, setLoadingAll] = useState(false);
   const [error, setError] = useState('');
   const [sort, setSort] = useState('newest');
   const [subscribed, setSubscribed] = useState(false);
   const [subLoading, setSubLoading] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
-  const loadAllRef = useRef(false);
+  const [scanState, setScanState] = useState({ active: false, pagesScanned: 0, totalFetched: 0, done: false });
 
-  const fetchPage = useCallback(async (channelId, sort, page) => {
-    const params = new URLSearchParams({ id: channelId, sort, page, pageSize: SERVER_PAGE_SIZE });
+  const scanCancelRef = useRef(false);
+  const scanActiveRef = useRef(false);
+
+  const fetchPage = useCallback(async (cId, s, page) => {
+    const params = new URLSearchParams({ id: cId, sort: s, page, pageSize: SERVER_PAGE_SIZE });
     const r = await fetch(`/api/channel/videos?${params}`);
     if (!r.ok) {
       const text = await r.text().catch(() => '');
@@ -39,6 +42,9 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     setCurrentPage(1);
     setHasMore(false);
     setSearchQuery('');
+    setScanState({ active: false, pagesScanned: 0, totalFetched: 0, done: false });
+    scanCancelRef.current = true;
+    scanActiveRef.current = false;
 
     fetchPage(channelId, sort, 1)
       .then(data => {
@@ -52,6 +58,70 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       .finally(() => setLoading(false));
   }, [channelId, sort, retryKey]);
 
+  // Auto-scan all pages when search query is active
+  useEffect(() => {
+    if (!searchQuery.trim() || loading) {
+      if (!searchQuery.trim()) {
+        scanCancelRef.current = true;
+        scanActiveRef.current = false;
+        setScanState({ active: false, pagesScanned: 0, totalFetched: 0, done: false });
+      }
+      return;
+    }
+
+    if (!hasMore || scanActiveRef.current) return;
+
+    scanCancelRef.current = false;
+    scanActiveRef.current = true;
+
+    const runScan = async () => {
+      setScanState(prev => ({ ...prev, active: true, done: false }));
+      let page = currentPage;
+      let more = hasMore;
+      let pagesScanned = 0;
+      let totalFetched = allVideos.length;
+
+      try {
+        while (more && !scanCancelRef.current) {
+          page += 1;
+          const data = await fetchPage(channelId, sort, page);
+          if (scanCancelRef.current) break;
+
+          if (data.videos?.length > 0) {
+            const newVids = data.videos;
+            setAllVideos(prev => {
+              const existingIds = new Set(prev.map(v => v.id));
+              return [...prev, ...newVids.filter(v => !existingIds.has(v.id))];
+            });
+            setCurrentPage(page);
+            more = data.hasMore ?? false;
+            setHasMore(more);
+            pagesScanned += 1;
+            totalFetched += newVids.length;
+            setScanState({ active: true, pagesScanned, totalFetched, done: false });
+          } else {
+            more = false;
+            setHasMore(false);
+          }
+        }
+      } catch (e) {
+        console.error('Scan error:', e.message);
+      } finally {
+        scanActiveRef.current = false;
+        if (!scanCancelRef.current) {
+          setScanState(prev => ({ ...prev, active: false, done: true }));
+        }
+      }
+    };
+
+    runScan();
+
+    return () => {
+      scanCancelRef.current = true;
+      scanActiveRef.current = false;
+    };
+  }, [searchQuery, hasMore, loading]);
+
   const handleLoadMore = async () => {
     if (loadingMore || !hasMore) return;
     setLoadingMore(true);
@@ -61,8 +131,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       if (data.videos?.length > 0) {
         setAllVideos(prev => {
           const existingIds = new Set(prev.map(v => v.id));
-          const newVids = data.videos.filter(v => !existingIds.has(v.id));
-          return [...prev, ...newVids];
+          return [...prev, ...data.videos.filter(v => !existingIds.has(v.id))];
         });
         setCurrentPage(nextPage);
         setHasMore(data.hasMore ?? false);
@@ -75,52 +144,6 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       setLoadingMore(false);
     }
   };
-
-  // When a search query is active, auto-load all remaining pages so search is comprehensive
-  useEffect(() => {
-    if (!searchQuery.trim()) {
-      loadAllRef.current = false;
-      return;
-    }
-    if (!hasMore || loadingAll || loadingMore || loading) return;
-
-    loadAllRef.current = true;
-    let cancelled = false;
-
-    const loadAll = async () => {
-      setLoadingAll(true);
-      let page = currentPage;
-      let more = hasMore;
-      try {
-        while (more && !cancelled && loadAllRef.current) {
-          page += 1;
-          const data = await fetchPage(channelId, sort, page);
-          if (cancelled || !loadAllRef.current) break;
-          if (data.videos?.length > 0) {
-            setAllVideos(prev => {
-              const existingIds = new Set(prev.map(v => v.id));
-              const newVids = data.videos.filter(v => !existingIds.has(v.id));
-              return [...prev, ...newVids];
-            });
-            setCurrentPage(page);
-            more = data.hasMore ?? false;
-            setHasMore(more);
-          } else {
-            more = false;
-            setHasMore(false);
-          }
-        }
-      } catch (e) {
-        console.error('Load all error:', e.message);
-      } finally {
-        if (!cancelled) setLoadingAll(false);
-      }
-    };
-
-    loadAll();
-    return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchQuery, hasMore]);
 
   useEffect(() => {
     if (!user || !channelId) return;
@@ -155,15 +178,21 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     finally { setSubLoading(false); }
   };
 
-  // Client-side filter — searches across all fetched videos (auto-load brings in the rest)
   const filteredVideos = useMemo(() => {
     if (!searchQuery.trim()) return allVideos;
     const q = searchQuery.trim().toLowerCase();
     return allVideos.filter(v => v.title?.toLowerCase().includes(q));
   }, [allVideos, searchQuery]);
 
+  // Scan progress bar: logarithmic fill so it never hits 100% until actually done
+  const scanBarPercent = scanState.done
+    ? 100
+    : scanState.pagesScanned > 0
+      ? Math.min(95, Math.round((scanState.pagesScanned / (scanState.pagesScanned + 3)) * 100))
+      : 0;
+
   const countLabel = searchQuery
-    ? `${filteredVideos.length}${loadingAll ? '+' : ''} results`
+    ? `${filteredVideos.length}${scanState.active ? '+' : ''} results`
     : `${allVideos.length}${hasMore ? '+' : ''} Videos`;
 
   return (
@@ -177,10 +206,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
       </button>
 
       {loading ? (
-        <div className="flex flex-col items-center justify-center h-64 gap-4">
-          <Loader2 size={40} className="text-[var(--accent)] animate-spin" />
-          <p className="text-[var(--text-secondary)] text-sm">Loading channel videos…</p>
-        </div>
+        <KaliLoader text="LOADING CHANNEL METADATA..." />
       ) : error ? (
         <div className="flex flex-col items-center justify-center h-40 gap-3">
           <p className="text-red-400 text-sm text-center max-w-sm">{error}</p>
@@ -222,25 +248,15 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
             </div>
           )}
 
-          {/* Controls row: count + search + sort */}
-          <div className="flex flex-wrap items-center gap-3 mb-4">
-            <h2 className="text-lg font-semibold flex-shrink-0 flex items-center gap-2">
-              {countLabel}
-              {loadingAll && (
-                <span className="flex items-center gap-1 text-xs font-normal text-[var(--text-secondary)]">
-                  <Loader2 size={12} className="animate-spin" />
-                  Scanning…
-                </span>
-              )}
-            </h2>
+          {/* Controls row */}
+          <div className="flex flex-wrap items-center gap-3 mb-2">
+            <h2 className="text-lg font-semibold flex-shrink-0">{countLabel}</h2>
 
             {/* Video search within channel */}
             <div className="flex-1 min-w-[180px] max-w-xs relative">
-              {loadingAll ? (
-                <Loader2 size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--accent)] animate-spin pointer-events-none" />
-              ) : (
-                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none" />
-              )}
+              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none flex items-center">
+                <Search size={14} className="text-[var(--text-secondary)]" />
+              </span>
               <input
                 type="text"
                 value={searchQuery}
@@ -272,9 +288,30 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
             </div>
           </div>
 
+          {/* Scan progress bar — shown when search is active and scanning */}
+          {searchQuery && (scanState.active || scanState.done) && (
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-[var(--text-secondary)]">
+                  {scanState.active
+                    ? `Scanning… ${scanState.totalFetched} videos checked`
+                    : `Scan complete — ${scanState.totalFetched} videos searched`}
+                </span>
+                <span className="text-xs text-[var(--text-secondary)]">{scanBarPercent}%</span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-[var(--border)] overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-[var(--accent)] transition-all duration-500"
+                  style={{ width: `${scanBarPercent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* No-results state while scanning */}
           {filteredVideos.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-40 gap-2">
-              {loadingAll ? (
+              {scanState.active ? (
                 <>
                   <Loader2 size={24} className="text-[var(--accent)] animate-spin" />
                   <p className="text-[var(--text-secondary)] text-sm">Scanning all videos…</p>
@@ -293,7 +330,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
                 ))}
               </div>
 
-              {/* Load more — only show when not searching (search filters already-fetched videos) */}
+              {/* Load more — only show when not searching */}
               {!searchQuery && hasMore && (
                 <div className="flex justify-center mt-8">
                   <button
@@ -306,7 +343,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
                     ) : (
                       <ChevronDown size={16} />
                     )}
-                    {loadingMore ? 'Loading…' : `Load More Videos`}
+                    {loadingMore ? 'Loading…' : 'Load More Videos'}
                   </button>
                 </div>
               )}
