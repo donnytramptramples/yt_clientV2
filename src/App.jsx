@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Sun, Moon, Rss, Search, LogOut, User, Zap, Bookmark, Sliders } from 'lucide-react';
+import { DownloadProvider } from './DownloadContext';
 import SearchBar from './components/SearchBar';
 import VideoGrid from './components/VideoGrid';
 import VideoPlayer from './components/VideoPlayer';
@@ -282,4 +283,12 @@ function App() {
   );
 }
 
-export default App;
+function AppWithProviders() {
+  return (
+    <DownloadProvider>
+      <App />
+    </DownloadProvider>
+  );
+}
+
+export default AppWithProviders;

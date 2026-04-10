@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ArrowLeft, Loader2, Users, SortAsc, ChevronDown, Search, X } from 'lucide-react';
 import VideoCard from './VideoCard';
 
@@ -11,15 +11,18 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadingAll, setLoadingAll] = useState(false);
   const [error, setError] = useState('');
   const [sort, setSort] = useState('newest');
   const [subscribed, setSubscribed] = useState(false);
   const [subLoading, setSubLoading] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
+  const loadAllRef = useRef(false);
 
   const fetchPage = useCallback(async (channelId, sort, page) => {
-    const r = await fetch(`/api/channel/${channelId}/videos?sort=${sort}&page=${page}&pageSize=${SERVER_PAGE_SIZE}`);
+    const params = new URLSearchParams({ id: channelId, sort, page, pageSize: SERVER_PAGE_SIZE });
+    const r = await fetch(`/api/channel/videos?${params}`);
     if (!r.ok) {
       const text = await r.text().catch(() => '');
       throw new Error(text.startsWith('<') ? `Server error ${r.status}` : text || `Server error ${r.status}`);
@@ -73,6 +76,52 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     }
   };
 
+  // When a search query is active, auto-load all remaining pages so search is comprehensive
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      loadAllRef.current = false;
+      return;
+    }
+    if (!hasMore || loadingAll || loadingMore || loading) return;
+
+    loadAllRef.current = true;
+    let cancelled = false;
+
+    const loadAll = async () => {
+      setLoadingAll(true);
+      let page = currentPage;
+      let more = hasMore;
+      try {
+        while (more && !cancelled && loadAllRef.current) {
+          page += 1;
+          const data = await fetchPage(channelId, sort, page);
+          if (cancelled || !loadAllRef.current) break;
+          if (data.videos?.length > 0) {
+            setAllVideos(prev => {
+              const existingIds = new Set(prev.map(v => v.id));
+              const newVids = data.videos.filter(v => !existingIds.has(v.id));
+              return [...prev, ...newVids];
+            });
+            setCurrentPage(page);
+            more = data.hasMore ?? false;
+            setHasMore(more);
+          } else {
+            more = false;
+            setHasMore(false);
+          }
+        }
+      } catch (e) {
+        console.error('Load all error:', e.message);
+      } finally {
+        if (!cancelled) setLoadingAll(false);
+      }
+    };
+
+    loadAll();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery, hasMore]);
+
   useEffect(() => {
     if (!user || !channelId) return;
     fetch(`/api/subscriptions/${channelId}/status`, { credentials: 'include' })
@@ -106,7 +155,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
     finally { setSubLoading(false); }
   };
 
-  // Client-side filter for in-channel search (over already-fetched videos)
+  // Client-side filter — searches across all fetched videos (auto-load brings in the rest)
   const filteredVideos = useMemo(() => {
     if (!searchQuery.trim()) return allVideos;
     const q = searchQuery.trim().toLowerCase();
@@ -114,7 +163,7 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
   }, [allVideos, searchQuery]);
 
   const countLabel = searchQuery
-    ? `${filteredVideos.length} results`
+    ? `${filteredVideos.length}${loadingAll ? '+' : ''} results`
     : `${allVideos.length}${hasMore ? '+' : ''} Videos`;
 
   return (
@@ -175,11 +224,23 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
 
           {/* Controls row: count + search + sort */}
           <div className="flex flex-wrap items-center gap-3 mb-4">
-            <h2 className="text-lg font-semibold flex-shrink-0">{countLabel}</h2>
+            <h2 className="text-lg font-semibold flex-shrink-0 flex items-center gap-2">
+              {countLabel}
+              {loadingAll && (
+                <span className="flex items-center gap-1 text-xs font-normal text-[var(--text-secondary)]">
+                  <Loader2 size={12} className="animate-spin" />
+                  Scanning…
+                </span>
+              )}
+            </h2>
 
             {/* Video search within channel */}
             <div className="flex-1 min-w-[180px] max-w-xs relative">
-              <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none" />
+              {loadingAll ? (
+                <Loader2 size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--accent)] animate-spin pointer-events-none" />
+              ) : (
+                <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] pointer-events-none" />
+              )}
               <input
                 type="text"
                 value={searchQuery}
@@ -212,10 +273,17 @@ export default function ChannelPage({ channelId, onBack, onVideoSelect, user, on
           </div>
 
           {filteredVideos.length === 0 ? (
-            <div className="flex items-center justify-center h-40">
-              <p className="text-[var(--text-secondary)]">
-                {searchQuery ? `No videos match "${searchQuery}"` : 'No videos found for this channel.'}
-              </p>
+            <div className="flex flex-col items-center justify-center h-40 gap-2">
+              {loadingAll ? (
+                <>
+                  <Loader2 size={24} className="text-[var(--accent)] animate-spin" />
+                  <p className="text-[var(--text-secondary)] text-sm">Scanning all videos…</p>
+                </>
+              ) : (
+                <p className="text-[var(--text-secondary)]">
+                  {searchQuery ? `No videos match "${searchQuery}"` : 'No videos found for this channel.'}
+                </p>
+              )}
             </div>
           ) : (
             <>

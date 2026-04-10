@@ -1694,6 +1694,34 @@ function formatUploadDate(d) {
   return `${d.substring(0, 4)}-${d.substring(4, 6)}-${d.substring(6, 8)}`;
 }
 
+// Query-string version — avoids routing failures when channelId contains slashes or other special chars
+app.get('/api/channel/videos', async (req, res) => {
+  try {
+    const channelId = req.query.id || '';
+    if (!channelId) return res.status(400).json({ error: 'id is required' });
+    const { sort = 'newest', page = '1', pageSize = '60' } = req.query;
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const pageSizeNum = Math.min(200, Math.max(10, parseInt(pageSize) || 60));
+
+    const data = await fetchChannelVideos(channelId, pageNum, pageSizeNum);
+    let videos = [...data.videos];
+
+    if (sort === 'oldest') videos = videos.reverse();
+    else if (sort === 'popular') {
+      videos = videos.sort((a, b) => {
+        const aV = parseInt((a.views || '0').replace(/[^\d]/g, '')) || 0;
+        const bV = parseInt((b.views || '0').replace(/[^\d]/g, '')) || 0;
+        return bV - aV;
+      });
+    }
+
+    res.json({ videos, channel: data.channel, hasMore: data.hasMore, page: pageNum });
+  } catch (e) {
+    console.error('[channel/videos] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/channel/:channelId/videos', async (req, res) => {
   try {
     const { channelId } = req.params;
@@ -2349,105 +2377,50 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
 // ─── Download ────────────────────────────────────────────────────────────────
 
-// CRITICAL FIX: New helper to estimate download size for progress indication
-function estimateDownloadSize(durationSecs, format, qualityNum, isAudio = false) {
-  if (!durationSecs || durationSecs <= 0) return null;
-
-  // Estimate bitrates based on format and quality
-  const bitrates = {
-    mp4: {
-      144: 200,    // 200 kbps
-      240: 400,
-      360: 800,
-      480: 1500,
-      720: 2500,
-      1080: 4500,
-      1440: 8000,
-      2160: 16000,
-    },
-    mp3: 320,      // 320 kbps
-    flac: 1500,    // ~1.5 Mbps average for FLAC
-    opus: 160,
-    ogg: 192,
-    m4a: 256,
-  };
-
-  let kbps;
-  if (isAudio) {
-    kbps = bitrates[format] || 320;
-  } else {
-    // Video + audio estimate
-    const videoKbps = bitrates.mp4[qualityNum] || bitrates.mp4[720];
-    const audioKbps = 128; // AAC audio
-    kbps = videoKbps + audioKbps;
-  }
-
-  // Calculate size: bitrate (kbps) * duration (s) / 8 = KB, then convert to bytes
-  const estimatedBytes = Math.floor((kbps * durationSecs / 8) * 1024);
-
-  // Add 10% overhead for container/metadata
-  return Math.floor(estimatedBytes * 1.1);
-}
-
-// CRITICAL FIX: New helper to get file extension and MIME type for downloads
 function getDownloadFormatConfig(format, bitrate, compression) {
   const configs = {
-    mp4: { 
-      ext: 'mp4', 
-      mime: 'video/mp4', 
-      codec: 'copy',
+    mp4: {
+      ext: 'mp4',
+      mime: 'video/mp4',
       audioCodec: 'copy',
-      // Note: faststart is NOT compatible with pipe output - removed!
-      movFlags: 'frag_keyframe+empty_moov+default_base_moof',
-      isAudio: false 
+      isAudio: false,
     },
-    mp3: { 
-      ext: 'mp3', 
-      mime: 'audio/mpeg', 
-      codec: null, // video not applicable
+    mp3: {
+      ext: 'mp3',
+      mime: 'audio/mpeg',
       audioCodec: 'libmp3lame',
       args: ['-b:a', bitrate || '320k', '-ar', '44100'],
-      movFlags: null,
-      isAudio: true 
+      isAudio: true,
     },
-    flac: { 
-      ext: 'flac', 
-      mime: 'audio/flac', 
-      codec: null,
+    flac: {
+      ext: 'flac',
+      mime: 'audio/flac',
       audioCodec: 'flac',
       args: ['-compression_level', String(compression ?? 5)],
-      movFlags: null,
-      isAudio: true 
+      isAudio: true,
     },
-    opus: { 
-      ext: 'opus', 
-      mime: 'audio/ogg',  // opus in ogg container
-      codec: null,
+    opus: {
+      ext: 'opus',
+      mime: 'audio/ogg',
       audioCodec: 'libopus',
       args: ['-b:a', bitrate || '160k', '-ar', '48000'],
-      movFlags: null,
-      isAudio: true 
+      isAudio: true,
     },
-    ogg: { 
-      ext: 'ogg', 
-      mime: 'audio/ogg', 
-      codec: null,
+    ogg: {
+      ext: 'ogg',
+      mime: 'audio/ogg',
       audioCodec: 'libvorbis',
       args: ['-b:a', bitrate || '192k', '-ar', '44100'],
-      movFlags: null,
-      isAudio: true 
+      isAudio: true,
     },
-    m4a: { 
-      ext: 'm4a', 
-      mime: 'audio/mp4', 
-      codec: null,
+    m4a: {
+      ext: 'm4a',
+      mime: 'audio/mp4',
       audioCodec: 'aac',
       args: ['-b:a', bitrate || '256k'],
-      movFlags: 'frag_keyframe+empty_moov+default_base_moof',
-      isAudio: true 
+      isAudio: true,
     },
   };
-
   return configs[format] || configs.mp4;
 }
 
@@ -2461,7 +2434,6 @@ function spawnFfmpegAudio(audioUrl, codec, ffmpegFormat, extraArgs, signal, seek
       'Referer: https://www.youtube.com/',
     ].join('\r\n') + '\r\n';
 
-    // BUG FIX: Add seek support for audio downloads
     const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
 
     const args = [
@@ -2471,7 +2443,7 @@ function spawnFfmpegAudio(audioUrl, codec, ffmpegFormat, extraArgs, signal, seek
       '-reconnect', '1',
       '-reconnect_on_network_error', '1',
       '-reconnect_delay_max', '5',
-      ...ssArgs,  // BUG FIX: Apply seek before input
+      ...ssArgs,
       '-i', audioUrl,
       '-vn',
       '-c:a', codec,
@@ -2495,30 +2467,22 @@ function spawnFfmpegAudio(audioUrl, codec, ffmpegFormat, extraArgs, signal, seek
   });
 }
 
-// CRITICAL FIX: Sanitize filename for HTTP headers
-// RFC 7230: Only printable ASCII characters (0x20-0x7E) allowed, no control chars
 function sanitizeFilenameForHeader(filename) {
   if (!filename) return 'download';
 
-  // Replace control characters and non-printable ASCII
-  // Allow only: A-Z, a-z, 0-9, space, and safe special chars: - _ . ( ) [ ] { } ~ ! @ # $ % & ' + , ; =
-  // Replace others with underscore
   let sanitized = filename
-    .replace(/[\x00-\x1F\x7F]/g, '') // Remove control characters
-    .replace(/[<>:"/\\|?*]/g, '_')   // Replace Windows forbidden chars
-    .replace(/[^\x20-\x7E]/g, '_')   // Replace non-ASCII printable chars
-    .replace(/\s+/g, '_')            // Replace whitespace with underscore
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/\s+/g, '_')
     .trim();
 
-  // Remove leading/trailing dots and underscores
   sanitized = sanitized.replace(/^[._]+|[._]+$/g, '');
 
-  // Limit length
   if (sanitized.length > 100) {
     sanitized = sanitized.substring(0, 100);
   }
 
-  // Fallback if empty
   if (!sanitized) {
     sanitized = 'download';
   }
@@ -2526,206 +2490,303 @@ function sanitizeFilenameForHeader(filename) {
   return sanitized;
 }
 
-app.get('/api/download/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  // BUG FIX: Added seek support for downloads
-  const { format = 'mp4', quality = '720', title: titleParam, bitrate, compression, t, start } = req.query;
+// Temp-file mux: download video+audio to disk, then serve with known Content-Length
+function muxToTempFile(videoUrl, audioUrl, tempPath, signal, seekSeconds = 0) {
+  return new Promise((resolve, reject) => {
+    const ytHeaders = [
+      `User-Agent: ${getRandomUA()}`,
+      'Accept: */*',
+      'Accept-Language: en-US,en;q=0.9',
+      'Origin: https://www.youtube.com',
+      'Referer: https://www.youtube.com/',
+    ].join('\r\n') + '\r\n';
 
-  // BUG FIX: Parse seek time
-  let seekSeconds = 0;
-  if (start !== undefined) {
-    seekSeconds = Math.max(0, parseFloat(start) || 0);
-  } else if (t !== undefined) {
-    const tStr = String(t);
-    if (/^\d+$/.test(tStr)) {
-      seekSeconds = parseInt(tStr, 10);
-    } else {
-      const match = tStr.match(/(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?/);
-      if (match) {
-        const hours = parseInt(match[1] || 0) * 3600;
-        const mins = parseInt(match[2] || 0) * 60;
-        const secs = parseInt(match[3] || 0);
-        seekSeconds = hours + mins + secs;
-      }
+    const ssArg = seekSeconds > 0 ? seekSeconds.toFixed(3) : null;
+
+    const args = ['-loglevel', 'error'];
+    args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto');
+
+    // Video input
+    args.push('-headers', ytHeaders);
+    args.push('-reconnect', '1');
+    args.push('-reconnect_streamed', '1');
+    args.push('-reconnect_on_network_error', '1');
+    args.push('-reconnect_delay_max', '10');
+    if (ssArg) args.push('-ss', ssArg);
+    args.push('-i', videoUrl);
+
+    // Audio input
+    args.push('-headers', ytHeaders);
+    args.push('-reconnect', '1');
+    args.push('-reconnect_streamed', '1');
+    args.push('-reconnect_on_network_error', '1');
+    args.push('-reconnect_delay_max', '10');
+    if (ssArg) args.push('-ss', ssArg);
+    args.push('-i', audioUrl);
+
+    args.push('-map', '0:v:0');
+    args.push('-map', '1:a:0');
+    args.push('-c:v', 'copy');
+    args.push('-c:a', 'copy');
+    args.push('-avoid_negative_ts', 'make_zero');
+    args.push('-max_muxing_queue_size', '4096');
+
+    // Write to file — faststart puts moov atom at front for instant seek
+    args.push('-movflags', '+faststart');
+    args.push('-f', 'mp4');
+    args.push(tempPath);
+
+    console.log(`[ffmpeg-dl] Muxing to temp file seek=${seekSeconds}s → ${tempPath}`);
+
+    const proc = spawn(FFMPEG, args);
+
+    if (signal) {
+      signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
     }
+
+    let stderrData = '';
+    proc.stderr.on('data', d => {
+      const msg = d.toString().trim();
+      if (msg) {
+        stderrData += msg + '\n';
+        if (msg.includes('Error') || msg.includes('error') || msg.includes('Invalid')) {
+          console.error('[ffmpeg-dl]', msg);
+        }
+      }
+    });
+
+    proc.on('close', code => {
+      if (code === 0) {
+        resolve();
+      } else {
+        if (stderrData) console.error('[ffmpeg-dl stderr]', stderrData.substring(0, 500));
+        reject(new Error(`ffmpeg exited with code ${code}`));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+// Temp-file audio: transcode audio to disk, then serve with known Content-Length
+function audioToTempFile(audioUrl, codec, ffmpegFormat, extraArgs, tempPath, signal, seekSeconds = 0) {
+  return new Promise((resolve, reject) => {
+    const ytHeaders = [
+      `User-Agent: ${getRandomUA()}`,
+      'Accept: */*',
+      'Accept-Language: en-US,en;q=0.9',
+      'Origin: https://www.youtube.com',
+      'Referer: https://www.youtube.com/',
+    ].join('\r\n') + '\r\n';
+
+    const ssArgs = seekSeconds > 0 ? ['-ss', seekSeconds.toFixed(3)] : [];
+
+    const args = [
+      '-loglevel', 'warning',
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      '-headers', ytHeaders,
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_on_network_error', '1',
+      '-reconnect_delay_max', '10',
+      ...ssArgs,
+      '-i', audioUrl,
+      '-vn',
+      '-c:a', codec,
+      ...extraArgs,
+      '-f', ffmpegFormat,
+      tempPath,
+    ];
+
+    console.log(`[ffmpeg-dl] Audio to temp file codec=${codec} → ${tempPath}`);
+
+    const proc = spawn(FFMPEG, args);
+
+    if (signal) {
+      signal.addEventListener('abort', () => { try { proc.kill('SIGTERM'); } catch {} }, { once: true });
+    }
+
+    let stderrData = '';
+    proc.stderr.on('data', d => {
+      const msg = d.toString().trim();
+      if (msg) {
+        stderrData += msg + '\n';
+        if (msg.includes('Error') || msg.includes('error') || msg.includes('Invalid')) {
+          console.error('[ffmpeg-dl]', msg);
+        }
+      }
+    });
+
+    proc.on('close', code => {
+      if (code === 0) {
+        resolve();
+      } else {
+        if (stderrData) console.error('[ffmpeg-dl stderr]', stderrData.substring(0, 500));
+        reject(new Error(`ffmpeg audio exited with code ${code}`));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+// ─── Download job store ───────────────────────────────────────────────────────
+// jobs: { status:'preparing'|'muxing'|'ready'|'error', tempPath, ext, mime,
+//          title, estimatedSize, finalSize, error, createdAt }
+const downloadJobs = new Map();
+
+function cleanupJob(jobId) {
+  const job = downloadJobs.get(jobId);
+  if (job) {
+    try { fs.unlinkSync(job.tempPath); } catch {}
+    downloadJobs.delete(jobId);
   }
+}
 
-  const controller = new AbortController();
-  req.on('close', () => controller.abort());
+// Phase 1 – start a job and return immediately
+app.post('/api/download/start', async (req, res) => {
+  const { videoId, format = 'mp4', quality = '720', title: titleParam, bitrate, compression } = req.query;
+  if (!videoId) return res.status(400).json({ error: 'videoId required' });
 
-  try {
-    const qualityNum = parseInt(quality, 10);
-    // Always use fresh URLs for downloads — cached URLs may be expired
-    ytdlpCache.delete(videoId);
-    ytdlpInFlight.delete(videoId);
+  const jobId = crypto.randomBytes(10).toString('hex');
+  const formatConfig = getDownloadFormatConfig(format, bitrate, compression);
+  const tempPath = path.join(os.tmpdir(), `ytdl_${jobId}.${formatConfig.ext}`);
 
-    // CRITICAL FIX: Try yt-dlp first, fallback to youtubei.js if it fails
-    let data;
-    let useYoutubei = false;
+  const job = {
+    status: 'preparing',
+    tempPath,
+    ext: formatConfig.ext,
+    mime: formatConfig.mime,
+    title: titleParam || `video_${videoId}`,
+    estimatedSize: null,
+    finalSize: null,
+    error: null,
+    createdAt: Date.now(),
+  };
+  downloadJobs.set(jobId, job);
+
+  // Respond immediately so the client isn't kept waiting
+  res.json({ jobId, title: job.title });
+
+  // Run FFmpeg in background
+  (async () => {
     try {
-      data = await getYtDlpFormatsWithRetry(videoId);
-    } catch (ytdlpError) {
-      console.warn(`[download] yt-dlp failed for ${videoId}, trying youtubei.js fallback:`, ytdlpError.message);
+      ytdlpCache.delete(videoId);
+      ytdlpInFlight.delete(videoId);
+
+      let data;
       try {
+        data = await getYtDlpFormatsWithRetry(videoId);
+      } catch (ytdlpError) {
         const info = await getVideoInfo(videoId);
-        const formats = getFormatsFromInfo(info);
-        // Convert youtubei.js format to yt-dlp-like format
+        const fmts = getFormatsFromInfo(info);
         data = {
           formats: [
-            ...formats.videoFormats.map(f => ({
-              url: f.url,
-              height: f.height,
-              width: f.width,
-              vcodec: f.has_video ? 'avc1' : 'none',
-              acodec: f.has_audio ? 'mp4a' : 'none',
-              ext: 'mp4',
-              format_id: f.itag,
+            ...fmts.videoFormats.map(f => ({
+              url: f.url, height: f.height, width: f.width,
+              vcodec: f.has_video ? 'avc1' : 'none', acodec: f.has_audio ? 'mp4a' : 'none',
+              ext: 'mp4', format_id: f.itag,
             })),
-            ...formats.adaptiveFormats.map(f => ({
-              url: f.url,
-              height: f.height,
-              width: f.width,
-              vcodec: f.has_video ? 'avc1' : 'none',
-              acodec: f.has_audio ? 'mp4a' : 'none',
-              ext: 'mp4',
-              format_id: f.itag,
-            }))
+            ...fmts.adaptiveFormats.map(f => ({
+              url: f.url, height: f.height, width: f.width,
+              vcodec: f.has_video ? 'avc1' : 'none', acodec: f.has_audio ? 'mp4a' : 'none',
+              ext: 'mp4', format_id: f.itag,
+            })),
           ],
-          meta: {
-            title: info.basic_info?.title || '',
-            duration: info.basic_info?.duration || 0,
-          }
+          meta: { title: info.basic_info?.title || '', duration: info.basic_info?.duration || 0 },
         };
-        useYoutubei = true;
-        console.log(`[download] Using youtubei.js fallback for ${videoId}`);
-      } catch (ytError) {
-        throw new Error(`Both yt-dlp and youtubei.js failed: ${ytdlpError.message}`);
       }
-    }
 
-    const { formats: ytFmts, meta } = data;
+      const { formats: ytFmts, meta } = data;
+      if (meta?.title) job.title = meta.title;
 
-    // CRITICAL FIX: Use proper filename sanitization for HTTP headers
-    const rawTitle = meta?.title || titleParam || `video_${videoId}`;
-    const safeTitle = sanitizeFilenameForHeader(rawTitle);
+      const qualityNum = parseInt(quality, 10);
 
-    // CRITICAL FIX: Get format configuration
-    const formatConfig = getDownloadFormatConfig(format, bitrate, compression);
+      if (format === 'mp4') {
+        const videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
+        const audioFmt = pickYtDlpAudio(ytFmts);
+        if (!videoFmt || !audioFmt) throw new Error('No suitable video or audio formats found');
 
-    // CRITICAL FIX: Select formats BEFORE setting headers to ensure we have valid formats
-    let videoFmt, audioFmt;
+        // Use yt-dlp reported sizes for a realistic total estimate
+        const vs = videoFmt.filesize || videoFmt.filesize_approx || 0;
+        const as = audioFmt.filesize || audioFmt.filesize_approx || 0;
+        if (vs + as > 0) job.estimatedSize = vs + as;
 
-    if (format === 'mp4') {
-      videoFmt = pickYtDlpVideo(ytFmts, qualityNum);
-      audioFmt = pickYtDlpAudio(ytFmts);
-
-      if (!videoFmt || !audioFmt) {
-        throw new Error('No suitable video or audio formats found');
-      }
-    } else {
-      // Audio download
-      audioFmt = pickYtDlpAudio(ytFmts);
-      if (!audioFmt) {
-        throw new Error('No audio format available');
-      }
-    }
-
-    // CRITICAL FIX: Estimate content length for progress indication
-    const duration = meta?.duration || 0;
-    const remainingDuration = Math.max(0, duration - seekSeconds);
-    const estimatedSize = estimateDownloadSize(remainingDuration, format, qualityNum, formatConfig.isAudio);
-
-    // CRITICAL FIX: Only set headers AFTER we have valid formats
-    if (format === 'mp4') {
-      // CRITICAL FIX: Set headers BEFORE streaming
-      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
-      res.setHeader('Content-Type', formatConfig.mime);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
-      // CRITICAL FIX: Set estimated content length if available
-      if (estimatedSize && estimatedSize > 0) {
-        res.setHeader('Content-Length', estimatedSize.toString());
-        console.log(`[download] ${videoId} mp4 quality=${qualityNum} seek=${seekSeconds}s estimatedSize=${(estimatedSize/1024/1024).toFixed(1)}MB`);
+        job.status = 'muxing';
+        await muxToTempFile(videoFmt.url, audioFmt.url, tempPath, null, 0);
       } else {
-        console.log(`[download] ${videoId} mp4 quality=${qualityNum} seek=${seekSeconds}s (unknown size)`);
+        const audioFmt = pickYtDlpAudio(ytFmts);
+        if (!audioFmt) throw new Error('No audio format available');
+
+        const as = audioFmt.filesize || audioFmt.filesize_approx || 0;
+        if (as > 0) job.estimatedSize = as;
+
+        job.status = 'muxing';
+        const ffmpegFormat = format === 'm4a' ? 'mp4' : formatConfig.ext;
+        await audioToTempFile(
+          audioFmt.url, formatConfig.audioCodec, ffmpegFormat,
+          formatConfig.args || [], tempPath, null, 0,
+        );
       }
 
-      // CRITICAL FIX: For youtubei.js fallback, we need to decipher URLs
-      let videoUrl, audioUrl;
-      if (useYoutubei) {
-        // For youtubei.js formats, we need to decipher the URL
-        const info = await getVideoInfo(videoId);
-        const formats = getFormatsFromInfo(info);
-        const videoFormat = formats.videoFormats.find(f => f.url === videoFmt.url) || 
-                           formats.adaptiveFormats.find(f => f.url === videoFmt.url);
-        const audioFormat = formats.adaptiveFormats.find(f => f.url === audioFmt.url) ||
-                           formats.videoFormats.find(f => f.url === audioFmt.url);
+      const { size } = fs.statSync(tempPath);
+      job.finalSize = size;
+      job.status = 'ready';
+      console.log(`[download] job=${jobId} ${format} size=${(size/1024/1024).toFixed(1)}MB ready`);
 
-        if (!videoFormat || !audioFormat) {
-          throw new Error('Could not find matching formats for deciphering');
-        }
-
-        videoUrl = await decipherUrl(videoFormat, info);
-        audioUrl = await decipherUrl(audioFormat, info);
-      } else {
-        videoUrl = videoFmt.url;
-        audioUrl = audioFmt.url;
-      }
-
-      // CRITICAL FIX: Pass isDownload=true for maximum compatibility
-      // This uses fragmented MP4 which is the only way to pipe MP4 output
-      await muxToResponse(videoUrl, audioUrl, res, controller.signal, seekSeconds, null, true);
-    } else {
-      // Audio download
-      res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${formatConfig.ext}"`);
-      res.setHeader('Content-Type', formatConfig.mime);
-      res.setHeader('Access-Control-Allow-Origin', '*');
-
-      // CRITICAL FIX: Set estimated content length for audio
-      if (estimatedSize && estimatedSize > 0) {
-        res.setHeader('Content-Length', estimatedSize.toString());
-        console.log(`[download] ${videoId} format=${format} estimatedSize=${(estimatedSize/1024/1024).toFixed(1)}MB`);
-      } else {
-        console.log(`[download] ${videoId} format=${format} (unknown size)`);
-      }
-
-      // BUG FIX: Pass seekSeconds to audio transcoding
-      const proc = await spawnFfmpegAudio(
-        audioFmt.url, 
-        formatConfig.audioCodec, 
-        format === 'm4a' ? 'mp4' : formatConfig.ext, // m4a uses mp4 container
-        formatConfig.args || [], 
-        controller.signal, 
-        seekSeconds
-      );
-
-      proc.stdout.pipe(res);
-      proc.stdout.on('error', () => {});
-
-      await new Promise((resolve, reject) => {
-        proc.on('close', c => {
-          if (c === 0 || c === null || res.writableEnded) resolve();
-          else reject(new Error(`ffmpeg exit ${c}`));
-        });
-        proc.on('error', reject);
-      });
+      // Auto-clean after 30 minutes if client never fetches
+      setTimeout(() => cleanupJob(jobId), 30 * 60 * 1000);
+    } catch (err) {
+      console.error(`[download] job=${jobId} error:`, err.message);
+      job.status = 'error';
+      job.error = err.message;
+      try { fs.unlinkSync(tempPath); } catch {}
+      setTimeout(() => downloadJobs.delete(jobId), 5 * 60 * 1000);
     }
-  } catch (error) {
-    if (!controller.signal.aborted) {
-      console.error('[download] error:', error.message);
-      // CRITICAL FIX: Only send JSON if headers haven't been sent
-      if (!res.headersSent) {
-        res.status(502).json({ 
-          error: error.message,
-          videoId,
-          fallback: { type: 'youtube-embed', url: `https://www.youtube.com/embed/${videoId}` },
-        });
-      } else {
-        // Headers already sent, just end the response
-        res.end();
-      }
-    }
+  })();
+});
+
+// Phase 2 – poll status + size on disk for progress
+app.get('/api/download/status/:jobId', (req, res) => {
+  const job = downloadJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  let fileSizeOnDisk = 0;
+  if (job.status === 'muxing' || job.status === 'ready') {
+    try { fileSizeOnDisk = fs.statSync(job.tempPath).size; } catch {}
   }
+
+  res.json({
+    status: job.status,
+    fileSizeOnDisk,
+    estimatedSize: job.finalSize || job.estimatedSize || null,
+    title: job.title,
+    ext: job.ext,
+    error: job.error,
+  });
+});
+
+// Phase 3 – serve the completed file
+app.get('/api/download/file/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const job = downloadJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status !== 'ready') return res.status(409).json({ error: `Not ready: ${job.status}` });
+
+  const safeTitle = sanitizeFilenameForHeader(job.title);
+  res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.${job.ext}"`);
+  res.setHeader('Content-Type', job.mime);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache');
+
+  console.log(`[download] job=${jobId} sending ${(job.finalSize/1024/1024).toFixed(1)}MB to client`);
+
+  res.sendFile(job.tempPath, { dotfiles: 'allow' }, (err) => {
+    cleanupJob(jobId);
+    if (err && !res.headersSent) {
+      console.error('[download] sendFile error:', err.message);
+    }
+  });
 });
 
 // ─── Trending ────────────────────────────────────────────────────────────────

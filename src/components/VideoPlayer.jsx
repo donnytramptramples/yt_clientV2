@@ -5,6 +5,7 @@ import {
   Subtitles, ChevronDown, ChevronUp, MessageSquare, ThumbsUp, Bookmark, BookmarkCheck,
   Share2, Check
 } from 'lucide-react';
+import { useDownload } from '../DownloadContext';
 
 // sessionStorage cache — auto-cleared when the tab closes
 const SS_TTL = 30 * 60 * 1000; // 30 minutes
@@ -173,25 +174,20 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
   const [selQuality, setSelQuality] = useState(quality || '720');
   const [selBitrate, setSelBitrate] = useState('320k');
   const [selCompression, setSelCompression] = useState('5');
-  const [downloading, setDownloading] = useState(false);
+  const { startDownload } = useDownload();
 
   const fmt = FORMAT_OPTIONS.find(f => f.value === selFormat);
 
   const handleDownload = () => {
-    let url = `/api/download/${video.id}?format=${selFormat}&title=${encodeURIComponent(video.title || 'video')}`;
-    if (fmt?.hasQuality) url += `&quality=${selQuality}`;
-    if (fmt?.hasBitrate) url += `&bitrate=${selBitrate}`;
-    if (fmt?.hasCompression) url += `&compression=${selCompression}`;
-
-    const safeTitle = (video.title || 'video').replace(/[<>:"/\\|?*]/g, '');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${safeTitle}.${selFormat}`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setDownloading(true);
-    setTimeout(() => { setDownloading(false); onClose(); }, 3000);
+    startDownload({
+      videoId: video.id,
+      format: selFormat,
+      quality: fmt?.hasQuality ? selQuality : undefined,
+      title: video.title || 'video',
+      bitrate: fmt?.hasBitrate ? selBitrate : undefined,
+      compression: fmt?.hasCompression ? selCompression : undefined,
+    });
+    onClose();
   };
 
   return (
@@ -277,14 +273,9 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
       {/* Download button */}
       <button
         onClick={handleDownload}
-        disabled={downloading}
-        className="w-full flex items-center justify-center gap-2 py-2 rounded bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90 disabled:opacity-50 transition-all"
+        className="w-full flex items-center justify-center gap-2 py-2 rounded bg-[var(--accent)] text-white text-sm font-semibold hover:opacity-90 transition-all"
       >
-        {downloading ? (
-          <><Loader2 size={14} className="animate-spin" /> Starting…</>
-        ) : (
-          <><Download size={14} /> Download {selFormat.toUpperCase()}</>
-        )}
+        <Download size={14} /> Download {selFormat.toUpperCase()}
       </button>
     </div>
   );
