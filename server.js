@@ -447,6 +447,47 @@ function requireAdmin(req, res, next) {
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
+// ─── Security & anti-indexing headers ────────────────────────────────────────
+// These tell crawlers not to index, and tell Fortinet/corporate filters that
+// this is a legitimate, well-behaved site (not malware/phishing).
+app.use((req, res, next) => {
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet, noodp');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), camera=(), microphone=()');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// ─── Bot / crawler blocking ───────────────────────────────────────────────────
+const BOT_UA_PATTERNS = [
+  /googlebot/i, /bingbot/i, /slurp/i, /duckduckbot/i, /baiduspider/i,
+  /yandexbot/i, /yandex\.com\/bots/i, /sogou/i, /exabot/i, /facebot/i,
+  /facebookexternalhit/i, /facebookcatalog/i, /twitterbot/i, /applebot/i,
+  /rogerbot/i, /linkedinbot/i, /embedly/i, /quora link preview/i,
+  /showyoubot/i, /outbrain/i, /pinterest/i, /pinterestbot/i, /slackbot/i,
+  /vkshare/i, /w3c_validator/i, /whatsapp/i, /telegrambot/i, /discordbot/i,
+  /semrushbot/i, /ahrefsbot/i, /mj12bot/i, /dotbot/i, /seznambot/i,
+  /screaming frog/i, /seokicks/i, /sistrix/i, /seobilitybot/i, /majestic/i,
+  /blexbot/i, /petalbot/i, /bytespider/i, /gptbot/i, /chatgpt-user/i,
+  /claudebot/i, /anthropic-ai/i, /cohere-ai/i, /ccbot/i, /omgilibot/i,
+  /dataforseobot/i, /serpstatbot/i, /neevabot/i, /pricespider/i,
+  /archive\.org_bot/i, /ia_archiver/i, /wayback_machine/i, /httrack/i,
+  /wget/i, /curl\/[0-9]/i, /python-requests/i, /go-http-client/i,
+  /scrapy/i, /mechanize/i, /libwww-perl/i, /lwp-trivial/i,
+  /java\/[0-9]/i, /okhttp/i, /axios\/[0-9]/i, /node-fetch/i,
+  /headlesschrome/i, /phantomjs/i, /selenium/i,
+];
+
+app.use((req, res, next) => {
+  const ua = req.headers['user-agent'] || '';
+  if (!ua || BOT_UA_PATTERNS.some(re => re.test(ua))) {
+    return res.status(404).set('Content-Type', 'text/plain').end('Not Found');
+  }
+  next();
+});
+
 app.use((req, res, next) => {
   const cookieHeader = req.headers.cookie || '';
   req.cookies = {};
