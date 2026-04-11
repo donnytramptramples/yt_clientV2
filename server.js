@@ -87,6 +87,9 @@ const PORT = process.env.PORT || 5000;
 const MAX_CONCURRENT_STREAMS = 5;
 // Use a Set so cleanup is always idempotent — each stream gets a unique ID
 const activeStreamSet = new Set();
+// Maps userId (or "ip:<addr>" for anon) -> currently active streamId.
+// Lets a user seek (which opens a new proxy connection) without consuming an extra slot.
+const activeUserStreams = new Map();
 
 // ─── Currently-watching tracker ──────────────────────────────────────────────
 // userId → { videoId, title, thumbnail, position, updatedAt }
@@ -432,6 +435,10 @@ function requireAdmin(req, res, next) {
   const token = req.cookies?.admin_token;
   const session = getAdminSession(token);
   if (!session) return res.status(401).json({ error: 'Admin not authenticated' });
+  // Renew session on every authenticated request so active admins never get kicked
+  const renewed = Date.now() + 24 * 60 * 60 * 1000;
+  authDb.prepare('UPDATE admin_sessions SET expires_at = ? WHERE token = ?').run(renewed, token);
+  res.cookie('admin_token', token, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000, sameSite: 'lax', path: '/' });
   next();
 }
 
@@ -582,8 +589,8 @@ app.post('/api/admin/login', async (req, res) => {
     if (!ok) return res.status(401).json({ error: 'Invalid password' });
     const token = crypto.randomBytes(32).toString('hex');
     const now = Date.now();
-    authDb.prepare('INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?,?,?)').run(token, now, now + 4 * 60 * 60 * 1000);
-    res.cookie('admin_token', token, { httpOnly: true, maxAge: 4 * 60 * 60 * 1000, sameSite: 'lax', path: '/' });
+    authDb.prepare('INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?,?,?)').run(token, now, now + 24 * 60 * 60 * 1000);
+    res.cookie('admin_token', token, { httpOnly: true, maxAge: 24 * 60 * 60 * 1000, sameSite: 'lax', path: '/' });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1342,16 +1349,13 @@ async function fetchFormatStream(format, info, signal, rangeHeader = null) {
   return resp;
 }
 
-// CRITICAL FIX: Completely rewritten muxToResponse for reliability
 function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHeader = null, isDownload = false) {
   return new Promise((resolve, reject) => {
-    // Validate inputs
     if (!videoUrl || !audioUrl) {
       return reject(new Error(`Missing URL: video=${!!videoUrl}, audio=${!!audioUrl}`));
     }
 
     const ssArg = seekSeconds > 0 ? seekSeconds.toFixed(3) : null;
-    const useRange = !ssArg && rangeHeader;
 
     const ytHeaders = [
       `User-Agent: ${getRandomUA()}`,
@@ -1361,10 +1365,7 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHe
       'Referer: https://www.youtube.com/',
     ].join('\r\n') + '\r\n';
 
-    // CRITICAL FIX: Build args array carefully to avoid undefined elements
     const args = ['-loglevel', 'error'];
-
-    // Protocol whitelist
     args.push('-protocol_whitelist', 'file,http,https,tcp,tls,crypto');
 
     // Video input
@@ -1372,48 +1373,26 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHe
     args.push('-reconnect', '1');
     args.push('-reconnect_on_network_error', '1');
     args.push('-reconnect_delay_max', '5');
-
-    // Add seek before video input if needed
-    if (ssArg) {
-      args.push('-ss', ssArg);
-    }
-
+    if (ssArg) args.push('-ss', ssArg);
     args.push('-i', videoUrl);
 
-    // Audio input - CRITICAL: Must have the same headers and seek
+    // Audio input
     args.push('-headers', ytHeaders);
     args.push('-reconnect', '1');
     args.push('-reconnect_on_network_error', '1');
     args.push('-reconnect_delay_max', '5');
-
-    // Add seek before audio input if needed (CRITICAL for A/V sync)
-    if (ssArg) {
-      args.push('-ss', ssArg);
-    }
-
+    if (ssArg) args.push('-ss', ssArg);
     args.push('-i', audioUrl);
 
-    // Mappings
     args.push('-map', '0:v:0');
     args.push('-map', '1:a:0');
-
-    // Codecs
     args.push('-c:v', 'copy');
     args.push('-c:a', 'copy');
-
-    // A/V SYNC FIX: Normalize timestamps so both streams start at 0
-    // This compensates for video keyframe alignment offset vs audio seek precision
     args.push('-avoid_negative_ts', 'make_zero');
     args.push('-max_muxing_queue_size', '4096');
 
-    // CRITICAL FIX: Use fragmented MP4 for pipe output - works for both streaming AND downloads
-    // frag_keyframe = fragment at keyframes (required for streaming)
-    // empty_moov = empty moov atom at start (allows pipe output without seeking)
-    // default_base_moof = default base media offset (required for proper playback)
-    // faststart is NOT compatible with pipe output - removed!
     const movFlags = 'frag_keyframe+empty_moov+default_base_moof';
     args.push('-movflags', movFlags);
-
     args.push('-f', 'mp4');
     args.push('pipe:1');
 
@@ -1425,8 +1404,8 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHe
     const proc = spawn(FFMPEG, args);
 
     if (signal) {
-      signal.addEventListener('abort', () => { 
-        try { proc.kill('SIGTERM'); } catch {} 
+      signal.addEventListener('abort', () => {
+        try { proc.kill('SIGTERM'); } catch {}
       }, { once: true });
     }
 
@@ -1441,25 +1420,12 @@ function muxToResponse(videoUrl, audioUrl, res, signal, seekSeconds = 0, rangeHe
       }
     });
 
-    // Set headers
-    // CRITICAL FIX: Fragmented MP4 doesn't support byte ranges, so never advertise Accept-Ranges
     res.setHeader('Accept-Ranges', 'none');
-
-    // CRITICAL FIX: For downloads, we still set Content-Disposition but the format is fragmented MP4
-    // This is the only way to pipe MP4 - standard MP4 requires seekable output
-    if (isDownload) {
-      // Note: The file will be a valid fragmented MP4, playable in all modern players
-      // Some very old players might not support fragmented MP4, but this is unavoidable
-      // when piping. For maximum compatibility, users should use the direct proxy endpoint
-      // for streaming instead of download if they need standard MP4.
-      res.setHeader('Cache-Control', 'no-cache');
-    } else {
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-    }
+    res.setHeader('Cache-Control', isDownload ? 'no-cache' : 'public, max-age=3600');
 
     proc.stdout.pipe(res);
 
-    proc.stdout.on('error', (err) => {
+    proc.stdout.on('error', err => {
       console.error('[ffmpeg] stdout error:', err.message);
     });
 
@@ -1526,17 +1492,60 @@ app.get('/api/search/more', async (req, res) => {
   }
 });
 
+function splitCollabNames(name) {
+  // Split on " and " or " & " to detect collaboration channel names
+  const parts = name.split(/ and | & /i).map(p => p.trim()).filter(Boolean);
+  return parts.length > 1 ? parts : null;
+}
+
+function sanitizeChannelId(id) {
+  if (!id || id === 'N/A' || id === 'n/a' || id.trim().length < 2) return '';
+  return id;
+}
+
+function buildAuthors(v) {
+  const arr = [];
+  if (Array.isArray(v.authors) && v.authors.length > 0) {
+    for (const a of v.authors) {
+      if (a.name || a.id) {
+        arr.push({ name: a.name || '', id: sanitizeChannelId(a.id), avatar: a.thumbnails?.[0]?.url || a.best_thumbnail?.url || '' });
+      }
+    }
+  }
+  if (arr.length === 0 && v.author && (v.author.name || v.author.id)) {
+    const fullName = v.author.name || '';
+    const primaryId = sanitizeChannelId(v.author.id);
+    const primaryAvatar = v.author.best_thumbnail?.url || v.author.thumbnails?.[0]?.url || '';
+    const parts = splitCollabNames(fullName);
+    if (parts) {
+      parts.forEach((name, i) => {
+        arr.push({ name, id: i === 0 ? primaryId : '', avatar: i === 0 ? primaryAvatar : '' });
+      });
+    } else {
+      arr.push({ name: fullName, id: primaryId, avatar: primaryAvatar });
+    }
+  }
+  if (arr.length === 0 && v.channel && (v.channel.name || v.channel.id)) {
+    arr.push({ name: v.channel.name || '', id: sanitizeChannelId(v.channel.id), avatar: '' });
+  }
+  return arr;
+}
+
 function mapSearchResults(videos) {
-  return videos.map(v => ({
-    id: v.id,
-    title: v.title?.text || 'Video',
-    thumbnail: v.thumbnails?.[0]?.url || '',
-    duration: v.duration?.text || '0:00',
-    views: v.view_count?.text || '0',
-    channel: v.author?.name || 'Channel',
-    channelId: v.author?.id || '',
-    channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-  }));
+  return videos.map(v => {
+    const authors = buildAuthors(v);
+    return {
+      id: v.id,
+      title: v.title?.text || 'Video',
+      thumbnail: v.thumbnails?.[0]?.url || '',
+      duration: v.duration?.text || '0:00',
+      views: v.view_count?.text || '0',
+      channel: authors[0]?.name || 'Channel',
+      channelId: authors[0]?.id || '',
+      channelAvatar: authors[0]?.avatar || '',
+      authors,
+    };
+  });
 }
 
 // ─── Channel search ──────────────────────────────────────────────────────────
@@ -1570,6 +1579,52 @@ app.get('/api/channel/search', async (req, res) => {
   } catch (e) {
     console.error('[channel/search] error:', e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── Lightweight channel info (name → id + avatar) ───────────────────────────
+
+const channelInfoCache = new Map();
+
+app.get('/api/channel/info', async (req, res) => {
+  try {
+    if (!youtube) return res.status(503).json({ error: 'API initialising' });
+    const { name } = req.query;
+    if (!name) return res.status(400).json({ id: '', avatar: '' });
+
+    const cacheKey = name.toLowerCase().trim();
+    if (channelInfoCache.has(cacheKey)) return res.json(channelInfoCache.get(cacheKey));
+
+    const results = await youtube.search(name, { type: 'video' });
+    const sn = name.toLowerCase().trim();
+
+    let bestScore = 0;
+    let bestInfo = null;
+
+    for (const v of (results.videos || [])) {
+      const authorName = (v.author?.name || '').toLowerCase().trim();
+      if (!authorName) continue;
+      let score = 0;
+      if (authorName === sn) score = 4;
+      else if (authorName.startsWith(sn) || sn.startsWith(authorName)) score = 3;
+      else if (authorName.split(' ').some(w => w === sn) || sn.split(' ').some(w => w === authorName)) score = 2;
+      else if (authorName.includes(sn) && !authorName.includes(' and ') && !authorName.includes(' & ')) score = 1;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestInfo = {
+          id: sanitizeChannelId(v.author?.id),
+          avatar: v.author?.best_thumbnail?.url || v.author?.thumbnails?.[0]?.url || '',
+        };
+      }
+      if (bestScore === 4) break;
+    }
+
+    const result = bestInfo || { id: '', avatar: '' };
+    channelInfoCache.set(cacheKey, result);
+    res.json(result);
+  } catch (e) {
+    res.json({ id: '', avatar: '' });
   }
 });
 
@@ -2124,9 +2179,13 @@ app.get('/api/subtitles/:videoId/translate', async (req, res) => {
 app.get('/api/stream/available', requireAuth, (req, res) => {
   const streamSettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
   const maxStreams = streamSettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
-  // Use the live activeStreamSet count — accurate in real-time, no staleness issues
   const current = activeStreamSet.size;
-  const available = current < maxStreams;
+  // If this user already has a stream slot, seeking/reloading won't consume an extra slot
+  // (the proxy handler releases the old slot before checking capacity).
+  const userKey = `uid:${req.user.id}`;
+  const userHasSlot = activeUserStreams.has(userKey);
+  const effectiveCount = userHasSlot ? Math.max(0, current - 1) : current;
+  const available = effectiveCount < maxStreams;
   res.json({ available, current, max: maxStreams });
 });
 
@@ -2182,17 +2241,38 @@ app.get('/api/proxy/:videoId', async (req, res) => {
 
   // ── Concurrent stream limit (admins bypass) ────────────────────────────────
   const _proxyIsAdmin = !!getAdminSession(req.cookies?.admin_token);
+  const _proxyStreamId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  // Key for per-user deduplication: authenticated user ID or fallback to IP.
+  // This lets the same user seek (which opens a new connection) without burning an extra slot.
+  const _proxyUserKey = _bwUid != null ? `uid:${_bwUid}` : `ip:${req.ip}`;
+
   if (!_proxyIsAdmin) {
     const _proxySettings = authDb.prepare('SELECT max_connections FROM admin_settings WHERE id = 1').get();
     const _proxyMax = _proxySettings?.max_connections ?? MAX_CONCURRENT_STREAMS;
+
+    // If this user already has an active stream, release it first so seeking
+    // doesn't look like a brand-new concurrent connection to the limit check.
+    const _oldStreamId = activeUserStreams.get(_proxyUserKey);
+    if (_oldStreamId) {
+      activeStreamSet.delete(_oldStreamId);
+      activeUserStreams.delete(_proxyUserKey);
+    }
+
     if (activeStreamSet.size >= _proxyMax) {
       return res.status(503).json({ error: 'Server is busy, please try again later.', current: activeStreamSet.size, max: _proxyMax });
     }
   }
-  const _proxyStreamId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
   activeStreamSet.add(_proxyStreamId);
+  activeUserStreams.set(_proxyUserKey, _proxyStreamId);
   let _proxyCleaned = false;
-  const _proxyCleanup = () => { if (!_proxyCleaned) { _proxyCleaned = true; activeStreamSet.delete(_proxyStreamId); } };
+  const _proxyCleanup = () => {
+    if (!_proxyCleaned) {
+      _proxyCleaned = true;
+      activeStreamSet.delete(_proxyStreamId);
+      if (activeUserStreams.get(_proxyUserKey) === _proxyStreamId) activeUserStreams.delete(_proxyUserKey);
+    }
+  };
   req.on('close', _proxyCleanup);
 
   try {
@@ -2490,7 +2570,6 @@ function sanitizeFilenameForHeader(filename) {
   return sanitized;
 }
 
-// Temp-file mux: download video+audio to disk, then serve with known Content-Length
 function muxToTempFile(videoUrl, audioUrl, tempPath, signal, seekSeconds = 0) {
   return new Promise((resolve, reject) => {
     const ytHeaders = [
@@ -2530,8 +2609,6 @@ function muxToTempFile(videoUrl, audioUrl, tempPath, signal, seekSeconds = 0) {
     args.push('-c:a', 'copy');
     args.push('-avoid_negative_ts', 'make_zero');
     args.push('-max_muxing_queue_size', '4096');
-
-    // Write to file — faststart puts moov atom at front for instant seek
     args.push('-movflags', '+faststart');
     args.push('-f', 'mp4');
     args.push(tempPath);
@@ -2799,17 +2876,21 @@ async function fetchTrendingYtDlp() {
   if (youtube) {
     try {
       const results = await youtube.search('trending');
-      const vids = (results.videos || []).slice(0, 40).map(v => ({
-        id: v.id,
-        title: v.title?.text || v.title || 'Video',
-        thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-        duration: v.duration?.text || v.duration || '',
-        views: v.view_count?.text || v.short_view_count?.text || '',
-        channel: v.author?.name || v.channel?.name || '',
-        channelId: v.author?.id || v.channel?.id || '',
-        channelAvatar: v.author?.best_thumbnail?.url || v.author?.thumbnails?.[0]?.url || '',
-        published: v.published?.text || '',
-      })).filter(v => v.id);
+      const vids = (results.videos || []).slice(0, 40).map(v => {
+        const authors = buildAuthors(v);
+        return {
+          id: v.id,
+          title: v.title?.text || v.title || 'Video',
+          thumbnail: v.best_thumbnail?.url || v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+          duration: v.duration?.text || v.duration || '',
+          views: v.view_count?.text || v.short_view_count?.text || '',
+          channel: authors[0]?.name || '',
+          channelId: authors[0]?.id || '',
+          channelAvatar: authors[0]?.avatar || '',
+          published: v.published?.text || '',
+          authors,
+        };
+      }).filter(v => v.id);
       if (vids.length > 0) {
         console.log(`[trending] got ${vids.length} videos via search`);
         return vids;
@@ -2879,17 +2960,21 @@ app.get('/api/trending', async (req, res) => {
         videos = section
           .filter(v => v.id && (v.title?.text || v.title))
           .slice(0, 40)
-          .map(v => ({
-            id: v.id,
-            title: v.title?.text || v.title || 'Video',
-            thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
-            duration: v.duration?.text || '',
-            views: v.view_count?.text || v.short_view_count?.text || '',
-            channel: v.author?.name || v.channel?.name || '',
-            channelId: v.author?.id || v.channel?.id || '',
-            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
-            published: v.published?.text || '',
-          }));
+          .map(v => {
+            const authors = buildAuthors(v);
+            return {
+              id: v.id,
+              title: v.title?.text || v.title || 'Video',
+              thumbnail: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+              duration: v.duration?.text || '',
+              views: v.view_count?.text || v.short_view_count?.text || '',
+              channel: authors[0]?.name || '',
+              channelId: authors[0]?.id || '',
+              channelAvatar: authors[0]?.avatar || '',
+              published: v.published?.text || '',
+              authors,
+            };
+          });
       }
     } catch (apiErr) {
       console.warn('[trending] API failed:', apiErr.message);
@@ -2939,6 +3024,7 @@ async function fetchActualShorts(offset = 0) {
         .map(v => {
           const id = v.id || v.video_id || v.videoId;
           const durSecs = v.duration?.seconds ?? v.duration ?? 0;
+          const authors = buildAuthors(v);
           return {
             id,
             title: v.title?.text || v.title || 'Short',
@@ -2946,10 +3032,11 @@ async function fetchActualShorts(offset = 0) {
             duration: durSecs ? formatSecondsToTime(durSecs) : '',
             durationSecs: durSecs,
             views: v.view_count?.text || v.views?.text || '',
-            channel: v.author?.name || v.channel?.name || '',
-            channelId: v.author?.id || v.channel?.id || '',
-            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            channel: authors[0]?.name || '',
+            channelId: authors[0]?.id || '',
+            channelAvatar: authors[0]?.avatar || '',
             isShort: true,
+            authors,
           };
         })
         .filter(v => v.id && (!v.durationSecs || v.durationSecs <= 62))
@@ -3031,6 +3118,7 @@ async function fetchActualShorts(offset = 0) {
         .filter(v => v.id)
         .map(v => {
           const durSecs = v.duration?.seconds ?? 0;
+          const authors = buildAuthors(v);
           return {
             id: v.id,
             title: v.title?.text || 'Short',
@@ -3038,10 +3126,11 @@ async function fetchActualShorts(offset = 0) {
             duration: v.duration?.text || '',
             durationSecs: durSecs,
             views: v.view_count?.text || '',
-            channel: v.author?.name || '',
-            channelId: v.author?.id || '',
-            channelAvatar: v.author?.thumbnails?.[0]?.url || '',
+            channel: authors[0]?.name || '',
+            channelId: authors[0]?.id || '',
+            channelAvatar: authors[0]?.avatar || '',
             isShort: true,
+            authors,
           };
         })
         .filter(v => !v.durationSecs || v.durationSecs <= 62)

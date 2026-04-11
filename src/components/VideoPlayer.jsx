@@ -346,6 +346,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
   // Server busy state
   const [serverBusy, setServerBusy] = useState(false);
+  const serverBusyRef = useRef(false);
+  useEffect(() => { serverBusyRef.current = serverBusy; }, [serverBusy]);
   const [retryKey, setRetryKey] = useState(0);
 
   // CSS-based fullscreen fallback (when native fullscreen is unavailable, e.g. in iframes)
@@ -362,9 +364,6 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
 
   // Double-tap tracking for touch seek
   const lastTapRef = useRef({ time: 0, side: null });
-  // Prevents onClick from firing after a touch event
-  const touchJustHappenedRef = useRef(false);
-  const touchJustHappenedTimer = useRef(null);
   // Ref mirror of currentTime to avoid stale closures in non-reactive event handlers
   const currentTimeRef = useRef(0);
   // Stable ref for position reporting (avoids stale closures in seekTo)
@@ -552,22 +551,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     setHoverInfo(null);
     setShowChapters(false);
 
-    // Pre-check: ask server if it can handle another stream before loading.
-    // credentials: 'include' sends the session cookie. If unauthenticated (e.g. co-watch
-    // admin view), the server returns 401 — we skip the check and let the video load.
-    fetch('/api/stream/available', { credentials: 'include' })
-      .then(r => {
-        if (!r.ok) return null; // 401 or other error — skip the block
-        return r.json();
-      })
-      .then(data => {
-        if (!data) return;
-        if (!data.available) {
-          setServerBusy(true);
-          setServerBusyInfo({ current: data.current, max: data.max });
-        }
-      })
-      .catch(() => {});
+    // No pre-check here — the proxy handler now does per-user slot management,
+    // so seeking never falsely consumes an extra slot. Stream-full errors are
+    // caught by the video element's onError handler below.
 
     // Formats — check sessionStorage first
     const cachedFormats = ssGet(`formats:${video.id}`);
@@ -726,6 +712,8 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   useEffect(() => {
     if (!video?.id || !user) return;
     const report = () => {
+      // Don't report while stream-blocked — the user isn't actually playing anything
+      if (serverBusyRef.current) return;
       fetch('/api/watching', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -749,7 +737,6 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     return () => {
       clearInterval(id);
       reportWatchingRef.current = null;
-      // Immediately free the stream slot when the user leaves this video
       fetch('/api/watching/stop', { method: 'POST', credentials: 'include' }).catch(() => {});
     };
   }, [video.id, user]);
@@ -1135,10 +1122,12 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const onEnded = () => setPlaying(false);
     const onError = async () => {
       setIsLoading(false);
-      // Always clear the reload flag so co-watch sync isn't permanently blocked
       seekReloadRef.current = false;
-      // Check if the server is at stream capacity
       if (proxyUrl) {
+        // Brief wait so any old stream slot (e.g. from a previous seek) has time to
+        // close on the server before we check capacity. Without this delay a seek
+        // could briefly look like a new concurrent connection and show a false block.
+        await new Promise(r => setTimeout(r, 600));
         try {
           const r = await fetch('/api/stream/available', { credentials: 'include' });
           if (r.ok) {
@@ -1146,7 +1135,6 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
             if (!data.available) {
               setServerBusyInfo({ current: data.current, max: data.max });
               setServerBusy(true);
-              return;
             }
           }
         } catch {}
@@ -1254,9 +1242,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         setFullscreen(false);
       }
     } else {
-      // Try native fullscreen first, fall back to CSS
+      // Try native fullscreen first (with navigationUI: 'hide' for truly full screen),
+      // fall back to CSS full screen
       if (containerRef.current?.requestFullscreen) {
-        containerRef.current.requestFullscreen().catch(() => {
+        containerRef.current.requestFullscreen({ navigationUI: 'hide' }).catch(() => {
           setCssFull(true);
           setFullscreen(true);
         });
@@ -1267,58 +1256,45 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     }
   };
 
-  // Touch controls: tap left third = skip -10s, tap right third = skip +10s, tap center = play/pause.
-  // Uses non-passive listeners to call preventDefault() and block page scroll / synthetic clicks.
-  const touchStartXRef = useRef(null);
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+  // Blocks the synthetic onClick that fires ~300ms after a touch so it doesn't
+  // double-trigger play/pause when the touch handler already handled the tap.
+  const touchBlockRef = useRef(false);
+  const touchBlockTimer = useRef(null);
 
-    const handleTouchStart = (e) => {
-      if (e.target.closest('.video-controls-layer')) return;
-      e.preventDefault();
-      touchStartXRef.current = e.touches[0].clientX;
-    };
+  // Touch double-tap handler — wired via onPointerDown prop so React always keeps
+  // it current without any addEventListener/removeEventListener calls.
+  //   Single tap anywhere  → show controls; center also toggles play/pause
+  //   Double tap left      → seek −10 s
+  //   Double tap right     → seek +10 s
+  //   Double tap center    → toggle play/pause
+  const handleContainerPointerDown = useCallback((e) => {
+    if (e.pointerType !== 'touch') return; // mouse clicks go through onClick
+    if (e.target.closest('.video-controls-layer')) return;
 
-    const handleTouchEnd = (e) => {
-      if (e.target.closest('.video-controls-layer')) return;
-      e.preventDefault();
+    // Suppress the upcoming synthetic click for this touch sequence
+    touchBlockRef.current = true;
+    clearTimeout(touchBlockTimer.current);
+    touchBlockTimer.current = setTimeout(() => { touchBlockRef.current = false; }, 600);
 
-      const touch = e.changedTouches[0];
-      if (!touch) return;
+    const now = Date.now();
+    const last = lastTapRef.current;
+    const DOUBLE_TAP_DELAY = 300;
 
-      // Ignore if finger moved significantly (scroll attempt)
-      const deltaX = Math.abs(touch.clientX - (touchStartXRef.current ?? touch.clientX));
-      const deltaY = Math.abs(touch.clientY - (touchStartXRef.current ?? touch.clientY));
-      if (deltaX > 20) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const relX = e.clientX - rect.left;
+    const half = rect.width / 2;
+    const side = relX < half ? 'left' : 'right';
 
-      const rect = container.getBoundingClientRect();
-      const relX = touch.clientX - rect.left;
-      const third = rect.width / 3;
-
-      if (relX < third) {
-        // Left third: skip back
-        seekTo(currentTimeRef.current - 10);
-        showSkip('left');
-        showControls();
-      } else if (relX > third * 2) {
-        // Right third: skip forward
-        seekTo(currentTimeRef.current + 10);
-        showSkip('right');
-        showControls();
-      } else {
-        // Center: toggle play/pause
-        togglePlay();
-        showControls();
-      }
-    };
-
-    container.addEventListener('touchstart', handleTouchStart, { passive: false });
-    container.addEventListener('touchend', handleTouchEnd, { passive: false });
-    return () => {
-      container.removeEventListener('touchstart', handleTouchStart);
-      container.removeEventListener('touchend', handleTouchEnd);
-    };
+    if (now - last.time < DOUBLE_TAP_DELAY) {
+      lastTapRef.current = { time: 0, side: null };
+      if (side === 'left') { seekTo(currentTimeRef.current - 10); showSkip('left'); }
+      else { seekTo(currentTimeRef.current + 10); showSkip('right'); }
+      showControls();
+    } else {
+      lastTapRef.current = { time: now, side };
+      togglePlay();
+      showControls();
+    }
   }, [seekTo, showSkip, showControls, togglePlay]);
 
   const progressPct = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -1355,9 +1331,15 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       <div
         ref={containerRef}
         className={`video-player-container${cssFull ? ' css-fullscreen' : ''}`}
+        style={{ touchAction: 'none' }}
+        onPointerDown={handleContainerPointerDown}
         onMouseMove={showControls}
-        onClick={() => { togglePlay(); showControls(); }}
-        onDoubleClick={toggleFullscreen}
+        onClick={() => {
+          // Skip if this click was synthesised from a touch (already handled above)
+          if (touchBlockRef.current) return;
+          togglePlay();
+          showControls();
+        }}
         onKeyDown={(e) => { if (e.key === 'Escape' && cssFull) { setCssFull(false); setFullscreen(false); } }}
         tabIndex={-1}
       >
@@ -1470,6 +1452,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           className={`video-controls-layer absolute inset-0 flex flex-col justify-end transition-opacity duration-200 ${controlsVisible || !playing ? 'opacity-100' : 'opacity-0'}`}
           style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85) 0%, transparent 40%)' }}
           onClick={e => e.stopPropagation()}
+          onDoubleClick={e => e.stopPropagation()}
         >
           <div className="px-4 pb-1 pt-4">
             {/* Chapter markers + progress bar */}
