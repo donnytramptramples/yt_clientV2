@@ -2010,6 +2010,35 @@ app.get('/api/formats/:videoId', async (req, res) => {
   }
 });
 
+// ─── Codec info for MSE (MediaSource Extensions) ─────────────────────────────
+// Returns the MIME type string for a given video+quality so the client can
+// initialize a SourceBuffer with the correct codec. Lightweight — no stream.
+app.get('/api/codec/:videoId', requireAuth, async (req, res) => {
+  const { videoId } = req.params;
+  const { quality = '720' } = req.query;
+  try {
+    const data = await getYtDlpFormatsWithRetry(videoId);
+    const qualityNum = parseInt(quality, 10);
+    const videoFmt  = pickYtDlpVideo(data.formats, qualityNum);
+
+    let vcodec = (videoFmt.vcodec || 'avc1.42E01E').replace(/^avc1$/, 'avc1.42E01E');
+    let acodec;
+
+    if (videoFmt.acodec !== 'none') {
+      acodec = (videoFmt.acodec || 'mp4a.40.2').replace(/^mp4a$/, 'mp4a.40.2');
+    } else {
+      const audioFmt = pickYtDlpAudio(data.formats);
+      acodec = (audioFmt.acodec || 'mp4a.40.2').replace(/^mp4a$/, 'mp4a.40.2');
+    }
+
+    // VP9/AV1 in mp4 container is uncommon but handle it anyway
+    const mimeType = `video/mp4; codecs="${vcodec},${acodec}"`;
+    res.json({ mimeType, videoCodec: vcodec, audioCodec: acodec });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Video details (description + comments) ──────────────────────────────────
 
 app.get('/api/video/:videoId/details', async (req, res) => {
