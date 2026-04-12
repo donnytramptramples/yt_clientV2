@@ -1,0 +1,11 @@
+﻿{
+  "agentId": 2,
+  "agentName": "OWENEDWARD",
+  "poolId": 1,
+  "poolName": "Default",
+  "serverUrl": "https://pipelinesghubeus21.actions.githubusercontent.com/2qPgtTaD5rUZ05RMYMOVHwupyBcj7pfB0x4p6jYQRICYoPsk3k/",
+  "gitHubUrl": "https://github.com/donnytramptramples/yt_clientV2",
+  "workFolder": "_work",
+  "useV2Flow": true,
+  "serverUrlV2": "https://broker.actions.githubusercontent.com/"
+}

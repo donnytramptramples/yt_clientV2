@@ -1,0 +1,14 @@
+name: Remote Auto-Deploy
+on:
+  push:
+    branches: [ main ] # Change this to 'master' if that is your branch name
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Trigger Updater
+        shell: cmd
+        run: |
+          cd /d "C:\Users\eleeh\Downloads\ytclientV2-2\ytclientV2"
+          updater.bat
