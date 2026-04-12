@@ -1,7 +1,7 @@
 name: Remote Auto-Deploy
 on:
   push:
-    branches: [ main ] # Change this to 'master' if that is your branch name
+    branches: [ master ] # Changed from main to master
 
 jobs:
   deploy:
