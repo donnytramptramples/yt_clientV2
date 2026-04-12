@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { useDownload } from '../DownloadContext';
 import CollaboratorPicker from './CollaboratorPicker';
+import { useVideoBuffer } from '../hooks/useVideoBuffer';
 
 // sessionStorage cache — auto-cleared when the tab closes
 const SS_TTL = 30 * 60 * 1000; // 30 minutes
@@ -285,11 +286,21 @@ function DownloadPanel({ video, quality, availableHeights, onClose }) {
 export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWatchUserId = null, onCoWatchVideoChange = null, initialPosition = null }) {
   const videoRef = useRef(null);
   const containerRef = useRef(null);
-  const progressRef = useRef(null);
-  const hideControlsTimer = useRef(null);
 
+  // Declare state BEFORE hooks that depend on them to avoid TDZ errors
   const [availableHeights, setAvailableHeights] = useState([]);
   const [quality, setQuality] = useState(null);
+
+  // MSE (MediaSource) buffer — lets seeks within already-buffered content be instant
+  // and prevents the reset-to-00:00 bug caused by changing the video src on every seek.
+  const { objectUrl: mseUrl, isReady: mseReady, seekInBuffer, restartFrom, evict } =
+    useVideoBuffer({ videoId: video.id, quality, videoRef });
+  // Position to restore after MSE reinit (quality change or initial co-watch offset)
+  const mseResumeRef  = useRef(0);
+  // Throttle eviction calls (every ~10 s at 4fps timeUpdate)
+  const evictFrameRef = useRef(0);
+  const progressRef = useRef(null);
+  const hideControlsTimer = useRef(null);
   const [speed, setSpeed] = useState(1);
 
   const [playing, setPlaying] = useState(false);
@@ -424,7 +435,40 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const clamped = Math.max(0, Math.min(duration > 0 ? duration - 1 : 1e9, targetTime));
     wasPlayingRef.current = !v.paused;
     const targetFloor = Math.floor(clamped);
+    currentTimeRef.current = clamped;
+    setCurrentTime(clamped);
 
+    // ── MSE path (MediaSource active) ────────────────────────────────────────
+    if (mseReady) {
+      if (seekInBuffer(clamped)) {
+        // In-buffer: instant native seek — no server round-trip, no reload.
+        seekPendingRef.current = false;
+        v.currentTime = clamped;
+        reportWatchingRef.current?.();
+        wsSendRef.current?.();
+      } else {
+        // Out-of-buffer: clear the SourceBuffer and restart the fetch from here.
+        seekPendingRef.current = true;
+        seekReloadRef.current = true;
+        setIsLoading(true);
+        if (proxySeekDebounceRef.current) clearTimeout(proxySeekDebounceRef.current);
+        const seekId = ++seekIdRef.current;
+        proxySeekDebounceRef.current = setTimeout(() => {
+          proxySeekDebounceRef.current = null;
+          if (seekIdRef.current !== seekId) return;
+          proxySeekRef.current = targetFloor;
+          restartFrom(targetFloor).then(() => {
+            const v2 = videoRef.current;
+            if (v2) v2.currentTime = clamped;
+          });
+          reportWatchingRef.current?.();
+          wsSendRef.current?.();
+        }, 150);
+      }
+      return;
+    }
+
+    // ── Fallback path: proxy URL seek (no MSE) ────────────────────────────────
     // For this proxy fMP4 format (frag_keyframe+empty_moov), native v.currentTime seeks
     // fail: the browser's seekable range is only the tiny amount buffered from the stream
     // start, so seeks beyond it are silently rejected and currentTime resets to 0.
@@ -433,8 +477,6 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     proxySeekRef.current = targetFloor;
     seekTargetRelRef.current = 0;
     seekPendingRef.current = true;
-    currentTimeRef.current = clamped;
-    setCurrentTime(clamped);
 
     // Tag this seek so stale debounce callbacks can self-cancel
     const seekId = ++seekIdRef.current;
@@ -473,7 +515,7 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       reportWatchingRef.current?.();
       wsSendRef.current?.();
     }, 150);
-  }, [duration]);
+  }, [duration, mseReady, seekInBuffer, restartFrom]);
 
   const changeQuality = useCallback((q) => {
     const v = videoRef.current;
@@ -484,17 +526,24 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       proxySeekDebounceRef.current = null;
     }
     seekPendingRef.current = false;
-    seekTargetRelRef.current = 0; // no post-load native seek for quality changes
-    const absoluteTime = Math.floor(proxySeekRef.current + (v.currentTime || 0));
+    seekTargetRelRef.current = 0;
     wasPlayingRef.current = !v.paused;
-    // Set proxy to current position so new stream starts from here
-    proxySeekRef.current = absoluteTime;
-    setProxySeek(absoluteTime);
     seekReloadRef.current = true;
     setIsLoading(true);
-    setQuality(q);
     setShowSettings(false);
-  }, [quality]);
+
+    if (mseReady) {
+      // MSE active: save current position so the new MSE instance resumes from here.
+      // The hook's useEffect([videoId, quality]) will reinitialize MSE for the new quality.
+      mseResumeRef.current = Math.floor(currentTimeRef.current || 0);
+    } else {
+      // Fallback: trigger proxy URL seek (changes src)
+      const absoluteTime = Math.floor(proxySeekRef.current + (v.currentTime || 0));
+      proxySeekRef.current = absoluteTime;
+      setProxySeek(absoluteTime);
+    }
+    setQuality(q);
+  }, [quality, mseReady]);
 
   const getProgressRatio = useCallback((e) => {
     const rect = progressRef.current.getBoundingClientRect();
@@ -514,6 +563,26 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
   useEffect(() => { qualityRef.current = quality; }, [quality]);
   useEffect(() => { subtitlesEnabledRef.current = subtitlesEnabled; }, [subtitlesEnabled]);
   useEffect(() => { selectedSubtitleRef.current = currentSubtitleLang; }, [currentSubtitleLang]);
+  // Mirror mseReady into a ref so event handler closures (onTimeUpdate etc.) can read it
+  const mseReadyRef = useRef(false);
+  useEffect(() => { mseReadyRef.current = mseReady; }, [mseReady]);
+
+  // When MSE becomes ready (new video, quality change, or initial co-watch offset),
+  // seek to the saved position. If no explicit position is saved (normal load), use
+  // currentTimeRef so we don't lose the user's place during the MSE init window.
+  useEffect(() => {
+    if (!mseReady) return;
+    const explicit = mseResumeRef.current;
+    const pos = explicit > 0 ? explicit : Math.floor(currentTimeRef.current || 0);
+    mseResumeRef.current = 0;
+    if (pos > 0) {
+      seekReloadRef.current = true;
+      restartFrom(pos).then(() => {
+        const v = videoRef.current;
+        if (v) v.currentTime = pos;
+      });
+    }
+  }, [mseReady, restartFrom]);
 
   // Now define effects that use the callbacks above
 
@@ -541,6 +610,9 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     }
     seekPendingRef.current = false;
     seekTargetRelRef.current = 0;
+    // MSE: store the initial offset — the hook will apply it when it becomes ready
+    mseResumeRef.current = startAt;
+    // Fallback proxy: still set proxySeek so the non-MSE path starts at the right time
     setProxySeek(startAt);
     proxySeekRef.current = startAt;
     seekReloadRef.current = false;
@@ -856,6 +928,19 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     let lastSeekAt    = 0;
     let lastVideoId   = null; // track video changes
 
+    // Load-ahead: persisted in localStorage so each session improves on the last.
+    // We only ever seek ONCE on join — all catch-up after that is via playback rate.
+    // Seeking again restarts the ffmpeg mux on the server, which costs the same load
+    // time every time and causes an infinite spiral.
+    const LOAD_AHEAD_KEY = 'cowatchLoadAhead';
+    let loadAhead = 5;
+    try {
+      const stored = parseFloat(localStorage.getItem(LOAD_AHEAD_KEY));
+      if (!isNaN(stored) && stored >= 1 && stored <= 60) loadAhead = stored;
+    } catch {}
+    let initSeekTime     = 0;   // timestamp of initial seek — cleared once measured
+    let loadTimeMeasured = false;
+
     // ── Core sync ─────────────────────────────────────────────────────────────
     const applyData = (data) => {
       lastData.current = data;
@@ -886,18 +971,20 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       if (data.videoId && !lastVideoId) lastVideoId = data.videoId;
 
       // ── Initial join: seek ahead of the user to compensate for stream load time.
-      // The stream takes ~3-5s to start. By the time it's playing, the user has
-      // advanced. Seeking 5s ahead means the rate-correction pulls us back gently
-      // instead of playing catch-up from behind. Retried every 500ms until quality resolves.
+      // Starts 5s ahead; if the admin still can't catch up after buffering settles,
+      // the measured load time is logged and the offset is increased until sync is achieved.
+      // Retried every 500ms until quality resolves.
       if (!initialized.current) {
         if (v && qualityRef.current) {
           initialized.current = true;
           clearInterval(initRetryId);
           initRetryId = null;
           lastSeekAt = now;
+          initSeekTime = now;
+          adjustCount = 0;
           coWatchSeekLockUntilRef.current = now + 3000;
-          const LOAD_AHEAD = 3; // seconds to seek ahead of current user position
-          seekToRef.current(userPos + LOAD_AHEAD);
+          console.log(`[cowatch] Initial seek: +${loadAhead}s ahead of user at ${userPos.toFixed(1)}s`);
+          seekToRef.current(userPos + loadAhead);
           wasPlayingRef.current = !userPaused;
         }
         return;
@@ -929,6 +1016,38 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         const adminPos = currentTimeRef.current;
         const diff     = userPos - adminPos; // positive = admin is behind
 
+        // ── One-time load measurement (no re-seek — re-seeking restarts ffmpeg) ─
+        // After the seek lock clears we take a single snapshot of the actual drift.
+        // That tells us the true stream load time. We save it to localStorage so
+        // the next co-watch join can start with a better initial offset.
+        // All catch-up from here on is done by playback rate — zero server cost.
+        if (initSeekTime > 0 && !loadTimeMeasured) {
+          const timeSinceSeek = (now - initSeekTime) / 1000;
+          if (timeSinceSeek > 3.2) {
+            loadTimeMeasured = true;
+            initSeekTime = 0;
+            const effectiveLoadTime = loadAhead + diff; // what we should have started with
+            const clamped = Math.max(2, Math.min(60, effectiveLoadTime));
+            console.log(
+              `[cowatch] Stream settled after ${timeSinceSeek.toFixed(1)}s. ` +
+              `Drift: ${diff > 0 ? '+' : ''}${diff.toFixed(2)}s. ` +
+              `Effective load time: ${effectiveLoadTime.toFixed(1)}s. ` +
+              `Saving load-ahead ${loadAhead.toFixed(1)}s → ${clamped.toFixed(1)}s for next session.`
+            );
+            try { localStorage.setItem(LOAD_AHEAD_KEY, clamped.toFixed(1)); } catch {}
+            // Rate correction will close whatever gap remains — no re-seek.
+          } else {
+            // Still within lock window — only nudge, never hard-seek yet
+            if (Math.abs(diff) > SYNC_THRESHOLD) {
+              v.playbackRate = userSpeed * (diff > 0 ? 1.04 : 0.97);
+            } else {
+              v.playbackRate = userSpeed;
+            }
+            if (v.paused) v.play().catch(() => {});
+            return;
+          }
+        }
+
         if (Math.abs(diff) > JUMP_THRESHOLD && now - lastSeekAt > 800) {
           // Hard seek — gap too large for rate correction to be practical
           lastSeekAt = now;
@@ -937,8 +1056,11 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
           wasPlayingRef.current = true;
           v.playbackRate = userSpeed;
           return;
+        } else if (Math.abs(diff) > 10) {
+          // Very large gap — close it at 2× (still sounds normal-ish)
+          v.playbackRate = userSpeed * (diff > 0 ? 2.0 : 0.5);
         } else if (Math.abs(diff) > 5) {
-          // Large gap — close it fast (scaled relative to user's speed)
+          // Large gap — close it fast
           v.playbackRate = userSpeed * (diff > 0 ? 1.5 : 0.7);
         } else if (Math.abs(diff) > 2) {
           // Moderate gap — close it in a few seconds without sounding choppy
@@ -1059,20 +1181,30 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     if (!v) return;
 
     const onTimeUpdate = () => {
+      // With MSE, v.currentTime is already absolute (due to SourceBuffer.timestampOffset).
+      // Without MSE, add proxySeekRef to get absolute time.
+      const isMSE = mseReadyRef.current;
       // Don't override the scrub display while a proxy reload is debouncing
       if (!seekPendingRef.current) {
-        const t = proxySeekRef.current + v.currentTime;
+        const t = isMSE ? v.currentTime : proxySeekRef.current + v.currentTime;
         currentTimeRef.current = t;
         setCurrentTime(t);
       }
       if (v.buffered.length > 0) {
-        setBufferedEnd(proxySeekRef.current + v.buffered.end(v.buffered.length - 1));
+        const bufEnd = v.buffered.end(v.buffered.length - 1);
+        setBufferedEnd(isMSE ? bufEnd : proxySeekRef.current + bufEnd);
+      }
+      // Periodically evict old buffer to keep memory bounded (~every 10 s at 4fps)
+      evictFrameRef.current++;
+      if (evictFrameRef.current % 40 === 0) {
+        evict(v.currentTime);
       }
     };
 
     const onDurationChange = () => {
       if (v.duration && isFinite(v.duration)) {
-        const elementDuration = proxySeekRef.current + v.duration;
+        const isMSE = mseReadyRef.current;
+        const elementDuration = isMSE ? v.duration : proxySeekRef.current + v.duration;
         const best = apiDuration.current > 0
           ? Math.max(apiDuration.current, elementDuration)
           : elementDuration;
@@ -1085,6 +1217,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     const onWaiting = () => setIsLoading(true);
     const onCanPlay = () => {
       setIsLoading(false);
+      // Always unblock onTimeUpdate here if no native seek is still pending.
+      // onLoadStart fires before listeners are attached on video remount, so this
+      // is the reliable fallback that un-freezes the progress bar after every load.
+      if (!seekTargetRelRef.current) seekPendingRef.current = false;
       // Enter this branch when: a proxy reload just finished (seekReloadRef), OR there's a
       // pending native-seek offset to apply (seekTargetRelRef > 0), OR the video was playing
       // before the reload and needs to resume.
@@ -1152,6 +1288,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
     v.addEventListener('ended', onEnded);
     v.addEventListener('error', onError);
 
+    // Sync play/pause state immediately in case the play/pause event fired before
+    // this effect had a chance to attach the listeners (common on first load with autoPlay).
+    setPlaying(!v.paused);
+
     return () => {
       v.removeEventListener('timeupdate', onTimeUpdate);
       v.removeEventListener('durationchange', onDurationChange);
@@ -1164,7 +1304,10 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('error', onError);
     };
-  }, [quality, proxySeek]);
+  // mseUrl is included so the effect re-runs when the MSE video element first mounts.
+  // Without it, the effect exits early (videoRef is null during async codec fetch),
+  // and listeners are never attached when the element eventually appears.
+  }, [quality, proxySeek, mseUrl]);
 
   useEffect(() => {
     // In co-watch mode the drift-correction loop controls playbackRate directly;
@@ -1343,11 +1486,13 @@ export default function VideoPlayer({ video, user, onBack, onChannelSelect, coWa
         onKeyDown={(e) => { if (e.key === 'Escape' && cssFull) { setCssFull(false); setFullscreen(false); } }}
         tabIndex={-1}
       >
-        {proxyUrl && (
+        {(mseUrl || proxyUrl) && (
           <video
-            key={`${video.id}-${quality}-${proxySeek}-${retryKey}`}
+            key={mseUrl
+              ? `${video.id}-${quality}-mse`
+              : `${video.id}-${quality}-${proxySeek}-${retryKey}`}
             ref={videoRef}
-            src={proxyUrl}
+            src={mseUrl || proxyUrl}
             className="video-element"
             autoPlay
             playsInline
