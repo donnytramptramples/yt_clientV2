@@ -83,7 +83,7 @@ export default function AuthPage({ onAuth }) {
               <input
                 type="password"
                 className="breeze-input w-full"
-                placeholder="Password1"
+                placeholder="Password"
                 value={form.password}
                 onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
                 required
