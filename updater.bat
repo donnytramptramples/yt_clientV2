@@ -1,22 +1,20 @@
 @echo off
 cd /d "%~dp0"
-echo [UPDATER] Checking GitHub...
+echo [UPDATER] Syncing with GitHub...
 
-:: Download latest info from GitHub
-git fetch origin main
+:: 1. Actually pull the code (this moves the files into your folder)
+git pull origin main
 
-:: Compare your local version to the remote version
-for /f %%i in ('git rev-parse HEAD') do set LOCAL=%%i
-for /f %%j in ('git rev-parse @{u}') do set REMOTE=%%j
+:: 2. Check if the pull actually did anything 
+:: (It looks for the 'up to date' message in the last command)
+git pull origin main | findstr /C:"Already up to date" > nul
 
-if "%LOCAL%" == "%REMOTE%" (
-    echo [UPDATER] Already up to date.
+if %errorlevel% == 0 (
+    echo [UPDATER] No changes on GitHub.
 ) else (
-    echo [UPDATER] New code found! Pulling now...
-    git pull origin main
-    echo [UPDATER] Installing packages...
+    echo [UPDATER] UPDATING DETECTED!
     call npm install
-    echo [UPDATER] Restarting server...
+    echo [UPDATER] Restarting node server...
     taskkill /F /IM node.exe /T
 )
 pause
