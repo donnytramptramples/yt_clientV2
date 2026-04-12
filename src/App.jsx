@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Sun, Moon, Rss, Search, LogOut, User, Zap, Bookmark, Sliders } from 'lucide-react';
+import { Sun, Moon, Rss, Search, LogOut, User, Zap, Bookmark, Sliders, Clock } from 'lucide-react';
 import { DownloadProvider } from './DownloadContext';
 import KaliLoader from './components/KaliLoader';
 import SearchBar from './components/SearchBar';
@@ -12,6 +12,7 @@ import ShortsPage from './components/ShortsPage';
 import SavedPage from './components/SavedPage';
 import AdminPage from './components/AdminPage';
 import FeedSettingsModal from './components/FeedSettingsModal';
+import WatchHistoryPage from './components/WatchHistoryPage';
 
 const isAdminPath = window.location.pathname === '/admin';
 const sharedVideoId = new URLSearchParams(window.location.search).get('v');
@@ -184,6 +185,14 @@ function App() {
               </button>
 
               <button
+                onClick={() => goToView('history')}
+                className={`p-2 rounded transition-colors flex-shrink-0 ${view === 'history' ? 'text-[var(--accent)] bg-[var(--bg-primary)]' : 'hover:bg-[var(--bg-primary)]'}`}
+                title="Watch History"
+              >
+                <Clock size={18} />
+              </button>
+
+              <button
                 onClick={() => setShowFeedSettings(true)}
                 className="p-2 rounded transition-colors flex-shrink-0 hover:bg-[var(--bg-primary)] hover:text-[var(--accent)]"
                 title="Settings"
@@ -257,6 +266,10 @@ function App() {
             <SavedPage
               onVideoSelect={handleVideoSelect}
               onChannelSelect={handleChannelSelect}
+            />
+          ) : view === 'history' ? (
+            <WatchHistoryPage
+              onVideoSelect={handleVideoSelect}
             />
           ) : (
             <VideoGrid
