@@ -1,18 +1,22 @@
 @echo off
 cd /d "%~dp0"
-echo [UPDATER] Checking and pulling latest code...
+echo [UPDATER] Checking GitHub...
 
-:: 1. Force the pull (this will only download if there's something new)
-git pull origin main
+:: Download latest info from GitHub
+git fetch origin main
 
-:: 2. Check if the pull actually changed anything
-:: (This searches the git logs to see if the local head changed in the last 5 seconds)
-git log -1 --since="5 seconds ago" | findstr /C:"commit" > nul
+:: Compare your local version to the remote version
+for /f %%i in ('git rev-parse HEAD') do set LOCAL=%%i
+for /f %%j in ('git rev-parse @{u}') do set REMOTE=%%j
 
-if %errorlevel% == 0 (
-    echo [UPDATER] New code detected. Installing and Restarting...
-    call npm install
-    taskkill /F /IM node.exe
-) else (
+if "%LOCAL%" == "%REMOTE%" (
     echo [UPDATER] Already up to date.
+) else (
+    echo [UPDATER] New code found! Pulling now...
+    git pull origin main
+    echo [UPDATER] Installing packages...
+    call npm install
+    echo [UPDATER] Restarting server...
+    taskkill /F /IM node.exe /T
 )
+pause
