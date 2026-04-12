@@ -6,7 +6,7 @@ echo [UPDATER] Syncing with GitHub...
 git status --porcelain > nul
 if %errorlevel% == 0 (
     :: No local changes, safe to pull
-    git pull 2>&1 | findstr /C:"Already up to date" > nul
+    git pull 2>&1 | findstr /C:"Already up to date." > nul
     if %errorlevel% == 0 (
         echo [UPDATER] No changes on GitHub.
     ) else (
@@ -16,7 +16,7 @@ if %errorlevel% == 0 (
     :: Local changes detected, stash them
     echo [UPDATER] Stashing local changes...
     git stash push -m "auto stash by updater"
-    git pull 2>&1 | findstr /C:"Already up to date" > nul
+    git pull 2>&1 | findstr /C:"Already up to date." > nul
     if %errorlevel% == 0 (
         echo [UPDATER] No changes on GitHub.
         echo [UPDATER] Restoring stashed changes...
@@ -39,4 +39,3 @@ echo [UPDATER] Restoring stashed changes if any...
 git stash pop 2> nul
 
 :end
-pause
