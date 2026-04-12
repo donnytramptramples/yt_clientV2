@@ -7,3 +7,4 @@ node server.js
 echo [ENGINE] Server stopped/crashed. Restarting in 10s...
 timeout /t 10
 goto loop
+step 
