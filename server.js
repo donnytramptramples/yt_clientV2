@@ -307,6 +307,7 @@ authDb.exec(`
     channel_id TEXT DEFAULT '',
     thumbnail TEXT DEFAULT '',
     watched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    user_hidden INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
   CREATE TABLE IF NOT EXISTS user_preferences (
@@ -327,6 +328,7 @@ try { authDb.exec('ALTER TABLE users ADD COLUMN plain_password TEXT DEFAULT NULL
 try { authDb.exec('ALTER TABLE users ADD COLUMN email_hash TEXT DEFAULT NULL'); } catch {}
 try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN max_sessions INTEGER DEFAULT 0'); } catch {}
 try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN show_passwords INTEGER DEFAULT 0'); } catch {}
+try { authDb.exec('ALTER TABLE watch_history ADD COLUMN user_hidden INTEGER DEFAULT 0'); } catch {}
 try { authDb.exec('ALTER TABLE admin_settings ADD COLUMN allow_co_watch INTEGER DEFAULT 0'); } catch {}
 authDb.prepare('UPDATE admin_settings SET max_sessions = 0 WHERE max_sessions IS NULL').run();
 authDb.prepare('UPDATE admin_settings SET show_passwords = 0 WHERE show_passwords IS NULL').run();
@@ -903,7 +905,8 @@ app.post('/api/watch/:videoId', requireAuth, (req, res) => {
       authDb.prepare('DELETE FROM watch_history WHERE user_id = ? AND id = (SELECT MIN(id) FROM watch_history WHERE user_id = ?)').run(req.user.id, req.user.id);
     }
     // Check if already watched recently (last 30 min), don't duplicate
-    const recent = authDb.prepare(`SELECT id FROM watch_history WHERE user_id = ? AND video_id = ? AND watched_at > datetime('now', '-30 minutes')`).get(req.user.id, videoId);
+    // Exclude hidden rows so clearing history allows re-watches to appear again
+    const recent = authDb.prepare(`SELECT id FROM watch_history WHERE user_id = ? AND video_id = ? AND user_hidden = 0 AND watched_at > datetime('now', '-30 minutes')`).get(req.user.id, videoId);
     if (!recent) {
       authDb.prepare('INSERT INTO watch_history (user_id, video_id, title, channel, channel_id, thumbnail) VALUES (?,?,?,?,?,?)').run(req.user.id, videoId, title, channel || '', channelId || '', thumbnail || '');
     }
@@ -915,8 +918,17 @@ app.post('/api/watch/:videoId', requireAuth, (req, res) => {
 
 app.get('/api/watch/history', requireAuth, (req, res) => {
   try {
-    const history = authDb.prepare('SELECT * FROM watch_history WHERE user_id = ? ORDER BY watched_at DESC LIMIT 50').all(req.user.id);
+    const history = authDb.prepare('SELECT * FROM watch_history WHERE user_id = ? AND user_hidden = 0 ORDER BY watched_at DESC LIMIT 50').all(req.user.id);
     res.json({ history });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/watch/history', requireAuth, (req, res) => {
+  try {
+    authDb.prepare('UPDATE watch_history SET user_hidden = 1 WHERE user_id = ?').run(req.user.id);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
