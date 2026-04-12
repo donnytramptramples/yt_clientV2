@@ -1,67 +1,65 @@
 @echo off
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
-echo [UPDATER] Syncing with GitHub...
 
-:: Detect the current branch automatically
-set "current_branch="
+echo [UPDATER] Starting sync at %date% %time%
+
+:: Get current branch
 for /f "tokens=*" %%i in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "current_branch=%%i"
 if "%current_branch%"=="" (
-    echo [UPDATER] Could not detect current branch.
+    echo [UPDATER] ERROR: Not a git repo
+    exit /b 1
+)
+
+echo [UPDATER] Branch: %current_branch%
+
+:: Fetch latest from GitHub
+git fetch origin %current_branch%
+if %errorlevel% neq 0 (
+    echo [UPDATER] ERROR: Failed to fetch
+    exit /b 1
+)
+
+:: Check if update needed (FIXED: proper errorlevel syntax)
+git diff --quiet HEAD origin/%current_branch%
+if %errorlevel% equ 0 (
+    echo [UPDATER] Already up to date
     goto end
 )
 
-:: Fetch latest info from GitHub
-git fetch origin
+echo [UPDATER] Changes detected! Updating...
 
-:: Verify the remote branch exists
-set "remote_branch=origin/%current_branch%"
-git show-ref --verify --quiet refs/remotes/%remote_branch%
-if errorlevel 1 (
-    echo [UPDATER] Remote branch %remote_branch% not found.
-    for /f "tokens=3 delims= " %%b in ('git remote show origin ^| findstr /c:"HEAD branch"') do set "current_branch=%%b"
-    if "%current_branch%"=="" (
-        echo [UPDATER] Could not detect remote HEAD branch.
-        goto end
-    )
-    set "remote_branch=origin/%current_branch%"
-    echo [UPDATER] Using remote default branch %remote_branch%.
+:: Hard reset to match GitHub
+git reset --hard origin/%current_branch%
+if %errorlevel% neq 0 (
+    echo [UPDATER] ERROR: Git reset failed
+    exit /b 1
 )
 
-:: Force local files to match GitHub exactly
-git reset --hard %remote_branch%
-if errorlevel 1 (
-    echo [UPDATER] Git reset failed. Aborting.
-    goto end
-)
-
-:: Check if the code actually changed since the last run
-git rev-parse --verify HEAD@{1} >nul 2>&1
-if errorlevel 0 (
-    git diff --quiet HEAD@{1} HEAD
-    if errorlevel 0 (
-        echo [UPDATER] No changes on GitHub.
-        goto end
-    )
-)
-
-echo [UPDATER] UPDATING DETECTED!
-
-:: Install new packages
+:: Install deps
 echo [UPDATER] Installing NPM packages...
-call npm install
+call npm ci --silent --no-audit --no-fund
+if %errorlevel% neq 0 (
+    echo [UPDATER] ERROR: npm install failed
+    exit /b 1
+)
 
-:: REBUILD VITE FRONTEND (Crucial for React changes)
-echo [UPDATER] Building Vite production files...
+:: Build
+echo [UPDATER] Building Vite...
 call npm run build
+if %errorlevel% neq 0 (
+    echo [UPDATER] ERROR: Build failed - server NOT restarted
+    exit /b 1
+)
 
-:: Update your YouTube downloader
+:: Update yt-dlp
 echo [UPDATER] Updating yt-dlp...
-pip install --upgrade yt-dlp
+pip install --upgrade --quiet yt-dlp
 
-:: Kill the running server
-:: Your engine.bat (running in Task Scheduler) will see this and restart the site
+:: Kill server (only if build succeeded)
 echo [UPDATER] Restarting server...
-taskkill /F /IM node.exe /T > nul 2>&1
+taskkill /F /IM node.exe /T >nul 2>&1
 
 :end
-echo [UPDATER] Task Finished.
+echo [UPDATER] Sync completed at %date% %time%
+exit /b 0
