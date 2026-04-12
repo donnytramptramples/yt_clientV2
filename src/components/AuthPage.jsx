@@ -83,7 +83,7 @@ export default function AuthPage({ onAuth }) {
               <input
                 type="password"
                 className="breeze-input w-full"
-                placeholder="Password"
+                placeholder="Password1"
                 value={form.password}
                 onChange={e => setForm(f => ({ ...f, password: e.target.value }))}
                 required
@@ -122,7 +122,7 @@ export default function AuthPage({ onAuth }) {
                   className="text-[var(--accent)] hover:underline"
                   onClick={() => { setMode('login'); setError(''); }}
                 >
-                  Sign intest
+                  Sign in
                 </button>
               </>
             )}
