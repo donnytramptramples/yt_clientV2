@@ -122,7 +122,7 @@ export default function AuthPage({ onAuth }) {
                   className="text-[var(--accent)] hover:underline"
                   onClick={() => { setMode('login'); setError(''); }}
                 >
-                  Sign in
+                  Sign intest
                 </button>
               </>
             )}
